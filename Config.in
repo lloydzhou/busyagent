@@ -737,6 +737,8 @@ endmenu
 
 comment "Applets"
 
+source agentutils/Config.in
+
 source archival/Config.in
 source coreutils/Config.in
 source console-tools/Config.in

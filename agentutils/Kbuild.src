@@ -1,0 +1,11 @@
+# Makefile for busybox
+#
+# Copyright (C) 2026 by Lloyd Zhou <lloydzhou@qq.com>
+#
+# Licensed under GPLv2, see file LICENSE in this source tree.
+
+lib-y:=
+
+ccflags-y += -std=gnu11 -Wno-unused-parameter -D_GNU_SOURCE
+
+INSERT

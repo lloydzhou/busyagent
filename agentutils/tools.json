@@ -1,0 +1,60 @@
+[
+  {
+    "name": "Bash",
+    "description": "Executes a given shell command via busybox sh and returns stdout/stderr. Use for running programs, pipelines, and anything not covered by the other tools. Output is truncated at 128KB.",
+    "exec": {
+      "applet": "sh",
+      "argv": ["-c", "$command"]
+    },
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "The shell command to execute"
+        }
+      },
+      "required": ["command"]
+    }
+  },
+  {
+    "name": "Read",
+    "description": "Read a file from the local filesystem using the busybox cat applet (direct in-process call, no exec).",
+    "exec": {
+      "applet": "cat",
+      "argv": ["$path"]
+    },
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Path to the file to read (absolute or relative to cwd)"
+        }
+      },
+      "required": ["path"]
+    }
+  },
+  {
+    "name": "Grep",
+    "description": "Search file contents with the busybox grep applet (direct in-process call). Returns matching lines with line numbers. If path is omitted, searches the current directory recursively.",
+    "exec": {
+      "applet": "grep",
+      "argv": ["-nH", "-r", "-e", "$pattern", "$path"]
+    },
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Regular expression to search for"
+        },
+        "path": {
+          "type": "string",
+          "description": "File or directory to search (default: cwd, recursive)"
+        }
+      },
+      "required": ["pattern"]
+    }
+  }
+]
