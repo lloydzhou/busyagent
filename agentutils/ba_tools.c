@@ -194,69 +194,82 @@ char *ba_tools_json(void)
     return sb.data;
 }
 
-/* 工具表模板 — `busyagent -i [PATH]` 导出为可编辑的 tools.json。
- * 这是代码常量而非运行时数据源：运行时唯一来源是导出后的文件。 */
 static const char ba_tools_template[] =
-"[\n\
-  {\n\
-    \"name\": \"Bash\",\n\
-    \"description\": \"Executes a given shell command via busybox sh and returns stdout/stderr. Use for running programs, pipelines, and anything not covered by the other tools. Output is truncated at 128KB.\",\n\
-    \"exec\": {\n\
-      \"applet\": \"sh\",\n\
-      \"argv\": [\"-c\", \"$command\"]\n\
-    },\n\
-    \"input_schema\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"command\": {\n\
-          \"type\": \"string\",\n\
-          \"description\": \"The shell command to execute\"\n\
-        }\n\
-      },\n\
-      \"required\": [\"command\"]\n\
-    }\n\
-  },\n\
-  {\n\
-    \"name\": \"Read\",\n\
-    \"description\": \"Read a file from the local filesystem with the busybox cat applet.\",\n\
-    \"exec\": {\n\
-      \"applet\": \"cat\",\n\
-      \"argv\": [\"$path\"]\n\
-    },\n\
-    \"input_schema\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"path\": {\n\
-          \"type\": \"string\",\n\
-          \"description\": \"Path to the file to read (absolute or relative to cwd)\"\n\
-        }\n\
-      },\n\
-      \"required\": [\"path\"]\n\
-    }\n\
-  },\n\
-  {\n\
-    \"name\": \"Grep\",\n\
-    \"description\": \"Search file contents with the busybox grep applet. Returns matching lines with line numbers. If path is omitted, searches the current directory recursively.\",\n\
-    \"exec\": {\n\
-      \"applet\": \"grep\",\n\
-      \"argv\": [\"-nH\", \"-r\", \"-e\", \"$pattern\", \"$path\"]\n\
-    },\n\
-    \"input_schema\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"pattern\": {\n\
-          \"type\": \"string\",\n\
-          \"description\": \"Regular expression to search for\"\n\
-        },\n\
-        \"path\": {\n\
-          \"type\": \"string\",\n\
-          \"description\": \"File or directory to search (default: cwd, recursive)\"\n\
-        }\n\
-      },\n\
-      \"required\": [\"pattern\"]\n\
-    }\n\
-  }\n\
-]";
+"[\n"
+"  {\n"
+"    \"name\": \"sh\",\n"
+"    \"description\": \"Execute a shell script via busybox sh (pipelines, redirection, loops, any applet). This is the primary entry point: compose busybox commands freely. Output truncated at 128KB.\",\n"
+"    \"exec\": { \"applet\": \"sh\", \"argv\": [\"-c\", \"$command\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"command\": { \"type\": \"string\", \"description\": \"The shell script to execute\" } },\n"
+"      \"required\": [\"command\"] }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"cat\",\n"
+"    \"description\": \"Print a file to stdout (busybox cat, direct in-process call).\",\n"
+"    \"exec\": { \"applet\": \"cat\", \"argv\": [\"$path\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to read\" } },\n"
+"      \"required\": [\"path\"] }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"head\",\n"
+"    \"description\": \"Print the first lines of a file (busybox head). Prefer over cat for large files.\",\n"
+"    \"exec\": { \"applet\": \"head\", \"argv\": [\"-n\", \"${lines}\", \"$path\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to read\" },\n"
+"                      \"lines\": { \"type\": \"integer\", \"description\": \"Number of lines (default 10)\" } },\n"
+"      \"required\": [\"path\"] }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"tail\",\n"
+"    \"description\": \"Print the last lines of a file (busybox tail).\",\n"
+"    \"exec\": { \"applet\": \"tail\", \"argv\": [\"-n\", \"${lines}\", \"$path\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to read\" },\n"
+"                      \"lines\": { \"type\": \"integer\", \"description\": \"Number of lines (default 10)\" } },\n"
+"      \"required\": [\"path\"] }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"ls\",\n"
+"    \"description\": \"List directory contents (busybox ls).\",\n"
+"    \"exec\": { \"applet\": \"ls\", \"argv\": [\"-la\", \"$path\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"Directory or file (default cwd)\" } } }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"grep\",\n"
+"    \"description\": \"Search file contents with a regular expression (busybox grep). If path is omitted, searches the current directory recursively.\",\n"
+"    \"exec\": { \"applet\": \"grep\", \"argv\": [\"-nH\", \"-r\", \"-e\", \"$pattern\", \"$path\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"pattern\": { \"type\": \"string\", \"description\": \"Regular expression\" },\n"
+"                      \"path\": { \"type\": \"string\", \"description\": \"File or directory (default cwd, recursive)\" } },\n"
+"      \"required\": [\"pattern\"] }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"find\",\n"
+"    \"description\": \"Find files by name pattern (busybox find).\",\n"
+"    \"exec\": { \"applet\": \"find\", \"argv\": [\"$path\", \"-name\", \"${pattern}\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"Search root (default cwd)\" },\n"
+"                      \"pattern\": { \"type\": \"string\", \"description\": \"Name glob, e.g. *.c\" } } }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"Skill\",\n"
+"    \"description\": \"Load a skill (prompt/playbook stored under $BB_AGENT_HOME/skills/<name>/SKILL.md) into this conversation. Its content becomes part of your instructions; follow it.\",\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"name\": { \"type\": \"string\", \"description\": \"Skill name\" } },\n"
+"      \"required\": [\"name\"] }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"SubAgent\",\n"
+"    \"description\": \"Run a fresh busyagent session on a self-contained prompt and return its final answer. Use for isolated sub-tasks that deserve their own context.\",\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"prompt\": { \"type\": \"string\", \"description\": \"Complete, self-contained task description\" },\n"
+"                      \"description\": { \"type\": \"string\", \"description\": \"Short task summary\" } },\n"
+"      \"required\": [\"prompt\"] }\n"
+"  }\n"
+"]\n";
 
 /* 导出模板到 path（默认由调用方决定，通常 $BB_AGENT_HOME/tools.json）。
  * 返回 0 成功；-1 文件已存在（不覆盖）；-2 写入失败。 */
@@ -467,15 +480,71 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 
 	sb_init(&sb);
 
-	tool = find_tool(name);
-	if (!tool || !tool->applet) {
-		sb_appendf(&sb, "Error: tool '%s' is not in the tool table", name);
-		return sb.data;
-	}
-
 	jp = json_parse_root(input_json && input_json[0] ? input_json : "{}");
 	if (jp.error) {
 		sb_append(&sb, "Error: invalid tool input JSON");
+		return sb.data;
+	}
+
+	/* ---- 内置保留名（L2/L3）：主循环语义，不走 exec 映射 ---- */
+
+	if (strcmp(name, "Skill") == 0) {
+		/* L2 知识级：读技能包全文作为 tool_result 回喂（in-context 生效） */
+		char *skill = json_get_string(jp.val, "name");
+		const char *home = getenv("BB_AGENT_HOME");
+		char *path;
+		if (!skill || !skill[0]) {
+			sb_append(&sb, "Error: Skill requires 'name'");
+			free(skill);
+			return sb.data;
+		}
+		path = xasprintf("%s/skills/%s/SKILL.md",
+				 (home && home[0]) ? home : "/tmp/busyagent", skill);
+		{
+			char *data = read_file_all(path);
+			free(path);
+			if (!data) {
+				sb_appendf(&sb, "Error: skill '%s' not found under $BB_AGENT_HOME/skills/", skill);
+				free(skill);
+				return sb.data;
+			}
+			sb_append(&sb, data);
+			free(data);
+		}
+		free(skill);
+		return sb.data;
+	}
+
+	if (strcmp(name, "SubAgent") == 0) {
+		/* L3 委托级：自举 —— fork+exec busyagent 自己，配置经环境变量下传 */
+		char *prompt = json_get_string(jp.val, "prompt");
+		char *sub_argv[5];
+		int sub_argc = 0;
+		int st;
+		if (!prompt || !prompt[0]) {
+			sb_append(&sb, "Error: SubAgent requires 'prompt'");
+			free(prompt);
+			return sb.data;
+		}
+		setenv("BB_AGENT_OUTPUT", "text", 1);   /* 子进程输出回喂须为纯文本 */
+		sub_argv[sub_argc++] = (char *)"busyagent";
+		sub_argv[sub_argc++] = (char *)"-n";    /* 独立新会话，不共享本会话 history */
+		sub_argv[sub_argc++] = prompt;
+		sub_argv[sub_argc] = NULL;
+		st = run_captured("busyagent", sub_argv, &out, &err,
+				  timeout_ms ? timeout_ms : 600000);
+		result_wrap(&sb, st, &out, &err);
+		free(prompt);
+		free(out.data);
+		free(err.data);
+		return sb.data;
+	}
+
+	/* ---- L0/L1：exec 映射 ---- */
+
+	tool = find_tool(name);
+	if (!tool || !tool->applet) {
+		sb_appendf(&sb, "Error: tool '%s' is not in the tool table", name);
 		return sb.data;
 	}
 

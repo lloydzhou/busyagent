@@ -35,6 +35,21 @@ Rationale: a bare busybox binary must work with zero external files
 (busybox philosophy), so the default must be embedded somewhere; a JSON
 source file is just the maintainable form of that embedding.
 
+## Tool layers (four-level model)
+
+| Layer | Tools | Mechanism |
+|---|---|---|
+| L0 primitive | cat, head, tail, ls, grep, find | exec mapping → one fork + `run_nofork_applet()` (or exec) |
+| L1 program | sh (was "Bash") | exec mapping → sh -c: pipelines/loops/any applet; with FEATURE_PREFER_APPLETS the shell dispatches applets in-process |
+| L2 knowledge | Skill | **builtin reserved name** (no `exec` field): reads `$BB_AGENT_HOME/skills/<name>/SKILL.md`, full text returned as tool_result — in-context learning, no prompt surgery |
+| L3 delegation | SubAgent | **builtin reserved name**: self-bootstrapping — fork+exec `busyagent --new <prompt>` with config passed via `BB_AGENT_*` env; child output captured as tool_result |
+
+tools.json entries route by shape: entries with `exec` run through the
+applet/argv-template path (the user-customizable zone: exposure
+cutting, parameter shaping); entries whose name matches a builtin
+reserved name are handled natively by the turn loop. The default
+template ships all nine.
+
 Each tool entry carries an `exec` mapping that never reaches the LLM
 (stripped by `ba_tools_json()`):
 

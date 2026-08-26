@@ -291,8 +291,13 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	const char *base_url = getenv("BB_AGENT_BASE_URL");
 	const char *api_key  = getenv("BB_AGENT_API_KEY");
 	const char *home_env = getenv("BB_AGENT_HOME");
-	const char *model = NULL, *provider = "openai", *session_arg = NULL;
-	const char *output_fmt = "text";
+	const char *model_env = getenv("BB_AGENT_MODEL");
+	const char *provider_env = getenv("BB_AGENT_PROVIDER");
+	const char *output_env = getenv("BB_AGENT_OUTPUT");
+	const char *model = (model_env && model_env[0]) ? model_env : NULL;
+	const char *provider = (provider_env && provider_env[0]) ? provider_env : "openai";
+	const char *session_arg = NULL;
+	const char *output_fmt = (output_env && output_env[0]) ? output_env : "text";
 	int max_turns = BA_DEFAULT_TURNS, verbose = 0;
 	int opt_new = 0;
 	char *prompt = NULL, *home, *cwd, *session_id = NULL;
@@ -347,6 +352,12 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	if (o_s) session_arg = o_s;
 	if (o_o) output_fmt = o_o;
 	if (max_turns <= 0) max_turns = BA_DEFAULT_TURNS;
+
+	/* 将最终生效配置写回环境：SubAgent 工具 fork+exec 自己时无需再传参 */
+	if (base_url) setenv("BB_AGENT_BASE_URL", base_url, 1);
+	if (api_key) setenv("BB_AGENT_API_KEY", api_key, 1);
+	if (model) setenv("BB_AGENT_MODEL", model, 1);
+	if (provider) setenv("BB_AGENT_PROVIDER", provider, 1);
 
 	argv += optind;
 	if (!argv[0]) {
