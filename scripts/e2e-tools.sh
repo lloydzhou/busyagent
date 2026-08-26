@@ -2,9 +2,9 @@
 # tool-loop + json output acceptance
 export BB_AGENT_HOME=/tmp/bbtools
 BB=/src/busybox
-API=$BB_AGENT_E2E_URL
-KEY=$BB_AGENT_E2E_KEY
-MODEL=gpt-5.6-sol
+API=${BB_AGENT_E2E_URL:?set BB_AGENT_E2E_URL, e.g. http://host.docker.internal:PORT/v1}
+KEY=${BB_AGENT_E2E_KEY:?set BB_AGENT_E2E_KEY}
+MODEL=gpt-5.6-luna
 rm -rf /tmp/bbtools
 cd /src
 echo "=== T0: -i exports starter tools.json ==="
