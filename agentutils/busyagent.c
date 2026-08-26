@@ -23,7 +23,7 @@
 //config:	$BB_AGENT_HOME and restored automatically per working directory.
 //config:
 //applet:IF_BUSYAGENT(APPLET(busyagent, BB_DIR_USR_BIN, BB_SUID_DROP))
-//kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_json.o ba_util.o ba_protocol.o
+//kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_json.o ba_util.o
 //kbuild:lib-$(CONFIG_BUSYAGENT) += ba_store.o ba_transport.o bb_http.o ba_tools.o
 
 //usage:#define busyagent_trivial_usage
@@ -40,6 +40,7 @@
 //usage:     "\n	-c	Resume latest session for this cwd (the default)"
 //usage:     "\n	-o FMT	Output: text | json (default text)"
 //usage:     "\n	-v	Verbose request info on stderr"
+//usage:     "\n	-i [PATH]	Write a starter tools.json (default $BB_AGENT_HOME/tools.json) and exit"
 //usage:     "\n	PROMPT	Reads stdin when no PROMPT is given"
 //usage:
 
@@ -47,7 +48,6 @@
 #include <unistd.h>
 #include "ba_util.h"
 #include "ba_json.h"
-#include "ba_protocol.h"
 #include "ba_transport.h"
 #include "ba_store.h"
 #include "ba_tools.h"
@@ -80,11 +80,9 @@ static void ba_render(TurnCtx *t, const char *json_frag)
 	StrBuf line;
 	const char *type = NULL;
 
-	{
-		JsonParse jp = json_parse_root(json_frag);
-		if (!jp.error)
-			type = json_get_string(jp.val, "type");
-	}
+	JsonParse jp = json_parse_root(json_frag);
+	if (!jp.error)
+		type = json_get_string(jp.val, "type");
 
 	sb_init(&line);
 	sb_append(&line, json_frag);
@@ -94,8 +92,7 @@ static void ba_render(TurnCtx *t, const char *json_frag)
 		fwrite(line.data, 1, line.len, stdout);
 		fflush(stdout);
 	} else {
-		/* human rendering */
-		JsonParse jp = json_parse_root(json_frag);
+		/* human rendering（复用上面的 jp） */
 		if (!jp.error && type) {
 			if (strcmp(type, "text") == 0) {
 				char *c = json_get_string(jp.val, "content");
@@ -267,15 +264,18 @@ static int ba_trim_history(const char *conv_path)
 	 * keeping at least the most recent exchange */
 	for (i = 0; i < n - 2; i++) {
 		JsonParse jp = json_parse_root(lines[i]);
-		int is_user = 0;
+		int is_user_input = 0;
 		if (!jp.error) {
 			char *r = json_get_string(jp.val, "role");
-			is_user = (r && strcmp(r, "user") == 0);
+			JsonVal content = json_get(jp.val, "content");
+			/* 真 user 输入行 content 是字符串；tool_result 行是数组 */
+			is_user_input = (r && strcmp(r, "user") == 0
+					 && content.type == JSON_STRING);
 			free(r);
 		}
 		total -= strlen(lines[i]) + 1;
 		start = i + 1;
-		if (is_user && total <= BA_CTX_LIMIT_BYTES)
+		if (is_user_input && total <= BA_CTX_LIMIT_BYTES)
 			break;
 	}
 	for (i = 0; i < n; i++) free(lines[i]);
@@ -296,6 +296,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	int max_turns = BA_DEFAULT_TURNS, verbose = 0;
 	int opt_new = 0;
 	char *prompt = NULL, *home, *cwd, *session_id = NULL;
+	char *tools_json = NULL;
 	SessionPaths paths;
 	char *api_url;
 	int rc = 0;
@@ -307,15 +308,37 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 		OPT_verbose = 1 << 0,
 		OPT_new     = 1 << 8,
 		OPT_continue= 1 << 9,
+		OPT_init    = 1 << 10,
 	};
 
 	opts = getopt32(argv, "^"
-		"vu:k:m:p:t:s:o:nc" "\0",
+		"vu:k:m:p:t:s:o:nci" "\0",
 		&o_u, &o_k, &o_m, &o_p, &o_t, &o_s, &o_o);
 	if (opts & OPT_verbose) verbose = 1;
 	if (opts & OPT_new) opt_new = 1;
 	/* OPT_continue is the default behavior; the flag is a no-op kept
 	 * for muscle-memory compatibility with cagent */
+
+	if (opts & OPT_init) {
+		/* -i [PATH]: export starter tools.json and exit */
+		const char *dst = argv[optind];
+		char *def = NULL;
+		int trc;
+		if (!dst || !dst[0]) {
+			const char *h = getenv("BB_AGENT_HOME");
+			def = xasprintf("%s/tools.json", (h && h[0]) ? h : "/tmp/busyagent");
+			dst = def;
+		}
+		trc = ba_tools_write_template(dst);
+		if (trc == 0)
+			printf("wrote %s\n", dst);
+		else if (trc == -1)
+			bb_error_msg_and_die("%s already exists (delete it first to re-export)", dst);
+		else
+			bb_error_msg_and_die("cannot write %s", dst);
+		free(def);
+		return 0;
+	}
 	if (o_u) base_url = o_u;
 	if (o_k) api_key = o_k;
 	if (o_m) model = o_m;
@@ -361,14 +384,19 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	/* api url */
 	{
 		size_t bl = strlen(base_url);
-		int strip = (bl && base_url[bl-1] == '/');
-		const char *b = strip ? xstrndup(base_url, bl - 1) : base_url;
+		char *b_stripped = NULL;
+		const char *b = base_url;
+		if (bl && base_url[bl-1] == '/') {
+			b_stripped = xstrndup(base_url, bl - 1);
+			b = b_stripped;
+		}
 		if (strcmp(provider, "claude") == 0)
 			api_url = xasprintf("%s/messages", b);
 		else if (strcmp(provider, "responses") == 0)
 			api_url = xasprintf("%s/responses", b);
 		else
 			api_url = xasprintf("%s/chat/completions", b);
+		free(b_stripped);
 	}
 
 	/* session resolution: --session > --new > default(cwd latest) */
@@ -395,8 +423,8 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 				session_id, is_new ? "new" : "resumed", home);
 	}
 
-	if (ba_tools_init(home) <= 0)
-		bb_simple_error_msg("no tools loaded (tool calls will fail)");
+	/* 提示（如缺失/损坏）由 ba_tools_init 内部给出：缺表即纯 chat 降级 */
+	ba_tools_init(home);
 
 	/* record user turn */
 	{
@@ -418,6 +446,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			"Answer concisely. Use tools when needed to inspect files or run commands.";
 
 		int turn;
+		tools_json = ba_tools_json();   /* constant across turns */
 		for (turn = 0; turn < max_turns; turn++) {
 			TurnCtx tctx;
 			char **lines = NULL;
@@ -426,7 +455,6 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			const char *headers[8];
 			char auth_header[512];
 			int hdr_count = 0, sse_rc;
-			const char *tools_json = ba_tools_json();
 			SseAccumulator *accum;
 
 			ba_trim_history(paths.conversation);
@@ -480,7 +508,9 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			}
 
 			if (sse_rc != 0 || accum->error) {
-				ba_render_error(&tctx, accum->error ? accum->error : "HTTP request failed");
+				/* SSE_ERROR 回调已渲染过时不重复（json 流/trace 双份） */
+				if (!accum->error)
+					ba_render_error(&tctx, "HTTP request failed");
 				ba_render_stop(&tctx, "error");
 				sse_accum_free(accum);
 				rc = 1;
@@ -494,6 +524,8 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			  || strcmp(accum->stop_reason, "tool_calls") == 0)) {
 				const char **ids, **contents;
 				int i;
+				/* json 模式下中间轮的 text/thinking/usage 也要进输出流和 trace */
+				ba_flush_turn_events(&tctx);
 				/* record assistant message with tool calls */
 				{
 					const char **tids = xzalloc(accum->tool_count * sizeof(char *));
@@ -549,6 +581,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 
 out:
 	store_session_paths_free(&paths);
+	free(tools_json);
 	free(session_id);
 	free(cwd);
 	free(home);

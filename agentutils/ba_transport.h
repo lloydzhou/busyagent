@@ -5,10 +5,9 @@
 #include "ba_json.h"
 
 /*
- * 传输层 — HTTP 请求（libcurl）、SSE 流式解析
+ * 传输层 — SSE 流式解析与请求体构建（无 libcurl）
  *
- * 支持 Claude (Anthropic) 和 OpenAI 两种协议。
- * SSE 解析是同步阻塞的，在一个独立线程中运行。
+ * HTTP 收发在 bb_http.c（libbb 原语，明文）；本文件只做协议层。
  */
 
 /* SSE 事件回调 */
@@ -37,19 +36,6 @@ typedef struct {
 } SseEvent;
 
 typedef void (*sse_callback_fn)(void *ctx, const SseEvent *evt);
-
-/* HTTP 响应（非流式） */
-typedef struct {
-    int status_code;
-    char *body;
-} HttpResponse;
-
-/* 释放 HTTP 响应 */
-void http_response_free(HttpResponse *r);
-
-/* 同步 POST 请求，返回整个响应 */
-HttpResponse http_post(const char *url, const char **headers, int header_count,
-                       const char *body, size_t body_len);
 
 /* 流式 POST 请求，通过回调传递 SSE 事件 */
 int http_post_sse(const char *url, const char **headers, int header_count,

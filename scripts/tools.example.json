@@ -19,7 +19,7 @@
   },
   {
     "name": "Read",
-    "description": "Read a file from the local filesystem using the busybox cat applet (direct in-process call, no exec).",
+    "description": "Read a file from the local filesystem with the busybox cat applet.",
     "exec": {
       "applet": "cat",
       "argv": ["$path"]
@@ -37,7 +37,7 @@
   },
   {
     "name": "Grep",
-    "description": "Search file contents with the busybox grep applet (direct in-process call). Returns matching lines with line numbers. If path is omitted, searches the current directory recursively.",
+    "description": "Search file contents with the busybox grep applet. Returns matching lines with line numbers. If path is omitted, searches the current directory recursively.",
     "exec": {
       "applet": "grep",
       "argv": ["-nH", "-r", "-e", "$pattern", "$path"]

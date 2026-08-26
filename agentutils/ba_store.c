@@ -4,6 +4,8 @@
 #include <string.h>
 #include <errno.h>
 #include <ctype.h>
+#include <time.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
@@ -205,6 +207,8 @@ int store_session_init_sub(const SessionPaths *parent_paths, const SessionPaths 
 
 char *session_new_id(void) {
     time_t now = time(NULL);
+    static int seeded = 0;
+    if (!seeded) { srand((unsigned)(now ^ getpid())); seeded = 1; }
     struct tm *t = localtime(&now);
     unsigned short r = (unsigned short)(rand() % 0xFFFF);
     char buf[64];
@@ -369,29 +373,43 @@ int store_conv_add_assistant(const char *path, const char *thinking, const char 
                        int tool_count, const char **tool_ids,
                        const char **tool_names, const char **tool_inputs) {
     StrBuf buf;
+    int first = 1;
     sb_init(&buf);
     sb_append(&buf, "{\"role\":\"assistant\",\"content\":[");
 
-    /* thinking block */
-    sb_append(&buf, "{\"type\":\"thinking\",\"thinking\":");
-    sb_append_json_string(&buf, thinking ? thinking : "");
-    sb_append(&buf, "}");
+    /* thinking block — 仅在有内容时写入（空块会被 Claude API 拒绝） */
+    if (thinking && thinking[0]) {
+        sb_append(&buf, "{\"type\":\"thinking\",\"thinking\":");
+        sb_append_json_string(&buf, thinking);
+        sb_append(&buf, "}");
+        first = 0;
+    }
 
-    /* text block */
-    sb_append(&buf, ",{\"type\":\"text\",\"text\":");
-    sb_append_json_string(&buf, text ? text : "");
-    sb_append(&buf, "}");
+    /* text block — 同上 */
+    if (text && text[0]) {
+        if (!first) sb_append(&buf, ",");
+        sb_append(&buf, "{\"type\":\"text\",\"text\":");
+        sb_append_json_string(&buf, text);
+        sb_append(&buf, "}");
+        first = 0;
+    }
 
     /* tool_use blocks */
     for (int i = 0; i < tool_count; i++) {
-        sb_appendf(&buf, ",{\"type\":\"tool_use\",\"id\":");
+        if (!first) sb_append(&buf, ",");
+        sb_appendf(&buf, "{\"type\":\"tool_use\",\"id\":");
         sb_append_json_string(&buf, tool_ids[i]);
         sb_append(&buf, ",\"name\":");
         sb_append_json_string(&buf, tool_names[i]);
         sb_append(&buf, ",\"input\":");
         sb_append(&buf, tool_inputs[i]); /* 已经是 JSON */
         sb_append(&buf, "}");
+        first = 0;
     }
+
+    /* 全空（无 thinking/text/tool_use）时补占位 text，保持消息合法 */
+    if (first)
+        sb_append(&buf, "{\"type\":\"text\",\"text\":\"(empty)\"}");
 
     sb_append(&buf, "]}");
     int rc = jsonl_append(path, buf.data);

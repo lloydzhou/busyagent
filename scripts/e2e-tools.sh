@@ -7,6 +7,9 @@ KEY=$BB_AGENT_E2E_KEY
 MODEL=gpt-5.6-sol
 rm -rf /tmp/bbtools
 cd /src
+echo "=== T0: -i exports starter tools.json ==="
+$BB busyagent -i
+echo "rc=$?"
 
 echo "=== T5: tool convergence (needs Grep/Read on real file) ==="
 $BB busyagent -n "What is the value of BA_MAX_TOKENS in the file agentutils/busyagent.c under the current directory? Answer with the number only, no other text." -u $API -k $KEY -m $MODEL

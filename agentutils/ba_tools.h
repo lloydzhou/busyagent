@@ -10,6 +10,9 @@ int ba_tools_init(const char *home);
 
 void ba_tools_free(void);
 
+/* 导出工具表模板（-i）。0 成功；-1 已存在；-2 写失败。 */
+int ba_tools_write_template(const char *path);
+
 /* 当前生效的 tools 数组 JSON 文本（与执行表同源），调用方 free */
 char *ba_tools_json(void);
 

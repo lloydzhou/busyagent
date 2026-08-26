@@ -287,7 +287,11 @@ int sse_stream_feed(StreamCtx *sctx, const char *ptr, size_t total) {
         if (sctx->cancelled && *(sctx->cancelled)) return 0;
         if (ptr[i] == '\n') {
             char *line = sctx->line_buf.data;
-            size_t llen = strlen(line);
+            size_t llen;
+            if (!line) {   /* empty line before any data (SSE allows it) */
+                continue;
+            }
+            llen = strlen(line);
             if (llen > 0 && line[llen-1] == '\r') line[--llen] = '\0';
 
             if (strncmp(line, "event: ", 7) == 0 && strcmp(sctx->provider, "responses") == 0) {
@@ -604,7 +608,12 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
                 callback(ctx, &evt);
             }
         } else if (strcmp(type, "error") == 0) {
-            char *msg = json_get_string(jp.val, "error");
+            /* Claude 错误形如 {"type":"error","error":{"type":..,"message":..}} */
+            char *msg = NULL;
+            JsonVal err_obj = json_get(jp.val, "error");
+            if (err_obj.type == JSON_OBJECT)
+                msg = json_get_string(err_obj, "message");
+            if (!msg) msg = json_get_string(jp.val, "error");
             if (!msg) msg = json_get_string(jp.val, "message");
             emit_simple_event(callback, ctx, SSE_ERROR, msg ? msg : "unknown error");
             free(msg);

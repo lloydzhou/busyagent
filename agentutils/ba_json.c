@@ -314,14 +314,19 @@ char *json_string_val(JsonVal v) {
                 case 'u': {
                     /* \uXXXX — 支持 surrogate pair */
                     unsigned int cp = 0;
+                    int hex_digits = 0;
                     for (int j = 0; j < 4 && i + 1 < end; j++) {
                         i++;
                         char h = src[i];
                         cp = cp * 16;
-                        if (h >= '0' && h <= '9') cp += h - '0';
-                        else if (h >= 'a' && h <= 'f') cp += h - 'a' + 10;
-                        else if (h >= 'A' && h <= 'F') cp += h - 'A' + 10;
+                        if (h >= '0' && h <= '9') { cp += h - '0'; hex_digits++; }
+                        else if (h >= 'a' && h <= 'f') { cp += h - 'a' + 10; hex_digits++; }
+                        else if (h >= 'A' && h <= 'F') { cp += h - 'A' + 10; hex_digits++; }
+                        else break;
                     }
+                    /* 畸形 \u（hex 不足 4 位）→ U+FFFD，避免内嵌 NUL 截断下游 */
+                    if (hex_digits < 4)
+                        cp = 0xFFFD;
                     /* high surrogate? 检查紧跟的 \uDC00-\uDFFF */
                     if (cp >= 0xD800 && cp <= 0xDBFF &&
                         i + 1 < end && src[i + 1] == '\\' && src[i + 2] == 'u') {

@@ -1,8 +1,8 @@
 /*
  * ba_tools - table-driven tool execution for busyagent
  *
- * Tool definitions live in $BB_AGENT_HOME/tools.json: seeded from the
- * embedded default on first run, freely editable by the user afterwards.
+ * Tool definitions live in $BB_AGENT_HOME/tools.json — the only source,
+ * never embedded in the binary. A sample lives at scripts/tools.example.json.
  * Each
  * tool carries an "exec" mapping: {"applet": "grep", "argv": ["-nH", "-e",
  * "$pattern", "$path"]}. At execution time argv templates are expanded with
@@ -28,7 +28,6 @@
 #include "ba_json.h"
 #include "ba_transport.h"
 #include "ba_tools.h"
-#include "ba_tools_embed.h"
 
 #define BA_TOOL_TIMEOUT_MS   120000
 #define BA_OUTPUT_MAX        (128 * 1024)
@@ -101,8 +100,9 @@ static int ba_tools_parse(const char *json)
 	return 0;
 }
 
-/* Load tools from $BB_AGENT_HOME/tools.json, seeding it from the embedded
- * default on first run. Parse failure falls back to the embedded table. */
+/* Load tools from $BB_AGENT_HOME/tools.json. The file is the only
+ * source: nothing is embedded in the binary. Missing or broken file
+ * means "no tools" — plain Q&A still works, requests just omit tools. */
 int ba_tools_init(const char *home)
 {
 	char *path = NULL;
@@ -113,30 +113,20 @@ int ba_tools_init(const char *home)
 
 	if (home && home[0])
 		path = xasprintf("%s/tools.json", home);
-	if (path) {
+	if (path)
 		data = read_file_all(path);
-		if (!data) {
-			/* first run: seed from embedded default */
-			int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-			if (fd >= 0) {
-				ssize_t rc = full_write(fd, embedded_tools_json,
-							strlen(embedded_tools_json));
-				close(fd);
-				if (rc >= 0)
-					data = read_file_all(path);
-			}
-		}
-	}
 	if (data && ba_tools_parse(data) == 0) {
 		g_tools_json_text = data;
-		free(path);
-		return g_tool_count;
+	} else {
+		if (data)
+			bb_error_msg("tools.json parse failed, continuing without tools");
+		else
+			bb_error_msg("no %s — continuing as plain chat agent "
+				     "(busyagent -i exports a starter table)", path);
+		free(data);
+		g_tools_json_text = NULL;
 	}
-	free(data);
 	free(path);
-	if (ba_tools_parse(embedded_tools_json) == 0)
-		bb_simple_error_msg("tools.json unreadable, using embedded default");
-	g_tools_json_text = util_strdup(embedded_tools_json);
 	return g_tool_count;
 }
 
@@ -167,14 +157,18 @@ static char *val_span_dup(const char *src, JsonVal v)
     return s;
 }
 
-/* 当前生效的 tools 数组（LLM 视角：剥离 busyagent 专有的 exec 字段） */
+/* 当前生效的 tools 数组（LLM 视角：剥离 busyagent 专有的 exec 字段）。
+ * 无工具表时返回 NULL —— 调用方据此在请求中省略 tools 字段。 */
 char *ba_tools_json(void)
 {
-    const char *src = g_tools_json_text ? g_tools_json_text : embedded_tools_json;
-    JsonParse jp = json_parse_root(src);
+    const char *src = g_tools_json_text;
+    JsonParse jp;
     StrBuf sb;
     int n, i;
 
+    if (!src)
+        return NULL;
+    jp = json_parse_root(src);
     if (jp.error)
         return util_strdup(src);
     n = json_array_len(jp.val);
@@ -198,6 +192,99 @@ char *ba_tools_json(void)
     }
     sb_append_char(&sb, ']');
     return sb.data;
+}
+
+/* 工具表模板 — `busyagent -i [PATH]` 导出为可编辑的 tools.json。
+ * 这是代码常量而非运行时数据源：运行时唯一来源是导出后的文件。 */
+static const char ba_tools_template[] =
+"[\n\
+  {\n\
+    \"name\": \"Bash\",\n\
+    \"description\": \"Executes a given shell command via busybox sh and returns stdout/stderr. Use for running programs, pipelines, and anything not covered by the other tools. Output is truncated at 128KB.\",\n\
+    \"exec\": {\n\
+      \"applet\": \"sh\",\n\
+      \"argv\": [\"-c\", \"$command\"]\n\
+    },\n\
+    \"input_schema\": {\n\
+      \"type\": \"object\",\n\
+      \"properties\": {\n\
+        \"command\": {\n\
+          \"type\": \"string\",\n\
+          \"description\": \"The shell command to execute\"\n\
+        }\n\
+      },\n\
+      \"required\": [\"command\"]\n\
+    }\n\
+  },\n\
+  {\n\
+    \"name\": \"Read\",\n\
+    \"description\": \"Read a file from the local filesystem with the busybox cat applet.\",\n\
+    \"exec\": {\n\
+      \"applet\": \"cat\",\n\
+      \"argv\": [\"$path\"]\n\
+    },\n\
+    \"input_schema\": {\n\
+      \"type\": \"object\",\n\
+      \"properties\": {\n\
+        \"path\": {\n\
+          \"type\": \"string\",\n\
+          \"description\": \"Path to the file to read (absolute or relative to cwd)\"\n\
+        }\n\
+      },\n\
+      \"required\": [\"path\"]\n\
+    }\n\
+  },\n\
+  {\n\
+    \"name\": \"Grep\",\n\
+    \"description\": \"Search file contents with the busybox grep applet. Returns matching lines with line numbers. If path is omitted, searches the current directory recursively.\",\n\
+    \"exec\": {\n\
+      \"applet\": \"grep\",\n\
+      \"argv\": [\"-nH\", \"-r\", \"-e\", \"$pattern\", \"$path\"]\n\
+    },\n\
+    \"input_schema\": {\n\
+      \"type\": \"object\",\n\
+      \"properties\": {\n\
+        \"pattern\": {\n\
+          \"type\": \"string\",\n\
+          \"description\": \"Regular expression to search for\"\n\
+        },\n\
+        \"path\": {\n\
+          \"type\": \"string\",\n\
+          \"description\": \"File or directory to search (default: cwd, recursive)\"\n\
+        }\n\
+      },\n\
+      \"required\": [\"pattern\"]\n\
+    }\n\
+  }\n\
+]";
+
+/* 导出模板到 path（默认由调用方决定，通常 $BB_AGENT_HOME/tools.json）。
+ * 返回 0 成功；-1 文件已存在（不覆盖）；-2 写入失败。 */
+int ba_tools_write_template(const char *path)
+{
+	int fd;
+	char *dir;
+
+	if (access(path, F_OK) == 0)
+		return -1;
+	dir = xstrdup(path);
+	{
+		char *slash = strrchr(dir, '/');
+		if (slash && slash != dir) {
+			*slash = '\0';
+			bb_make_directory(dir, 0755, FILEUTILS_RECUR);
+		}
+	}
+	free(dir);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (fd < 0)
+		return -2;
+	if (full_write(fd, ba_tools_template, strlen(ba_tools_template)) < 0) {
+		close(fd);
+		return -2;
+	}
+	close(fd);
+	return 0;
 }
 
 /* ---- execution ---- */
@@ -259,6 +346,7 @@ static int run_captured(const char *applet, char **argv,
 		/* child */
 		signal(SIGPIPE, SIG_DFL);
 		close(pipe_out[0]); close(pipe_err[0]);
+		xmove_fd(xopen("/dev/null", O_RDONLY), STDIN_FILENO);
 		xmove_fd(pipe_out[1], STDOUT_FILENO);
 		xmove_fd(pipe_err[1], STDERR_FILENO);
 		if (nofork) {

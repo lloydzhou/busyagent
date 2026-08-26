@@ -73,8 +73,14 @@ static int ba_connect(const char *host, int port)
 	socklen_t slen;
 	int err;
 
-	lsa = xhost2sockaddr(host, port);
-	fd = xsocket(lsa->u.sa.sa_family, SOCK_STREAM, 0);
+	lsa = host2sockaddr(host, port);
+	if (!lsa)
+		return -1;
+	fd = socket(lsa->u.sa.sa_family, SOCK_STREAM, 0);
+	if (fd < 0) {
+		free(lsa);
+		return -1;
+	}
 	flags = fcntl(fd, F_GETFL, 0);
 	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 	rc = connect(fd, &lsa->u.sa, lsa->len);
@@ -168,12 +174,17 @@ static int ba_read_header(BaResp *r)
 		char *hit;
 		size_t have = r->hdr_len;
 
-		hit = memmem(r->hdr, have, "\r\n\r\n", 4);
-		if (have >= 4 && hit)
+		hit = (have >= 4) ? memmem(r->hdr, have, "\r\n\r\n", 4) : NULL;
+		if (hit)
 			break;
-		/* also handle leading partial */
 		{
-			int n = ba_read(r, r->hdr + r->hdr_len, 4096);
+			size_t want = BA_MAX_HEADER - 1 - r->hdr_len;
+			int n;
+			if (want > 4096)
+				want = 4096;
+			if (want == 0)
+				return -1;   /* header too large */
+			n = ba_read(r, r->hdr + r->hdr_len, want);
 			if (n <= 0)
 				return -1;
 			r->hdr_len += n;
@@ -182,7 +193,7 @@ static int ba_read_header(BaResp *r)
 		hit = memmem(r->hdr, r->hdr_len, "\r\n\r\n", 4);
 		if (hit)
 			break;
-		(void)hit; (void)have;
+		(void)hit;
 	}
 	end = memmem(r->hdr, r->hdr_len, "\r\n\r\n", 4);
 	if (!end)
@@ -325,12 +336,20 @@ static void ba_send_request(int fd, const BaUrl *u, const char **headers,
 	char first[512];
 	int i;
 
-	snprintf(first, sizeof(first),
-		"POST %s HTTP/1.1\r\n"
-		"Host: %s\r\n"
-		"Content-Length: %lu\r\n"
-		"Connection: close\r\n",
-		u->path, u->host, (unsigned long)body_len);
+	if (u->port != 80)
+		snprintf(first, sizeof(first),
+			"POST %s HTTP/1.1\r\n"
+			"Host: %s:%d\r\n"
+			"Content-Length: %lu\r\n"
+			"Connection: close\r\n",
+			u->path, u->host, u->port, (unsigned long)body_len);
+	else
+		snprintf(first, sizeof(first),
+			"POST %s HTTP/1.1\r\n"
+			"Host: %s\r\n"
+			"Content-Length: %lu\r\n"
+			"Connection: close\r\n",
+			u->path, u->host, (unsigned long)body_len);
 	send_all(fd, first, strlen(first));
 	for (i = 0; i < header_count; i++) {
 		send_all(fd, headers[i], strlen(headers[i]));
@@ -340,75 +359,6 @@ static void ba_send_request(int fd, const BaUrl *u, const char **headers,
 	send_all(fd, body, body_len);
 }
 
-void http_response_free(HttpResponse *r)
-{
-	if (!r)
-		return;
-	free(r->body);
-	r->body = NULL;
-}
-
-/* Synchronous POST: whole body. */
-HttpResponse http_post(const char *url, const char **headers, int header_count,
-		       const char *body, size_t body_len)
-{
-	HttpResponse resp;
-	BaUrl u;
-	BaResp r;
-	char buf[4096];
-	size_t cap = 0, len = 0;
-
-	memset(&resp, 0, sizeof(resp));
-	resp.body = malloc(1);
-	if (resp.body)
-		resp.body[0] = '\0';
-
-	if (ba_parse_url(url, &u) != 0) {
-		resp.status_code = 0;
-		free(resp.body);
-		resp.body = xstrdup("bad url");
-		return resp;
-	}
-
-	memset(&r, 0, sizeof(r));
-	r.fd = ba_connect(u.host, u.port);
-	if (r.fd < 0) {
-		resp.status_code = 0;
-		free(resp.body);
-		resp.body = xstrdup("connect failed");
-		return resp;
-	}
-	ba_send_request(r.fd, &u, headers, header_count, body, body_len);
-
-	if (ba_read_header(&r) != 0) {
-		close(r.fd);
-		resp.status_code = 0;
-		free(resp.body);
-		resp.body = xstrdup("bad response header");
-		return resp;
-	}
-	resp.status_code = r.status;
-
-	for (;;) {
-		int n = ba_body_read(&r, buf, sizeof(buf));
-		if (n < 0)
-			break;
-		if (n == 0)
-			break;
-		if (len + (size_t)n + 1 > cap) {
-			size_t nc = cap ? cap * 2 : 4096;
-			while (nc < len + (size_t)n + 1)
-				nc *= 2;
-			resp.body = realloc(resp.body, nc);
-			cap = nc;
-		}
-		memcpy(resp.body + len, buf, n);
-		len += n;
-		resp.body[len] = '\0';
-	}
-	close(r.fd);
-	return resp;
-}
 
 /* Streaming POST with SSE pump. Mirrors the old curl semantics:
  * up to 2 retries, 1s delay, 20s total retry window, retry on 5xx. */
@@ -471,7 +421,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 		}
 		close(fd);
 
-		if (!io_err) {
+		if (!io_err && http_code < 500) {
 			/* non-SSE JSON error bodies etc. */
 			sse_stream_finish(&sctx, provider, callback, ctx);
 			sse_stream_free(&sctx);
@@ -480,6 +430,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 			return 0;
 		}
 		sse_stream_free(&sctx);
+		/* 5xx or io error: fall through to retry logic */
 
 	attempt_done:
 		if (cancelled && *cancelled) {
@@ -492,6 +443,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 		}
 		if (attempt >= BA_MAX_RETRIES)
 			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
+		(void)0;
 		if ((unsigned)(monotonic_ms() - start_ms) >= BA_RETRY_MAX_TIME_MS)
 			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
 		{
