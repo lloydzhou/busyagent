@@ -10,7 +10,14 @@ if [ "$target" = "defconfig" ]; then
 else
 	make allnoconfig >/dev/null
 	sed -i '/CONFIG_BUSYAGENT/d' .config
-	echo "CONFIG_BUSYAGENT=y" >> .config
+	# lineedit 输入回显需要的完整码表与 CJK 宽度：
+	# allnoconfig 把 LAST_SUPPORTED_WCHAR 截到 767(0x2FF)，
+	# CJK 码点会被 wcwidth 判为不可显示而画成 '?'（ash 同病）
+	cat >> .config <<'EOF'
+CONFIG_BUSYAGENT=y
+CONFIG_LAST_SUPPORTED_WCHAR=1114111
+CONFIG_UNICODE_WIDE_WCHARS=y
+EOF
 	make oldconfig >/dev/null
 fi
 make -j"$(nproc)"

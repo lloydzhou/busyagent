@@ -321,6 +321,146 @@ typedef struct {
 
 static int ba_run_session(BaRunCtx *ctx);
 
+/* ---- resume 回放（bash-agent agent.c:508-660 对齐）----
+ * 从 events.jsonl 最近 max_turns 个 user_input 起逐事件重放到 display */
+static long ba_find_recent_turn_start(const char *events_path, int max_turns)
+{
+	FILE *f = fopen(events_path, "r");
+	long *offsets;
+	char *line = NULL;
+	size_t cap = 0;
+	int seen = 0;
+	long start = -1;
+
+	if (!f)
+		return -1;
+	if (max_turns <= 0)
+		max_turns = 10;
+	offsets = xzalloc((size_t)max_turns * sizeof(long));
+	for (;;) {
+		long pos = ftell(f);
+		ssize_t n = getline(&line, &cap, f);
+
+		if (n < 0)
+			break;
+		if (strstr(line, "\"type\":\"user_input\"")) {
+			offsets[seen % max_turns] = pos;
+			seen++;
+		}
+	}
+	fclose(f);
+	free(line);
+	if (seen > 0)
+		start = (seen >= max_turns) ? offsets[seen % max_turns]
+		                            : offsets[0];
+	free(offsets);
+	return start;
+}
+
+static int ba_replay_events(const SessionPaths *paths, const BaDisplay *disp,
+			            int max_turns)
+{
+	long start;
+	FILE *f;
+	char *line = NULL;
+	size_t cap = 0;
+	int replayed = 0;
+
+	start = ba_find_recent_turn_start(paths->events, max_turns);
+	if (start < 0 || disp->format != BA_FMT_HUMAN)
+		return 0;
+	f = fopen(paths->events, "r");
+	if (!f)
+		return 0;
+	if (fseek(f, start, SEEK_SET) != 0) {
+		fclose(f);
+		return 0;
+	}
+
+	while (getline(&line, &cap, f) >= 0) {
+		JsonParse jp;
+		char *type;
+
+		jp = json_parse_root(line);
+		if (jp.error)
+			continue;
+		type = json_get_string(jp.val, "type");
+		if (!type)
+			continue;
+
+		if (strcmp(type, "user_input") == 0) {
+			char *content = json_get_string(jp.val, "content");
+			if (content && content[0]) {
+				StrBuf u;
+				sb_init(&u);
+				util_truncate_str(content, 80);
+				{ char *nl = strchr(content, '\n');
+				  if (nl) *nl = '\0'; }
+				sb_appendf(&u, "\n\x1b[32m> %s\x1b[0m", content);
+				ba_display_push((BaDisplay *)disp, &(BaDisplayMsg){
+					.type = BA_DM_TEXT, .content = u.data});
+				sb_free(&u);
+				replayed = 1;
+			}
+			free(content);
+		} else if (strcmp(type, "text") == 0) {
+			char *content = json_get_string(jp.val, "content");
+			if (content && content[0])
+				replayed |= ba_display_push((BaDisplay *)disp,
+					&(BaDisplayMsg){.type = BA_DM_TEXT,
+						.content = content}) != NULL;
+			free(content);
+		} else if (strcmp(type, "thinking") == 0) {
+			char *content = json_get_string(jp.val, "content");
+			if (content && content[0])
+				replayed |= ba_display_push((BaDisplay *)disp,
+					&(BaDisplayMsg){.type = BA_DM_THINKING,
+						.content = content}) != NULL;
+			free(content);
+		} else if (strcmp(type, "tool_call") == 0) {
+			char *name = json_get_string(jp.val, "name");
+			char *id = json_get_string(jp.val, "id");
+			char *input_str = json_get_string(jp.val, "input_json");
+
+			if (!input_str)
+				input_str = json_as_string(json_get(jp.val, "input"));
+			{
+				char *sum = input_str
+					? ba_tool_call_summary(name ? name : "", input_str)
+					: xstrdup("");
+				ba_display_push((BaDisplay *)disp, &(BaDisplayMsg){
+					.type = BA_DM_TOOL_CALL,
+					.tool_name = name, .tool_id = id,
+					.tool_input = input_str, .content = sum});
+				free(sum);
+			}
+			replayed = 1;
+			free(name); free(id); free(input_str);
+		} else if (strcmp(type, "tool_result") == 0) {
+			char *content = json_get_string(jp.val, "content");
+			if (content)
+				util_truncate_str(content, 200);
+			ba_display_push((BaDisplay *)disp, &(BaDisplayMsg){
+				.type = BA_DM_TOOL_RESULT, .content = content,
+				.tool_id = json_get_string(jp.val, "tool_use_id"),
+				.tool_name = json_get_string(jp.val, "name")});
+			free(content);
+			replayed = 1;
+		} else if (strcmp(type, "error") == 0) {
+			char *message = json_get_string(jp.val, "message");
+			ba_display_push((BaDisplay *)disp, &(BaDisplayMsg){
+				.type = BA_DM_ERROR, .content = message});
+			free(message);
+			replayed = 1;
+		}
+		free(type);
+	}
+	fclose(f);
+	free(line);
+	return replayed;
+}
+
+
 static void ba_handle_async_result(const BaDisplay *disp,
                                    SessionPaths *paths, const char *tid,
                                    int exit_code, const char *output)
@@ -963,6 +1103,19 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 
 			fprintf(stderr, "busyagent ready (interactive). "
 					"Type 'quit' or Ctrl-D to exit.\n");
+			/* resumed 会话：先回放最近 10 轮事件（cagent.c:350-355 同款） */
+			{
+				SessionPaths rp = store_session_paths_for(home, cwd, session_id);
+				if (access(rp.session_dir, F_OK) == 0) {
+					BaDisplay rd;
+					memset(&rd, 0, sizeof(rd));
+					rd.format = repl.fmt;
+					rd.out = stdout;
+					if (ba_replay_events(&rp, &rd, 10))
+						fwrite("\n", 1, 1, stdout);
+				}
+				store_session_paths_free(&rp);
+			}
 			memset(&repl, 0, sizeof(repl));
 			repl.home = home;
 			repl.cwd = cwd;
