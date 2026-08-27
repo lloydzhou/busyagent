@@ -1,7 +1,8 @@
 # two-stage: builder compiles static busybox(+busyagent); the final image
-# is FROM scratch with only the rootfs contents.
+# is FROM scratch with only the rootfs contents. Multi-platform:
 #
-#   docker build -t lloydzhou/busyagent .
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -t lloydzhou/busyagent:latest -t lloydzhou/busybox:latest --push .
 #
 # Config policy: self-contained in this file. No committed .config.
 #   make defconfig (kconfig defaults) then pin exactly four things:
@@ -11,11 +12,26 @@
 #     CONFIG_BUSYAGENT=y              pulls our applet + its selects
 #
 FROM alpine:3.23 AS build
+# TARGETARCH is injected by buildx. busybox's Makefile derives the CPU
+# subdir from uname, which under qemu emulation reports the host arch -
+# pin ARCH explicitly (same reason docker-library/busybox does).
+ARG TARGETARCH
+
 RUN apk add --no-cache gcc make musl-dev linux-headers findutils
 WORKDIR /src
 COPY . .
 
-RUN make defconfig >/dev/null && \
+RUN case "$TARGETARCH" in \
+        amd64)          export ARCH=x86_64  ;; \
+        arm64)          export ARCH=aarch64 ;; \
+        arm|arm/v7)     export ARCH=arm     ;; \
+        386)            export ARCH=i386    ;; \
+        ppc64le)        export ARCH=powerpc ;; \
+        s390x)          export ARCH=s390    ;; \
+        *)              export ARCH="$(uname -m)" ;; \
+    esac; \
+    echo "building for ARCH=$ARCH (TARGETARCH=$TARGETARCH)" && \
+    make defconfig >/dev/null && \
     sed -i -e '/^CONFIG_STATIC=/d' -e '/^# CONFIG_STATIC is not set/d' .config && \
     echo 'CONFIG_STATIC=y' >> .config && \
     sed -i -e '/^CONFIG_LAST_SUPPORTED_WCHAR=/d' -e '/^# CONFIG_LAST_SUPPORTED_WCHAR is not set/d' .config && \
@@ -31,7 +47,7 @@ RUN make defconfig >/dev/null && \
     grep -q '^CONFIG_LAST_SUPPORTED_WCHAR=1114111$' .config && \
     grep -q '^CONFIG_UNICODE_WIDE_WCHARS=y' .config && \
     grep -q '^CONFIG_BUSYAGENT=y' .config && \
-    make -j"$(nproc)"
+    make ARCH="$ARCH" -j"$(nproc)"
 
 # minimal rootfs: binary + every applet link + /etc basics, normalized mtimes
 RUN mkdir -p out-rootfs/bin out-rootfs/etc out-rootfs/root; \
