@@ -987,9 +987,10 @@ static int ba_run_session(BaRunCtx *ctx)
 						 0, NULL, NULL, NULL);
 			ba_push_display(&tctx, &(BaDisplayMsg){
 				.type = BA_DM_STOP,
-				.content = accum->stop_reason ? accum->stop_reason : "end_turn" });
-			if (tctx.disp.format == BA_FMT_HUMAN)
-				fwrite("\n", 1, 1, stdout);
+				.content = accum->stop_reason ? accum->stop_reason : "end_turn"});
+			/* 换行由 STOP 渲染的 ensure_newline 条件补：
+			 * 模型回答本身以 \n 结尾时不再多打（bash-agent
+			 * display.c DISPLAY_STOP 同款） */
 			sse_accum_free(accum);
 
 			/* end_turn 但仍有后台任务：阻塞收割并以注入结果
