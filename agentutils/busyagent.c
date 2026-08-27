@@ -24,8 +24,7 @@
 //config:	$BB_AGENT_HOME and restored automatically per working directory.
 //config:
 //applet:IF_BUSYAGENT(APPLET(busyagent, BB_DIR_USR_BIN, BB_SUID_DROP))
-//kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_json.o ba_util.o ba_prompt.o ba_display.o
-//kbuild:lib-$(CONFIG_BUSYAGENT) += ba_store.o ba_transport.o bb_http.o ba_tools.o
+//kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_impl.o
 
 //usage:#define busyagent_trivial_usage
 //usage:       "[OPTIONS] [PROMPT]"
@@ -49,13 +48,7 @@
 #include <unistd.h>
 #include <sys/utsname.h>
 #include <dirent.h>
-#include "ba_util.h"
-#include "ba_json.h"
-#include "ba_transport.h"
-#include "ba_store.h"
-#include "ba_prompt.h"
-#include "ba_display.h"
-#include "ba_tools.h"
+#include "busyagent.h"
 
 #define BA_MAX_TOKENS     16384
 #define BA_DEFAULT_TURNS  8

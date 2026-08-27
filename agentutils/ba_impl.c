@@ -1,0 +1,4979 @@
+/*
+ * ba_impl.c - support implementation for the busyagent applet.
+ *
+ * Everything the applet needs besides its main loop lives here, in
+ * dependency order: utils, JSON parser/serializer, HTTP client (SSE),
+ * session store, display rendering, protocol adaptation, system prompt
+ * assembly and the busybox tool executor.
+ */
+#include "busyagent.h"
+#include "ba_builtin_schemas.h"
+
+/* ==== ba_util.c ==== */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <time.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* ============================================================
+ * StrBuf — 动态字符串缓冲区
+ * ============================================================ */
+
+void sb_init(StrBuf *sb) {
+    sb->data = NULL;
+    sb->len = 0;
+    sb->cap = 0;
+}
+
+void sb_free(StrBuf *sb) {
+    free(sb->data);
+    sb->data = NULL;
+    sb->len = 0;
+    sb->cap = 0;
+}
+
+void sb_ensure(StrBuf *sb, size_t extra) {
+    if (sb->len + extra + 1 <= sb->cap) return;
+    size_t newcap = sb->cap ? sb->cap : 256;
+    while (newcap < sb->len + extra + 1) newcap *= 2;
+    char *p = realloc(sb->data, newcap);
+    if (!p) { fprintf(stderr, "out of memory\n"); abort(); }
+    sb->data = p;
+    sb->cap = newcap;
+}
+
+void sb_append(StrBuf *sb, const char *s) {
+    if (!s) return;
+    size_t n = strlen(s);
+    sb_appendn(sb, s, n);
+}
+
+void sb_appendn(StrBuf *sb, const char *s, size_t n) {
+    if (n == 0) return;
+    sb_ensure(sb, n);
+    memcpy(sb->data + sb->len, s, n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+}
+
+void sb_appendf(StrBuf *sb, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    sb_ensure(sb, (size_t)n);
+    vsnprintf(sb->data + sb->len, (size_t)n + 1, fmt, ap2);
+    va_end(ap2);
+    sb->len += (size_t)n;
+    sb->data[sb->len] = '\0';
+}
+
+void sb_append_char(StrBuf *sb, char c) {
+    sb_ensure(sb, 1);
+    sb->data[sb->len++] = c;
+    sb->data[sb->len] = '\0';
+}
+
+void sb_truncate(StrBuf *sb, size_t len) {
+    if (len < sb->len) {
+        sb->len = len;
+        sb->data[len] = '\0';
+    }
+}
+
+void sb_append_json_string(StrBuf *sb, const char *src) {
+    if (!src) { sb_append(sb, "null"); return; }
+    sb_append_char(sb, '"');
+    while (*src) {
+        unsigned char c = (unsigned char)*src;
+        switch (c) {
+            case '"':  sb_append(sb, "\\\""); src++; break;
+            case '\\': sb_append(sb, "\\\\"); src++; break;
+            case '\b': sb_append(sb, "\\b"); src++; break;
+            case '\f': sb_append(sb, "\\f"); src++; break;
+            case '\n': sb_append(sb, "\\n"); src++; break;
+            case '\r': sb_append(sb, "\\r"); src++; break;
+            case '\t': sb_append(sb, "\\t"); src++; break;
+            default:
+                if (c < 0x20) {
+                    /* 控制字符 → \uXXXX（JSON 规范要求） */
+                    sb_appendf(sb, "\\u%04x", c);
+                    src++;
+                } else {
+                    /* ASCII 可打印 + 所有非控制字节（含 UTF-8 多字节）原样输出
+                     * UTF-8 非法字节由上游 util_sanitize_utf8 在源头处理 */
+                    sb_append_char(sb, c);
+                    src++;
+                }
+                break;
+        }
+    }
+    sb_append_char(sb, '"');
+}
+
+void sb_append_shell_arg(StrBuf *sb, const char *src) {
+    if (!src) {
+        sb_append(sb, "''");
+        return;
+    }
+    sb_append_char(sb, '\'');
+    for (; *src; src++) {
+        if (*src == '\'') sb_append(sb, "'\\''");
+        else sb_append_char(sb, *src);
+    }
+    sb_append_char(sb, '\'');
+}
+
+/* UTF-8 sanitize：与 awk/sanitize_utf8.awk 完全一致的逻辑
+ * 逐字节扫描，非法 UTF-8 字节替换为字面文本 \ufffd（6 个 ASCII 字符）
+ * 返回新 malloc'd 字符串，调用者负责 free
+ */
+char *util_sanitize_utf8(const char *src) {
+    if (!src) return util_strdup("");
+    size_t len = strlen(src);
+    /* 最坏情况：每个字节都非法，替换为 6 字符 \ufffd */
+    StrBuf sb;
+    sb_init(&sb);
+    sb_ensure(&sb, len * 6 + 1);
+
+    const unsigned char *p = (const unsigned char *)src;
+    const unsigned char *end = p + len;
+
+    while (p < end) {
+        unsigned char b = *p;
+        if (b < 0x80) {
+            /* ASCII (0x00-0x7F): 直接输出 */
+            sb_append_char(&sb, b);
+            p++;
+        } else if (b >= 0xC2 && b <= 0xDF) {
+            /* 2 字节序列: C2-DF + 80-BF */
+            if (p + 1 < end && p[1] >= 0x80 && p[1] <= 0xBF) {
+                sb_appendn(&sb, (const char *)p, 2);
+                p += 2;
+            } else {
+                sb_append(&sb, "\\ufffd");
+                p++;
+            }
+        } else if (b >= 0xE0 && b <= 0xEF) {
+            /* 3 字节序列: E0-EF + 80-BF + 80-BF */
+            if (p + 2 < end && p[1] >= 0x80 && p[1] <= 0xBF && p[2] >= 0x80 && p[2] <= 0xBF) {
+                sb_appendn(&sb, (const char *)p, 3);
+                p += 3;
+            } else {
+                sb_append(&sb, "\\ufffd");
+                p++;
+            }
+        } else if (b >= 0xF0 && b <= 0xF4) {
+            /* 4 字节序列: F0-F4 + 80-BF + 80-BF + 80-BF */
+            if (p + 3 < end && p[1] >= 0x80 && p[1] <= 0xBF && p[2] >= 0x80 && p[2] <= 0xBF && p[3] >= 0x80 && p[3] <= 0xBF) {
+                sb_appendn(&sb, (const char *)p, 4);
+                p += 4;
+            } else {
+                sb_append(&sb, "\\ufffd");
+                p++;
+            }
+        } else {
+            /* 非法字节: C0-C1(过长编码), 80-BF(孤立 continuation), F5-FF(超范围) */
+            sb_append(&sb, "\\ufffd");
+            p++;
+        }
+    }
+    return sb.data;
+}
+
+/* ============================================================
+ * 工具函数
+ * ============================================================ */
+
+char *util_new_session_id(void) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char *buf = malloc(64);  /* 比实际需要的大，消除 -Wformat-truncation 警告 */
+    unsigned short r = (unsigned short)(rand() & 0xFFFF);
+    snprintf(buf, 64, "%04d%02d%02d-%02d%02d%02d-%04x",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, r);
+    return buf;
+}
+
+char *util_path_join(const char *a, const char *b) {
+    size_t alen = strlen(a);
+    /* 跳过 b 前导斜杠 */
+    while (*b == '/') b++;
+    size_t blen = strlen(b);
+    char *r = malloc(alen + 1 + blen + 1);
+    memcpy(r, a, alen);
+    /* 确保 a 末尾有斜杠 */
+    if (alen > 0 && a[alen - 1] != '/') {
+        r[alen++] = '/';
+    }
+    memcpy(r + alen, b, blen + 1);
+    return r;
+}
+
+int util_mkdirs(const char *path, int mode) {
+    char *tmp = util_strdup(path);
+    if (!tmp) return -1;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
+                free(tmp);
+                return -1;
+            }
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
+        free(tmp);
+        return -1;
+    }
+    free(tmp);
+    return 0;
+}
+
+const char *util_home_dir(void) {
+    const char *home = getenv("HOME");
+    if (home) return home;
+    return "/tmp";
+}
+
+char *util_strdup(const char *s) {
+    if (!s) return NULL;
+    return strdup(s);
+}
+
+const char *util_env(const char *name, const char *defval) {
+    const char *v = getenv(name);
+    return v ? v : defval;
+}
+
+char *util_timestamp_now(void) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char *buf = malloc(32);
+    strftime(buf, 32, "%Y-%m-%dT%H:%M:%S", &tm);
+    return buf;
+}
+
+long util_parse_size(const char *s) {
+    if (!s || !*s) return -1;
+    char *endp = NULL;
+    long val = strtol(s, &endp, 10);
+    if (endp == s || val <= 0) return -1;
+    if (*endp == 'k' || *endp == 'K') { val *= 1000; endp++; }
+    else if (*endp == 'm' || *endp == 'M') { val *= 1000000; endp++; }
+    else if (*endp == 'g' || *endp == 'G') { val *= 1000000000; endp++; }
+    return (*endp == '\0') ? val : -1;
+}
+
+long util_epoch_seconds(void) {
+    return (long)time(NULL);
+}
+
+int util_utf8_char_count(const char *s) {
+    int count = 0;
+    for (; *s; s++) {
+        /* UTF-8 后续字节是 10xxxxxx (0x80-0xBF)，不计为字符 */
+        if ((*(unsigned char*)s & 0xC0) != 0x80) count++;
+    }
+    return count;
+}
+
+size_t util_utf8_truncate_len(const char *s, size_t max_bytes) {
+    size_t len = strlen(s);
+    if (len <= max_bytes) return len;
+    /* 从 max_bytes 处往前跳过 UTF-8 后继字节 (10xxxxxx)，确保不在字符中间切断 */
+    while (max_bytes > 0 && ((unsigned char)s[max_bytes] & 0xC0) == 0x80) {
+        max_bytes--;
+    }
+    return max_bytes;
+}
+
+void util_truncate_str(char *s, size_t max_total) {
+    size_t len = strlen(s);
+    if (len <= max_total) return;
+    /* 留 3 字节给 "..."，UTF-8 安全截断 */
+    size_t cut = (max_total >= 3) ? max_total - 3 : 0;
+    cut = util_utf8_truncate_len(s, cut);
+    s[cut] = '.';
+    s[cut + 1] = '.';
+    s[cut + 2] = '.';
+    s[cut + 3] = '\0';
+}
+
+void util_truncate_chars(char *s, int max_chars) {
+    if (util_utf8_char_count(s) <= max_chars) return;
+    /* 留 3 字符给 "..."，找到前 (max_chars - 3) 个字符的字节位置 */
+    int target = max_chars >= 3 ? max_chars - 3 : 0;
+    int char_count = 0;
+    char *p = s;
+    while (*p && char_count < target) {
+        if ((*(unsigned char *)p & 0xC0) != 0x80) char_count++;
+        p++;
+    }
+    p[0] = '.'; p[1] = '.'; p[2] = '.'; p[3] = '\0';
+}
+
+char *util_rtrim(char *s) {
+    size_t len = strlen(s);
+    while (len > 0 && (s[len-1] == '\n' || s[len-1] == '\r' ||
+                       s[len-1] == ' '  || s[len-1] == '\t')) {
+        s[--len] = '\0';
+    }
+    return s;
+}
+
+char *util_read_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return NULL; }
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t nread = fread(buf, 1, (size_t)sz, f);
+    buf[nread] = '\0';
+    fclose(f);
+    return buf;
+}
+
+int util_write_file(const char *path, const char *content) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    size_t len = strlen(content);
+    size_t nw = fwrite(content, 1, len, f);
+    fclose(f);
+    return (nw == len) ? 0 : -1;
+}
+
+/* ==== ba_json.c ==== */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <errno.h>
+
+/* ============================================================
+ * 内部辅助
+ * ============================================================ */
+
+static void skip_ws(const char *src, size_t *pos) {
+    while (src[*pos] == ' ' || src[*pos] == '\t' ||
+           src[*pos] == '\n' || src[*pos] == '\r') {
+        (*pos)++;
+    }
+}
+
+static JsonParse make_err(const char *msg) {
+    JsonParse p;
+    memset(&p, 0, sizeof(p));
+    p.error = msg;
+    return p;
+}
+
+static JsonParse make_val(JsonType type, const char *src, size_t start, size_t end) {
+    JsonParse p;
+    p.val.type = type;
+    p.val.src = src;
+    p.val.start = start;
+    p.val.end = end;
+    p.error = NULL;
+    return p;
+}
+
+/* 解析 JSON 字符串（从开引号开始） */
+static JsonParse parse_string(const char *src, size_t *pos) {
+    size_t start = *pos;
+    (*pos)++; /* 跳过开引号 */
+    while (src[*pos] && src[*pos] != '"') {
+        if (src[*pos] == '\\') {
+            (*pos)++; /* 跳过转义字符 */
+        }
+        (*pos)++;
+    }
+    if (src[*pos] != '"') return make_err("unclosed string");
+    (*pos)++; /* 跳过闭引号 */
+    return make_val(JSON_STRING, src, start, *pos);
+}
+
+/* 解析 JSON 数字 */
+static JsonParse parse_number(const char *src, size_t *pos) {
+    size_t start = *pos;
+    if (src[*pos] == '-') (*pos)++;
+    while (isdigit((unsigned char)src[*pos])) (*pos)++;
+    if (src[*pos] == '.') {
+        (*pos)++;
+        while (isdigit((unsigned char)src[*pos])) (*pos)++;
+    }
+    if (src[*pos] == 'e' || src[*pos] == 'E') {
+        (*pos)++;
+        if (src[*pos] == '+' || src[*pos] == '-') (*pos)++;
+        while (isdigit((unsigned char)src[*pos])) (*pos)++;
+    }
+    return make_val(JSON_NUMBER, src, start, *pos);
+}
+
+/* 前向声明 */
+static JsonParse json_parse_internal(const char *src, size_t *pos);
+
+/* 解析 JSON 数组 */
+static JsonParse parse_array(const char *src, size_t *pos) {
+    size_t start = *pos;
+    (*pos)++; /* 跳过 [ */
+    skip_ws(src, pos);
+    if (src[*pos] == ']') { (*pos)++; return make_val(JSON_ARRAY, src, start, *pos); }
+    for (;;) {
+        skip_ws(src, pos);
+        JsonParse vp = json_parse(src, pos);
+        if (vp.error) return vp;
+        skip_ws(src, pos);
+        if (src[*pos] == ',') { (*pos)++; continue; }
+        if (src[*pos] == ']') { (*pos)++; break; }
+        return make_err("expected ',' or ']'");
+    }
+    return make_val(JSON_ARRAY, src, start, *pos);
+}
+
+/* 解析 JSON 对象 */
+static JsonParse parse_object(const char *src, size_t *pos) {
+    size_t start = *pos;
+    (*pos)++; /* 跳过 { */
+    skip_ws(src, pos);
+    if (src[*pos] == '}') { (*pos)++; return make_val(JSON_OBJECT, src, start, *pos); }
+    for (;;) {
+        skip_ws(src, pos);
+        if (src[*pos] != '"') return make_err("expected string key");
+        JsonParse kp = parse_string(src, pos);
+        if (kp.error) return kp;
+        skip_ws(src, pos);
+        if (src[*pos] != ':') return make_err("expected ':'");
+        (*pos)++;
+        skip_ws(src, pos);
+        JsonParse vp = json_parse(src, pos);
+        if (vp.error) return vp;
+        skip_ws(src, pos);
+        if (src[*pos] == ',') { (*pos)++; continue; }
+        if (src[*pos] == '}') { (*pos)++; break; }
+        return make_err("expected ',' or '}'");
+    }
+    return make_val(JSON_OBJECT, src, start, *pos);
+}
+
+/* 解析 JSON 值 */
+static JsonParse json_parse_internal(const char *src, size_t *pos) {    skip_ws(src, pos);
+    char c = src[*pos];
+    if (c == '"') return parse_string(src, pos);
+    if (c == '{') return parse_object(src, pos);
+    if (c == '[') return parse_array(src, pos);
+    if (c == 't') {
+        if (strncmp(src + *pos, "true", 4) == 0) { *pos += 4; return make_val(JSON_BOOL, src, *pos - 4, *pos); }
+        return make_err("expected 'true'");
+    }
+    if (c == 'f') {
+        if (strncmp(src + *pos, "false", 5) == 0) { *pos += 5; return make_val(JSON_BOOL, src, *pos - 5, *pos); }
+        return make_err("expected 'false'");
+    }
+    if (c == 'n') {
+        if (strncmp(src + *pos, "null", 4) == 0) { *pos += 4; return make_val(JSON_NULL, src, *pos - 4, *pos); }
+        return make_err("expected 'null'");
+    }
+    if (c == '-' || isdigit((unsigned char)c)) return parse_number(src, pos);
+    return make_err("unexpected character");
+}
+
+/* 公开的解析函数 */
+JsonParse json_parse(const char *src, size_t *pos) {
+    return json_parse_internal(src, pos);
+}
+
+JsonParse json_parse_root(const char *src) {
+    if (!src) return make_err("null input");
+    size_t pos = 0;
+    JsonParse p = json_parse_internal(src, &pos);
+    if (p.error) return p;
+    skip_ws(src, &pos);
+    if (src[pos] != '\0') return make_err("trailing content");
+    return p;
+}
+
+/* ============================================================
+ * 查询函数
+ * ============================================================ */
+
+JsonVal json_get(JsonVal obj, const char *key) {
+    if (obj.type != JSON_OBJECT) {
+        JsonVal null_val;
+        memset(&null_val, 0, sizeof(null_val));
+        return null_val;
+    }
+    size_t pos = obj.start + 1; /* 跳过 { */
+    const char *src = obj.src;
+    skip_ws(src, &pos);
+    if (src[pos] == '}') {
+        JsonVal null_val;
+        memset(&null_val, 0, sizeof(null_val));
+        return null_val;
+    }
+    for (;;) {
+        skip_ws(src, &pos);
+        /* 解析 key */
+        JsonParse kp = parse_string(src, &pos);
+        if (kp.error) break;
+        /* 比较 key（不含引号） */
+        size_t klen = (kp.val.end - 1) - (kp.val.start + 1);
+        const char *kstr = src + kp.val.start + 1;
+        bool match = (strlen(key) == klen && strncmp(key, kstr, klen) == 0);
+        skip_ws(src, &pos);
+        if (src[pos] != ':') break;
+        pos++;
+        skip_ws(src, &pos);
+        if (match) {
+            return json_parse(src, &pos).val;
+        }
+        /* 跳过值 */
+        JsonParse vp = json_parse(src, &pos);
+        if (vp.error) break;
+        skip_ws(src, &pos);
+        if (src[pos] == ',') { pos++; continue; }
+        break;
+    }
+    JsonVal null_val;
+    memset(&null_val, 0, sizeof(null_val));
+    return null_val;
+}
+
+char *json_get_string(JsonVal obj, const char *key) {
+    JsonVal v = json_get(obj, key);
+    return json_string_val(v);
+}
+
+int json_get_int(JsonVal obj, const char *key) {
+    JsonVal v = json_get(obj, key);
+    if (v.type != JSON_NUMBER) return 0;
+    /* 从 src 中提取子串并转 int */
+    char buf[64];
+    size_t len = v.end - v.start;
+    if (len >= sizeof(buf)) return 0;
+    memcpy(buf, v.src + v.start, len);
+    buf[len] = '\0';
+    return (int)strtod(buf, NULL);
+}
+
+long long json_get_ll(JsonVal obj, const char *key) {
+    JsonVal v = json_get(obj, key);
+    if (v.type != JSON_NUMBER) return 0;
+    char buf[64];
+    size_t len = v.end - v.start;
+    if (len >= sizeof(buf)) return 0;
+    memcpy(buf, v.src + v.start, len);
+    buf[len] = '\0';
+    return strtoll(buf, NULL, 10);
+}
+
+double json_get_double(JsonVal obj, const char *key) {
+    JsonVal v = json_get(obj, key);
+    return json_number_val(v);
+}
+
+bool json_get_bool(JsonVal obj, const char *key, bool def) {
+    JsonVal v = json_get(obj, key);
+    if (v.type == JSON_NULL) return def;
+    return json_bool_val(v);
+}
+
+/* ============================================================
+ * 数组操作
+ * ============================================================ */
+
+int json_array_len(JsonVal arr) {
+    if (arr.type != JSON_ARRAY) return 0;
+    int count = 0;
+    size_t pos = arr.start + 1; /* 跳过 [ */
+    const char *src = arr.src;
+    skip_ws(src, &pos);
+    if (src[pos] == ']') return 0;
+    for (;;) {
+        skip_ws(src, &pos);
+        JsonParse vp = json_parse(src, &pos);
+        if (vp.error) break;
+        count++;
+        skip_ws(src, &pos);
+        if (src[pos] == ',') { pos++; continue; }
+        break;
+    }
+    return count;
+}
+
+JsonVal json_array_get(JsonVal arr, int index) {
+    if (arr.type != JSON_ARRAY) {
+        JsonVal null_val;
+        memset(&null_val, 0, sizeof(null_val));
+        return null_val;
+    }
+    size_t pos = arr.start + 1;
+    const char *src = arr.src;
+    skip_ws(src, &pos);
+    if (src[pos] == ']') {
+        JsonVal null_val;
+        memset(&null_val, 0, sizeof(null_val));
+        return null_val;
+    }
+    int cur = 0;
+    for (;;) {
+        skip_ws(src, &pos);
+        JsonParse vp = json_parse(src, &pos);
+        if (vp.error) break;
+        if (cur == index) return vp.val;
+        cur++;
+        skip_ws(src, &pos);
+        if (src[pos] == ',') { pos++; continue; }
+        break;
+    }
+    JsonVal null_val;
+    memset(&null_val, 0, sizeof(null_val));
+    return null_val;
+}
+
+/* ============================================================
+ * 值提取
+ * ============================================================ */
+
+char *json_string_val(JsonVal v) {
+    if (v.type != JSON_STRING) return NULL;
+    /* 解码 JSON 字符串（去掉引号，处理转义） */
+    const char *src = v.src;
+    size_t start = v.start + 1; /* 跳过开引号 */
+    size_t end = v.end - 1;     /* 跳过闭引号 */
+    size_t len = end - start;
+    char *buf = malloc(len * 2 + 1); /* 最坏情况 */
+    size_t out = 0;
+    for (size_t i = start; i < end; i++) {
+        if (src[i] == '\\') {
+            i++;
+            switch (src[i]) {
+                case '"':  buf[out++] = '"'; break;
+                case '\\': buf[out++] = '\\'; break;
+                case '/':  buf[out++] = '/'; break;
+                case 'b':  buf[out++] = '\b'; break;
+                case 'f':  buf[out++] = '\f'; break;
+                case 'n':  buf[out++] = '\n'; break;
+                case 'r':  buf[out++] = '\r'; break;
+                case 't':  buf[out++] = '\t'; break;
+                case 'u': {
+                    /* \uXXXX — 支持 surrogate pair */
+                    unsigned int cp = 0;
+                    int hex_digits = 0;
+                    for (int j = 0; j < 4 && i + 1 < end; j++) {
+                        i++;
+                        char h = src[i];
+                        cp = cp * 16;
+                        if (h >= '0' && h <= '9') { cp += h - '0'; hex_digits++; }
+                        else if (h >= 'a' && h <= 'f') { cp += h - 'a' + 10; hex_digits++; }
+                        else if (h >= 'A' && h <= 'F') { cp += h - 'A' + 10; hex_digits++; }
+                        else break;
+                    }
+                    /* 畸形 \u（hex 不足 4 位）→ U+FFFD，避免内嵌 NUL 截断下游 */
+                    if (hex_digits < 4)
+                        cp = 0xFFFD;
+                    /* high surrogate? 检查紧跟的 \uDC00-\uDFFF */
+                    if (cp >= 0xD800 && cp <= 0xDBFF &&
+                        i + 1 < end && src[i + 1] == '\\' && src[i + 2] == 'u') {
+                        size_t saved = i;
+                        i += 2; /* 跳过 \u */
+                        unsigned int lo = 0;
+                        int valid = 1;
+                        for (int j = 0; j < 4 && i + 1 < end; j++) {
+                            i++;
+                            char h = src[i];
+                            if (h >= '0' && h <= '9') lo = lo * 16 + (h - '0');
+                            else if (h >= 'a' && h <= 'f') lo = lo * 16 + (h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') lo = lo * 16 + (h - 'A' + 10);
+                            else { valid = 0; break; }
+                        }
+                        if (valid && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        } else {
+                            /* 不是合法 low surrogate，回退 */
+                            i = saved;
+                        }
+                    }
+                    /* UTF-8 编码 */
+                    if (cp < 0x80) {
+                        buf[out++] = (char)cp;
+                    } else if (cp < 0x800) {
+                        buf[out++] = (char)(0xC0 | (cp >> 6));
+                        buf[out++] = (char)(0x80 | (cp & 0x3F));
+                    } else if (cp < 0x10000) {
+                        buf[out++] = (char)(0xE0 | (cp >> 12));
+                        buf[out++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        buf[out++] = (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        buf[out++] = (char)(0xF0 | (cp >> 18));
+                        buf[out++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                        buf[out++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        buf[out++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+                default: buf[out++] = src[i]; break;
+            }
+        } else {
+            buf[out++] = src[i];
+        }
+    }
+    buf[out] = '\0';
+    /* 缩减到实际大小 */
+    char *result = realloc(buf, out + 1);
+    return result ? result : buf;
+}
+
+double json_number_val(JsonVal v) {
+    if (v.type != JSON_NUMBER) return 0.0;
+    char buf[64];
+    size_t len = v.end - v.start;
+    if (len >= sizeof(buf)) return 0.0;
+    memcpy(buf, v.src + v.start, len);
+    buf[len] = '\0';
+    return strtod(buf, NULL);
+}
+
+bool json_bool_val(JsonVal v) {
+    if (v.type != JSON_BOOL) return false;
+    /* true 的文本是 "true"，false 是 "false" */
+    return v.src[v.start] == 't';
+}
+
+char *json_as_string(JsonVal v) {
+    if (v.type == JSON_STRING) return json_string_val(v);
+    if (v.type == JSON_NULL) return NULL;
+    /* 其他类型：提取原始文本 */
+    size_t len = v.end - v.start;
+    char *s = malloc(len + 1);
+    memcpy(s, v.src + v.start, len);
+    s[len] = '\0';
+    return s;
+}
+
+/* ============================================================
+ * Object 迭代器
+ * ============================================================ */
+
+void json_obj_iter_init(JsonObjectIter *it, JsonVal obj) {
+    memset(it, 0, sizeof(*it));
+    if (obj.type != JSON_OBJECT) return;
+    it->src = obj.src;
+    it->pos = obj.start + 1; /* 跳过 { */
+    it->first = true;
+}
+
+bool json_obj_iter_next(JsonObjectIter *it) {
+    /* 释放上一次迭代的 key */
+    free((char *)it->key);
+    it->key = NULL;
+
+    const char *src = it->src;
+    if (!src) return false;
+    skip_ws(src, &it->pos);
+    if (src[it->pos] == '}' || src[it->pos] == '\0') return false;
+    if (!it->first) {
+        /* 跳过逗号 */
+        if (src[it->pos] == ',') it->pos++;
+        skip_ws(src, &it->pos);
+        if (src[it->pos] == '}' || src[it->pos] == '\0') return false;
+    }
+    it->first = false;
+    /* 解析 key */
+    JsonParse kp = parse_string(src, &it->pos);
+    if (kp.error) return false;
+    /* key 文本（不含引号） */
+    size_t klen = (kp.val.end - 1) - (kp.val.start + 1);
+    char *key = malloc(klen + 1);
+    memcpy(key, src + kp.val.start + 1, klen);
+    key[klen] = '\0';
+    it->key = key; /* 注意：指向临时 buffer，调用者用完需自行处理 */
+    /* 跳过 : */
+    skip_ws(src, &it->pos);
+    if (src[it->pos] == ':') it->pos++;
+    skip_ws(src, &it->pos);
+    /* 解析 value */
+    JsonParse vp = json_parse(src, &it->pos);
+    if (vp.error) { free(key); return false; }
+    it->val = vp.val;
+    return true;
+}
+
+/* ============================================================
+ * JSONL 追加
+ * ============================================================ */
+
+int jsonl_append(const char *path, const char *json_line) {
+    FILE *f = fopen(path, "a");
+    if (!f) return -1;
+    fprintf(f, "%s\n", json_line);
+    fclose(f);
+    return 0;
+}
+
+void json_obj_iter_cleanup(JsonObjectIter *it) {
+    free((char *)it->key);
+    it->key = NULL;
+}
+
+/* ==== bb_http.c ==== */
+/*
+ * bb_http - plain-HTTP transport for busyagent
+ *
+ * Replaces the libcurl backend of bash-agent's transport.c using only
+ * busybox/libbb primitives: xhost2sockaddr for DNS, non-blocking connect
+ * with poll() timeout, safe_read/safe_poll for the body pump, and a wget
+ * style chunked decoder feeding the provider-agnostic SSE pump
+ * (sse_stream_feed) in ba_transport.c.
+ *
+ * Only http:// is supported in phase 1. TLS is a later phase.
+ *
+ * Copyright (C) 2026 by Lloyd Zhou <lloydzhou@qq.com>
+ *
+ * Licensed under GPLv2, see file LICENSE in this source tree.
+ */
+#include "libbb.h"
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#define BA_CONNECT_TIMEOUT_MS  5000
+#define BA_READ_TIMEOUT_MS    300000   /* idle timeout for SSE streams */
+#define BA_MAX_HEADER         (64 * 1024)
+#define BA_MAX_RETRIES        2
+#define BA_RETRY_MAX_TIME_MS  20000
+
+typedef struct {
+	char host[256];
+	int port;
+	char path[1024];
+} BaUrl;
+
+static int ba_parse_url(const char *url, BaUrl *u)
+{
+	char *colon;
+	const char *p, *slash;
+
+	memset(u, 0, sizeof(*u));
+	if (strncmp(url, "http://", 7) != 0)
+		return -1;
+	p = url + 7;
+	slash = strchr(p, '/');
+	if (!slash) {
+		snprintf(u->host, sizeof(u->host), "%s", p);
+		snprintf(u->path, sizeof(u->path), "/");
+	} else {
+		size_t hlen = slash - p;
+		if (hlen >= sizeof(u->host))
+			return -1;
+		memcpy(u->host, p, hlen);
+		u->host[hlen] = '\0';
+		snprintf(u->path, sizeof(u->path), "%s", slash);
+	}
+	colon = strchr(u->host, ':');
+	if (colon) {
+		u->port = atoi(colon + 1);
+		*colon = '\0';
+	} else {
+		u->port = 80;
+	}
+	if (!u->host[0] || u->port <= 0)
+		return -1;
+	return 0;
+}
+
+/* Connect with timeout (non-blocking connect + POLLOUT). -1 on error. */
+static int ba_connect(const char *host, int port)
+{
+	len_and_sockaddr *lsa;
+	int fd, flags, rc;
+	struct pollfd pfd;
+	socklen_t slen;
+	int err;
+
+	lsa = host2sockaddr(host, port);
+	if (!lsa)
+		return -1;
+	fd = socket(lsa->u.sa.sa_family, SOCK_STREAM, 0);
+	if (fd < 0) {
+		free(lsa);
+		return -1;
+	}
+	flags = fcntl(fd, F_GETFL, 0);
+	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	rc = connect(fd, &lsa->u.sa, lsa->len);
+	if (rc < 0 && errno != EINPROGRESS) {
+		close(fd);
+		free(lsa);
+		return -1;
+	}
+	if (rc != 0) {
+		pfd.fd = fd;
+		pfd.events = POLLOUT;
+		if (safe_poll(&pfd, 1, BA_CONNECT_TIMEOUT_MS) <= 0) {
+			close(fd);
+			free(lsa);
+			return -1;
+		}
+		err = 0;
+		slen = sizeof(err);
+		getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &slen);
+		if (err != 0) {
+			close(fd);
+			free(lsa);
+			return -1;
+		}
+	}
+	fcntl(fd, F_SETFL, flags);   /* back to blocking */
+	free(lsa);
+	return fd;
+}
+
+static int send_all(int fd, const char *buf, size_t len)
+{
+	size_t off = 0;
+	while (off < len) {
+		ssize_t n = send(fd, buf + off, len - off, 0);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		off += n;
+	}
+	return 0;
+}
+
+typedef struct {
+	int fd;
+	int chunked;              /* Transfer-Encoding: chunked */
+	long content_length;      /* -1 if unknown */
+	long body_left;           /* for content_length mode */
+	long chunk_left;          /* for chunked mode */
+	int chunk_state;          /* 0=hex line, 1=data, 2=data CRLF, 3=done */
+	int eof;
+	char hdr[BA_MAX_HEADER];
+	size_t hdr_len;
+	int status;
+	int got_header;
+	char pending[4096];
+	size_t pending_len;
+} BaResp;
+
+/* Read more bytes into buf, honoring idle timeout. Returns n>0, 0 on EOF, -1 on error/timeout. */
+static int ba_read(BaResp *r, char *buf, size_t bufsz)
+{
+	struct pollfd pfd;
+	int n;
+
+	pfd.fd = r->fd;
+	pfd.events = POLLIN;
+	for (;;) {
+		if (safe_poll(&pfd, 1, BA_READ_TIMEOUT_MS) < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR)))
+			return -1;   /* timeout */
+		break;
+	}
+	n = safe_read(r->fd, buf, bufsz);
+	return n;   /* 0 = EOF */
+}
+
+/* Read and parse the response header. Returns 0 on success. */
+static int ba_read_header(BaResp *r)
+{
+	char *p, *end, *save;
+	size_t idx;
+
+	while (r->hdr_len < BA_MAX_HEADER - 1) {
+		char *hit;
+		size_t have = r->hdr_len;
+
+		hit = (have >= 4) ? memmem(r->hdr, have, "\r\n\r\n", 4) : NULL;
+		if (hit)
+			break;
+		{
+			size_t want = BA_MAX_HEADER - 1 - r->hdr_len;
+			int n;
+			if (want > 4096)
+				want = 4096;
+			if (want == 0)
+				return -1;   /* header too large */
+			n = ba_read(r, r->hdr + r->hdr_len, want);
+			if (n <= 0)
+				return -1;
+			r->hdr_len += n;
+			r->hdr[r->hdr_len] = '\0';
+		}
+		hit = memmem(r->hdr, r->hdr_len, "\r\n\r\n", 4);
+		if (hit)
+			break;
+		(void)hit;
+	}
+	end = memmem(r->hdr, r->hdr_len, "\r\n\r\n", 4);
+	if (!end)
+		return -1;
+
+	/* the read that completed the header may have consumed body bytes:
+	 * keep them for ba_body_read (first SSE chunk lives here) */
+	{
+		size_t body_start = (end - r->hdr) + 4;
+		size_t avail = r->hdr_len - body_start;
+		if (avail > sizeof(r->pending))
+			avail = sizeof(r->pending);
+		memcpy(r->pending, r->hdr + body_start, avail);
+		r->pending_len = avail;
+	}
+
+	/* status code from first line */
+	r->status = 0;
+	p = strchr(r->hdr, ' ');
+	if (p)
+		r->status = atoi(p + 1);
+
+	r->chunked = 0;
+	r->content_length = -1;
+	r->got_header = 1;
+
+	for (idx = 0, save = NULL; ; idx++, save = NULL) {
+		char *line = strtok_r(idx == 0 ? r->hdr : NULL, "\r\n", &save);
+		if (!line)
+			break;
+		str_tolower(line);   /* libbb in-place lowercase */
+		if (strncmp(line, "transfer-encoding:", 18) == 0
+		 && strstr(line, "chunked"))
+			r->chunked = 1;
+		else if (strncmp(line, "content-length:", 15) == 0)
+			r->content_length = atol(line + 15);
+	}
+	if (r->chunked) {
+		r->chunk_state = 0;
+		r->chunk_left = 0;
+	} else {
+		r->body_left = r->content_length;
+	}
+	return 0;
+}
+
+/* Decode next piece of body into out (already de-chunked).
+ * Returns n>0 data, 0 end of body, -1 error. */
+static int ba_body_read(BaResp *r, char *out, size_t outsz)
+{
+	if (r->pending_len > 0) {
+		size_t n = r->pending_len < outsz ? r->pending_len : outsz;
+		memcpy(out, r->pending, n);
+		r->pending_len -= n;
+		memmove(r->pending, r->pending + n, r->pending_len);
+		return n;
+	}
+
+	if (r->eof)
+		return 0;
+
+	if (!r->chunked) {
+		int n;
+		size_t want = outsz;
+		if (r->content_length >= 0) {
+			if (r->body_left <= 0)
+				return 0;
+			if (want > (size_t)r->body_left)
+				want = r->body_left;
+		}
+		n = ba_read(r, out, want);
+		if (n < 0)
+			return -1;
+		if (n == 0) {
+			r->eof = 1;
+			return 0;
+		}
+		if (r->content_length >= 0)
+			r->body_left -= n;
+		return n;
+	}
+
+	/* chunked: state machine over a small scratch window */
+	for (;;) {
+		if (r->chunk_state == 3)
+			return 0;   /* done */
+		if (r->chunk_state == 1) {
+			int n = ba_read(r, out, r->chunk_left < (long)outsz ? r->chunk_left : outsz);
+			if (n < 0)
+				return -1;
+			if (n == 0)
+				return -1;   /* unexpected EOF mid-chunk */
+			r->chunk_left -= n;
+			if (r->chunk_left == 0)
+				r->chunk_state = 2;
+			return n;
+		}
+		if (r->chunk_state == 0 || r->chunk_state == 2) {
+			/* read a line: hex size or trailing CRLF / trailer */
+			char line[128];
+			size_t ln = 0;
+			int c;
+			for (;;) {
+				char ch;
+				c = ba_read(r, &ch, 1);
+				if (c <= 0)
+					return -1;
+				if (ch == '\n')
+					break;
+				if (ln < sizeof(line) - 1 && ch != '\r')
+					line[ln++] = ch;
+			}
+			line[ln] = '\0';
+			if (r->chunk_state == 2) {
+				if (ln == 0)
+					r->chunk_state = 3;   /* final CRLF after last chunk */
+				/* else: trailer header line, keep consuming */
+				continue;
+			}
+			/* state 0: hex size (possibly with ;ext) */
+			{
+				char *semi = strchr(line, ';');
+				if (semi)
+					*semi = '\0';
+			}
+			r->chunk_left = strtol(line, NULL, 16);
+			if (r->chunk_left == 0) {
+				r->chunk_state = 2;   /* last chunk; consume trailers + CRLF */
+				continue;
+			}
+			r->chunk_state = 1;
+			continue;
+		}
+	}
+}
+
+static void ba_send_request(int fd, const BaUrl *u, const char **headers,
+			    int header_count, const char *body, size_t body_len)
+{
+	char first[512];
+	int i;
+
+	if (u->port != 80)
+		snprintf(first, sizeof(first),
+			"POST %s HTTP/1.1\r\n"
+			"Host: %s:%d\r\n"
+			"Content-Length: %lu\r\n"
+			"Connection: close\r\n",
+			u->path, u->host, u->port, (unsigned long)body_len);
+	else
+		snprintf(first, sizeof(first),
+			"POST %s HTTP/1.1\r\n"
+			"Host: %s\r\n"
+			"Content-Length: %lu\r\n"
+			"Connection: close\r\n",
+			u->path, u->host, (unsigned long)body_len);
+	send_all(fd, first, strlen(first));
+	for (i = 0; i < header_count; i++) {
+		send_all(fd, headers[i], strlen(headers[i]));
+		send_all(fd, "\r\n", 2);
+	}
+	send_all(fd, "\r\n", 2);
+	send_all(fd, body, body_len);
+}
+
+
+/* Streaming POST with SSE pump. Mirrors the old curl semantics:
+ * up to 2 retries, 1s delay, 20s total retry window, retry on 5xx. */
+int http_post_sse(const char *url, const char **headers, int header_count,
+		  const char *body, size_t body_len,
+		  const char *provider,
+		  sse_callback_fn callback, void *ctx,
+		  volatile int *cancelled)
+{
+	BaUrl u;
+	char buf[4096];
+	unsigned start_ms = monotonic_ms();
+	int attempt;
+
+	if (ba_parse_url(url, &u) != 0)
+		return -1;
+
+	for (attempt = 0; attempt <= BA_MAX_RETRIES; attempt++) {
+		StreamCtx sctx;
+		BaResp r;
+		int fd = ba_connect(u.host, u.port);
+		int io_err = 0, http_code = 0;
+
+		if (fd < 0) {
+			io_err = 1;
+			goto attempt_done;
+		}
+		memset(&r, 0, sizeof(r));
+		r.fd = fd;
+		ba_send_request(fd, &u, headers, header_count, body, body_len);
+		if (ba_read_header(&r) != 0) {
+			io_err = 1;
+			close(fd);
+			goto attempt_done;
+		}
+		http_code = r.status;
+
+		sse_stream_init(&sctx, provider, callback, ctx, cancelled);
+		for (;;) {
+			int n = ba_body_read(&r, buf, sizeof(buf));
+			if (n < 0) {
+				io_err = 1;
+				break;
+			}
+			if (n == 0)
+				break;
+			if (sse_stream_feed(&sctx, buf, n) == 0) {
+				/* cancelled */
+				sse_stream_free(&sctx);
+				close(fd);
+				{
+					SseEvent st;
+					memset(&st, 0, sizeof(st));
+					st.type = SSE_STOP;
+					st.content = (char *)"interrupted";
+					callback(ctx, &st);
+				}
+				return 0;
+			}
+		}
+		close(fd);
+
+		if (!io_err && http_code < 500) {
+			/* non-SSE JSON error bodies etc. */
+			sse_stream_finish(&sctx, provider, callback, ctx);
+			sse_stream_free(&sctx);
+			if (http_code >= 400)
+				return http_code;
+			return 0;
+		}
+		sse_stream_free(&sctx);
+		/* 5xx or io error: fall through to retry logic */
+
+	attempt_done:
+		if (cancelled && *cancelled) {
+			SseEvent st;
+			memset(&st, 0, sizeof(st));
+			st.type = SSE_STOP;
+			st.content = (char *)"interrupted";
+			callback(ctx, &st);
+			return 0;
+		}
+		if (attempt >= BA_MAX_RETRIES)
+			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
+		(void)0;
+		if ((unsigned)(monotonic_ms() - start_ms) >= BA_RETRY_MAX_TIME_MS)
+			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
+		{
+			SseEvent retry_evt;
+			memset(&retry_evt, 0, sizeof(retry_evt));
+			retry_evt.type = SSE_RETRY;
+			callback(ctx, &retry_evt);
+		}
+		sleep(1);
+	}
+	return -1;
+}
+
+/* ==== ba_store.c ==== */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <time.h>
+
+/* ============================================================
+ * SessionPaths
+ * ============================================================ */
+
+void store_session_paths_free(SessionPaths *p) {
+    if (!p) return;
+    FREE_PTR(p->base_dir);
+    FREE_PTR(p->session_dir);
+    FREE_PTR(p->conversation);
+    FREE_PTR(p->events);
+    FREE_PTR(p->stats);
+    FREE_PTR(p->summary);
+    FREE_PTR(p->plan);
+    FREE_PTR(p->plan_draft);
+}
+
+char *store_session_project_key(const char *cwd) {
+    /* 对齐 bash 版 AWK 算法：
+     *   sub(/^\/+/, "", $0)              — 去前导 /
+     *   gsub(/\//, "-", $0)              — / → -
+     *   gsub(/[^A-Za-z0-9._-]/, "-", $0) — 非字母数字._- → -
+     *   gsub(/-+/, "-", $0)              — 压缩连续 -
+     *   sub(/^-+/, "", $0)               — 去前导 -
+     *   sub(/-+$/, "", $0)               — 去尾部 -
+     *   print "-" $0                      — 加 - 前缀
+     */
+    if (!cwd || !cwd[0]) return util_strdup("-");
+
+    size_t len = strlen(cwd);
+    char *key = malloc(len + 3); /* 足够加前缀 - */
+    if (!key) return NULL;
+
+    /* 跳过前导 / */
+    const char *src = cwd;
+    while (*src == '/') src++;
+
+    /* 逐步转换 */
+    size_t ki = 0;
+    char prev = '\0';
+    for (; *src; src++) {
+        char c = *src;
+        if (c == '/') c = '-';
+        else if (!(  (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                     (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+            c = '-';
+        /* 压缩连续 - */
+        if (c == '-' && prev == '-') continue;
+        key[ki++] = c;
+        prev = c;
+    }
+    key[ki] = '\0';
+
+    /* 去尾部 - */
+    while (ki > 0 && key[ki - 1] == '-') key[--ki] = '\0';
+
+    /* 加前缀 - */
+    char *result = malloc(ki + 2);
+    if (!result) { free(key); return NULL; }
+    result[0] = '-';
+    memcpy(result + 1, key, ki + 1);
+    free(key);
+    return result;
+}
+
+SessionPaths store_session_paths_for(const char *home, const char *cwd, const char *session_id) {
+    SessionPaths p;
+    memset(&p, 0, sizeof(p));
+
+    char *key = store_session_project_key(cwd);
+    StrBuf buf;
+    sb_init(&buf);
+
+    /* base_dir = $BB_AGENT_HOME/projects/<key> */
+    sb_appendf(&buf, "%s/projects/%s", home, key);
+    p.base_dir = util_strdup(buf.data);
+
+    /* session_dir = base_dir/<session-id> */
+    sb_truncate(&buf, 0);
+    sb_appendf(&buf, "%s/%s", p.base_dir, session_id);
+    p.session_dir = util_strdup(buf.data);
+
+    /* 各文件路径 */
+    sb_truncate(&buf, 0);
+    sb_appendf(&buf, "%s/conversation.jsonl", p.session_dir);
+    p.conversation = util_strdup(buf.data);
+
+    sb_truncate(&buf, 0);
+    sb_appendf(&buf, "%s/events.jsonl", p.session_dir);
+    p.events = util_strdup(buf.data);
+
+    sb_truncate(&buf, 0);
+    sb_appendf(&buf, "%s/stats.json", p.session_dir);
+    p.stats = util_strdup(buf.data);
+
+    sb_truncate(&buf, 0);
+    sb_appendf(&buf, "%s/summary.txt", p.session_dir);
+    p.summary = util_strdup(buf.data);
+
+    sb_truncate(&buf, 0);
+    sb_appendf(&buf, "%s/plan.md", p.session_dir);
+    p.plan = util_strdup(buf.data);
+
+    sb_truncate(&buf, 0);
+    sb_appendf(&buf, "%s/plan.draft", p.session_dir);
+    p.plan_draft = util_strdup(buf.data);
+
+    sb_free(&buf);
+    free(key);
+    return p;
+}
+
+/* touch 文件（如果不存在则创建） */
+static int touch_file(const char *path) {
+    FILE *f = fopen(path, "a");
+    if (!f) return -1;
+    fclose(f);
+    return 0;
+}
+
+const char *store_session_image_dir(const SessionPaths *paths) {
+    static __thread char buf[1024];
+    snprintf(buf, sizeof(buf), "%s/images", paths->session_dir);
+    return buf;
+}
+
+int store_session_init(const SessionPaths *p, int is_new) {
+    if (util_mkdirs(p->base_dir, 0755) != 0) return -1;
+    if (util_mkdirs(p->session_dir, 0755) != 0) return -1;
+    mkdir(store_session_image_dir(p), 0755);
+    touch_file(p->conversation);
+    touch_file(p->events);
+    touch_file(p->summary);
+    touch_file(p->plan);
+    touch_file(p->plan_draft);
+
+    if (is_new) {
+        /* 写入初始 stats.json */
+        FILE *f = fopen(p->stats, "w");
+        if (!f) return -1;
+        fprintf(f, "{\"current_turn_count\":0,\"agent_request_count\":0,"
+                   "\"compact_request_count\":0,\"sub_agent_request_count\":0,"
+                   "\"total_input_tokens\":0,"
+                   "\"total_output_tokens\":0,\"total_cache_read_tokens\":0,"
+                   "\"total_cache_creation_tokens\":0,\"current_context_tokens\":0,"
+                   "\"last_updated\":\"\"}\n");
+        fclose(f);
+
+        /* 写入 session_start 事件（与 bash 版对齐） */
+        {
+            StrBuf evt;
+            sb_init(&evt);
+            sb_append(&evt, "{\"type\":\"session_start\",\"session_id\":");
+            /* 从 session_dir 路径提取 session_id */
+            const char *sid = strrchr(p->session_dir, '/');
+            sb_append_json_string(&evt, sid ? sid + 1 : "");
+            sb_append_char(&evt, '}');
+            store_event_append(p, evt.data);
+            sb_free(&evt);
+        }
+    } else {
+        touch_file(p->stats);
+    }
+
+    /* 创建 images 目录 */
+    {
+        char imgdir[1024];
+        snprintf(imgdir, sizeof(imgdir), "%s/images", p->session_dir);
+        util_mkdirs(imgdir, 0755);
+    }
+
+    return 0;
+}
+
+int store_session_fork(const SessionPaths *parent, const SessionPaths *child) {
+    util_mkdirs(child->session_dir, 0755);
+    char *parent_conv = util_read_file(parent->conversation);
+    if (parent_conv && strlen(parent_conv) > 0) util_write_file(child->conversation, parent_conv);
+    free(parent_conv);
+    char *parent_summary = util_read_file(parent->summary);
+    if (parent_summary && strlen(parent_summary) > 0) util_write_file(child->summary, parent_summary);
+    free(parent_summary);
+    char *parent_plan = util_read_file(parent->plan);
+    if (parent_plan && strlen(parent_plan) > 0) util_write_file(child->plan, parent_plan);
+    free(parent_plan);
+    return 0;
+}
+
+int store_session_init_sub(const SessionPaths *parent_paths, const SessionPaths *sub_paths, int fork) {
+    if (fork) {
+        store_session_fork(parent_paths, sub_paths);
+    }
+    if (store_session_init(sub_paths, 1) != 0) return -1;
+    return 0;
+}
+
+char *session_new_id(void) {
+    time_t now = time(NULL);
+    static int seeded = 0;
+    if (!seeded) { srand((unsigned)(now ^ getpid())); seeded = 1; }
+    struct tm *t = localtime(&now);
+    unsigned short r = (unsigned short)(rand() % 0xFFFF);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%04d%02d%02d-%02d%02d%02d-%04x",
+             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec, r);
+    return util_strdup(buf);
+}
+
+char *store_session_resolve_continue(const char *home, const char *cwd) {
+    char *key = store_session_project_key(cwd);
+    StrBuf buf;
+    sb_init(&buf);
+    sb_appendf(&buf, "%s/projects/%s", home, key);
+
+    DIR *dir = opendir(buf.data);
+    if (!dir) { sb_free(&buf); free(key); return NULL; }
+
+    char *latest_id = NULL;
+    long latest_time = 0;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.' || strncmp(entry->d_name, "sub_", 4) == 0) continue;
+        /* 尝试解析目录名为时间戳: YYYYMMDD-HHMMSS-XXXX */
+        struct stat st;
+        sb_truncate(&buf, 0);
+        sb_appendf(&buf, "%s/projects/%s/%s", home, key, entry->d_name);
+        if (stat(buf.data, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        /* 优先用 events.jsonl 的 mtime，fallback 到目录 mtime（对齐 bash/rust） */
+        time_t mtime = st.st_mtime;
+        size_t base_len = buf.len;
+        sb_append(&buf, "/events.jsonl");
+        struct stat events_st;
+        if (stat(buf.data, &events_st) == 0) {
+            mtime = events_st.st_mtime;
+        }
+        sb_truncate(&buf, base_len);
+        if (mtime > latest_time) {
+            latest_time = mtime;
+            free(latest_id);
+            latest_id = util_strdup(entry->d_name);
+        }
+    }
+    closedir(dir);
+    sb_free(&buf);
+    free(key);
+    return latest_id;
+}
+
+int store_session_list_rows(const char *home, const char *cwd, StrBuf *out) {
+    char *key = store_session_project_key(cwd);
+    StrBuf buf;
+    sb_init(&buf);
+    sb_appendf(&buf, "%s/projects/%s", home, key);
+
+    struct dirent **namelist;
+    int n = scandir(buf.data, &namelist, NULL, alphasort);
+    if (n < 0) { sb_free(&buf); free(key); return 0; }
+
+    /* 收集有效 session 的 name 和 mtime */
+    char **names = calloc(n, sizeof(char *));
+    time_t *mtimes = calloc(n, sizeof(time_t));
+    int valid = 0;
+
+    for (int i = 0; i < n; i++) {
+        struct dirent *entry = namelist[i];
+        if (entry->d_name[0] == '.') { free(entry); continue; }
+        struct stat st;
+        sb_truncate(&buf, 0);
+        sb_appendf(&buf, "%s/projects/%s/%s", home, key, entry->d_name);
+        if (stat(buf.data, &st) != 0 || !S_ISDIR(st.st_mode)) { free(entry); continue; }
+        names[valid] = util_strdup(entry->d_name);
+        mtimes[valid] = st.st_mtime;
+        valid++;
+        free(entry);
+    }
+    free(namelist);
+
+    /* 按 mtime 降序排序 */
+    /* 间接排序：用索引数组 */
+    int *order = calloc(valid, sizeof(int));
+    for (int i = 0; i < valid; i++) order[i] = i;
+    /* 简单选择排序（session 数量通常不大）—— 用 mtimes[order[i]] 比较 */
+    for (int i = 0; i < valid - 1; i++) {
+        for (int j = i + 1; j < valid; j++) {
+            if (mtimes[order[j]] > mtimes[order[i]]) {
+                int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+            }
+        }
+    }
+
+    int count = 0;
+    for (int idx = 0; idx < valid; idx++) {
+        int i = order[idx];
+        struct stat st;
+        sb_truncate(&buf, 0);
+        sb_appendf(&buf, "%s/projects/%s/%s", home, key, names[i]);
+        stat(buf.data, &st);
+
+        /* modified: 目录 mtime，格式 YYYY-MM-DD HH:MM（对齐 bash） */
+        char time_buf[32];
+        struct tm *tm = localtime(&st.st_mtime);
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M", tm);
+
+        /* preview: 从 summary.txt 取第一行非空内容，超 60 字符截断为 57 + ... */
+        char preview[1024];
+        preview[0] = '\0';
+        size_t base_len = buf.len;
+        sb_append(&buf, "/summary.txt");
+        FILE *fp = fopen(buf.data, "r");
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                /* trim leading/trailing whitespace */
+                char *start = line;
+                while (*start && isspace((unsigned char)*start)) start++;
+                if (*start) {
+                    size_t len = strlen(start);
+                    while (len > 0 && isspace((unsigned char)start[len - 1])) start[--len] = '\0';
+                    strncpy(preview, start, sizeof(preview) - 1);
+                    preview[sizeof(preview) - 1] = '\0';
+                    break;
+                }
+            }
+            fclose(fp);
+        }
+        sb_truncate(&buf, base_len);
+
+        /* UTF-8 字符数截断（对齐 bash ${#preview} / rust chars().count()） */
+        util_truncate_chars(preview, 60);
+
+        sb_appendf(out, "%-40s %-16s %s\n", names[i], time_buf, preview);
+        count++;
+    }
+
+    for (int i = 0; i < valid; i++) FREE_PTR(names[i]);
+    free(names);
+    free(mtimes);
+    free(order);
+    sb_free(&buf);
+    free(key);
+    return count;
+}
+
+/* ============================================================
+ * conversation.jsonl 操作
+ * ============================================================ */
+
+int store_conv_add_user(const char *path, const char *content) {
+    StrBuf buf;
+    sb_init(&buf);
+    sb_appendf(&buf, "{\"role\":\"user\",\"content\":");
+    sb_append_json_string(&buf, content);
+    sb_append(&buf, "}");
+    int rc = jsonl_append(path, buf.data);
+    sb_free(&buf);
+    return rc;
+}
+
+int store_conv_add_assistant(const char *path, const char *thinking, const char *text,
+                       int tool_count, const char **tool_ids,
+                       const char **tool_names, const char **tool_inputs) {
+    StrBuf buf;
+    int first = 1;
+    sb_init(&buf);
+    sb_append(&buf, "{\"role\":\"assistant\",\"content\":[");
+
+    /* thinking block — 仅在有内容时写入（空块会被 Claude API 拒绝） */
+    if (thinking && thinking[0]) {
+        sb_append(&buf, "{\"type\":\"thinking\",\"thinking\":");
+        sb_append_json_string(&buf, thinking);
+        sb_append(&buf, "}");
+        first = 0;
+    }
+
+    /* text block — 同上 */
+    if (text && text[0]) {
+        if (!first) sb_append(&buf, ",");
+        sb_append(&buf, "{\"type\":\"text\",\"text\":");
+        sb_append_json_string(&buf, text);
+        sb_append(&buf, "}");
+        first = 0;
+    }
+
+    /* tool_use blocks */
+    for (int i = 0; i < tool_count; i++) {
+        if (!first) sb_append(&buf, ",");
+        sb_appendf(&buf, "{\"type\":\"tool_use\",\"id\":");
+        sb_append_json_string(&buf, tool_ids[i]);
+        sb_append(&buf, ",\"name\":");
+        sb_append_json_string(&buf, tool_names[i]);
+        sb_append(&buf, ",\"input\":");
+        sb_append(&buf, tool_inputs[i]); /* 已经是 JSON */
+        sb_append(&buf, "}");
+        first = 0;
+    }
+
+    /* 全空（无 thinking/text/tool_use）时补占位 text，保持消息合法 */
+    if (first)
+        sb_append(&buf, "{\"type\":\"text\",\"text\":\"(empty)\"}");
+
+    sb_append(&buf, "]}");
+    int rc = jsonl_append(path, buf.data);
+    sb_free(&buf);
+    return rc;
+}
+
+int store_conv_add_tool_results(const char *path, int count, const char **tool_use_ids,
+                          const char **contents) {
+    StrBuf buf;
+    sb_init(&buf);
+    sb_append(&buf, "{\"role\":\"user\",\"content\":[");
+    for (int i = 0; i < count; i++) {
+        if (i > 0) sb_append(&buf, ",");
+        sb_append(&buf, "{\"type\":\"tool_result\",\"tool_use_id\":");
+        sb_append_json_string(&buf, tool_use_ids[i]);
+        sb_append(&buf, ",\"content\":");
+        sb_append_json_string(&buf, contents[i]);
+        sb_append(&buf, "}");
+    }
+    sb_append(&buf, "]}");
+    int rc = jsonl_append(path, buf.data);
+    sb_free(&buf);
+    return rc;
+}
+
+int store_conv_line_count(const char *path, char ***out, int *out_count) {
+    *out = NULL;
+    *out_count = 0;
+
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    int cap = 64;
+    int count = 0;
+    char **lines = malloc(cap * sizeof(char *));
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t read_len;
+    if (!lines) goto fail;
+
+    /* getline 会按真实换行符扩容，不能将超长 JSONL 记录误当成多行。 */
+    while ((read_len = getline(&line, &line_cap, f)) != -1) {
+        /* 去除尾部换行 */
+        size_t len = (size_t)read_len;
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (len == 0) continue;
+
+        if (count >= cap) {
+            int new_cap = cap * 2;
+            char **new_lines = realloc(lines, new_cap * sizeof(char *));
+            if (!new_lines) goto fail;
+            lines = new_lines;
+            cap = new_cap;
+        }
+        lines[count] = util_strdup(line);
+        if (!lines[count]) goto fail;
+        count++;
+    }
+
+    free(line);
+    fclose(f);
+    *out = lines;
+    *out_count = count;
+    return 0;
+
+fail:
+    free(line);
+    fclose(f);
+    for (int i = 0; i < count; i++) free(lines[i]);
+    free(lines);
+    return -1;
+}
+
+int store_conv_trim_tail(const char *path, int keep_lines) {
+    char **lines = NULL;
+    int count = 0;
+    if (store_conv_line_count(path, &lines, &count) != 0) return -1;
+    if (keep_lines >= count) {
+        for (int i = 0; i < count; i++) free(lines[i]);
+        free(lines);
+        return 0;
+    }
+
+    /* 重写文件，只保留最后 keep_lines 行 */
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        for (int i = 0; i < count; i++) free(lines[i]);
+        free(lines);
+        return -1;
+    }
+    int start = count - keep_lines;
+    for (int i = start; i < count; i++) {
+        fprintf(f, "%s\n", lines[i]);
+    }
+    fclose(f);
+    for (int i = 0; i < count; i++) free(lines[i]);
+    free(lines);
+    return 0;
+}
+
+int store_conv_user_turn_count(const char *path) {
+    char **lines = NULL;
+    int count = 0;
+    if (store_conv_line_count(path, &lines, &count) != 0) return 0;
+    int user_count = 0;
+    for (int i = 0; i < count; i++) {
+        JsonParse jp = json_parse_root(lines[i]);
+        if (jp.error) continue;
+        char *role = json_get_string(jp.val, "role");
+        if (role && strcmp(role, "user") == 0) {
+            JsonVal content = json_get(jp.val, "content");
+            if (content.type == JSON_STRING) {
+                user_count++;
+            }
+        }
+        free(role);
+    }
+    for (int i = 0; i < count; i++) free(lines[i]);
+    free(lines);
+    return user_count;
+}
+
+long store_conv_total_bytes(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fclose(f);
+    return sz;
+}
+
+/* ============================================================
+ * stats.json 操作
+ * ============================================================ */
+
+char *store_stats_read(const char *path) {
+    return util_read_file(path);
+}
+
+static void stats_write_canonical(const char *path,
+                                  int current_turn_count,
+                                  int agent_request_count,
+                                  int compact_request_count,
+                                  int sub_agent_request_count,
+                                  int total_input_tokens,
+                                  int total_output_tokens,
+                                  int total_cache_read_tokens,
+                                  int total_cache_creation_tokens,
+                                  int current_context_tokens,
+                                  const char *last_updated) {
+    StrBuf buf;
+    sb_init(&buf);
+    sb_appendf(&buf, "{\"current_turn_count\":%d,\"agent_request_count\":%d,"
+               "\"compact_request_count\":%d,\"sub_agent_request_count\":%d,"
+               "\"total_input_tokens\":%d,\"total_output_tokens\":%d,"
+               "\"total_cache_read_tokens\":%d,\"total_cache_creation_tokens\":%d,"
+               "\"current_context_tokens\":%d,\"last_updated\":",
+               current_turn_count, agent_request_count, compact_request_count,
+               sub_agent_request_count, total_input_tokens, total_output_tokens,
+               total_cache_read_tokens, total_cache_creation_tokens,
+               current_context_tokens);
+    sb_append_json_string(&buf, last_updated ? last_updated : "");
+    sb_append(&buf, "}\n");
+    util_write_file(path, buf.data);
+    sb_free(&buf);
+}
+
+void store_stats_add_int(JsonVal obj, const char *key, int delta) {
+    int cur = store_stats_get_int(obj, key);
+    store_stats_set_int(obj, key, cur + delta);
+}
+
+void store_stats_set_int(JsonVal obj, const char *key, int value) {
+    /* 原地修改 JSON 源字符串中的数字值。
+     * 仅在 store_stats_update 的回调中使用。
+     * 新数字位数 <= 旧数字位数时直接覆写，多余位用空格填充。
+     * 新数字位数 > 旧数字位数时无法原地修改，跳过。 */
+    if (!obj.src) return;
+    /* 在源文本中找到 "key":<number> 模式 */
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(obj.src, search);
+    if (!p) return;
+    p += strlen(search);
+    /* 跳过空白和冒号 */
+    while (*p == ' ' || *p == ':') p++;
+    /* p 现在指向值的开始 */
+    const char *val_start = p;
+    /* 找到值的结束（逗号、}或空白） */
+    while (*p && *p != ',' && *p != '}' && *p != ' ' && *p != '\n' && *p != '\r') p++;
+    int old_len = (int)(p - val_start);
+    char new_val[32];
+    snprintf(new_val, sizeof(new_val), "%d", value);
+    int new_len = (int)strlen(new_val);
+    if (new_len > old_len) return; /* 无法原地扩展 */
+    memcpy((char*)val_start, new_val, new_len);
+    /* 用空格填充多余位置 */
+    for (int i = new_len; i < old_len; i++) ((char*)val_start)[i] = ' ';
+}
+
+int store_stats_get_int(JsonVal obj, const char *key) {
+    return json_get_int(obj, key);
+}
+
+/* 简易文件级操作：从 stats 文件中读取整数字段 */
+int store_stats_get_file_int(const char *path, const char *key) {
+    char *content = store_stats_read(path);
+    if (!content) return 0;
+    JsonParse jp = json_parse_root(content);
+    int val = jp.error ? 0 : json_get_int(jp.val, key);
+    free(content);
+    return val;
+}
+
+/* 设置 stats 文件中的整数字段。
+ * 读取已有字段；缺失/无效字段按 0 处理；写回标准 stats JSON。
+ * 这样旧版本缺字段时，下一次正常写入会自然补齐，不做历史回算。 */
+void store_stats_set_int_file(const char *path, const char *key, int value) {
+    int current_turn_count = 0, agent_request_count = 0;
+    int compact_request_count = 0, sub_agent_request_count = 0;
+    int total_input_tokens = 0, total_output_tokens = 0;
+    int total_cache_read_tokens = 0, total_cache_creation_tokens = 0;
+    int current_context_tokens = 0;
+
+    char *content = store_stats_read(path);
+    if (content && content[0]) {
+        JsonParse jp = json_parse_root(content);
+        if (!jp.error) {
+            current_turn_count = json_get_int(jp.val, "current_turn_count");
+            agent_request_count = json_get_int(jp.val, "agent_request_count");
+            compact_request_count = json_get_int(jp.val, "compact_request_count");
+            sub_agent_request_count = json_get_int(jp.val, "sub_agent_request_count");
+            total_input_tokens = json_get_int(jp.val, "total_input_tokens");
+            total_output_tokens = json_get_int(jp.val, "total_output_tokens");
+            total_cache_read_tokens = json_get_int(jp.val, "total_cache_read_tokens");
+            total_cache_creation_tokens = json_get_int(jp.val, "total_cache_creation_tokens");
+            current_context_tokens = json_get_int(jp.val, "current_context_tokens");
+        }
+    }
+
+    if (strcmp(key, "current_turn_count") == 0) current_turn_count = value;
+    else if (strcmp(key, "agent_request_count") == 0) agent_request_count = value;
+    else if (strcmp(key, "compact_request_count") == 0) compact_request_count = value;
+    else if (strcmp(key, "sub_agent_request_count") == 0) sub_agent_request_count = value;
+    else if (strcmp(key, "total_input_tokens") == 0) total_input_tokens = value;
+    else if (strcmp(key, "total_output_tokens") == 0) total_output_tokens = value;
+    else if (strcmp(key, "total_cache_read_tokens") == 0) total_cache_read_tokens = value;
+    else if (strcmp(key, "total_cache_creation_tokens") == 0) total_cache_creation_tokens = value;
+    else if (strcmp(key, "current_context_tokens") == 0) current_context_tokens = value;
+
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    gmtime_r(&now, &tm_buf);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+    stats_write_canonical(path, current_turn_count, agent_request_count,
+                          compact_request_count, sub_agent_request_count,
+                          total_input_tokens, total_output_tokens,
+                          total_cache_read_tokens, total_cache_creation_tokens,
+                          current_context_tokens, ts);
+    if (content) {
+        free(content);
+    }
+}
+
+/* 通用 stats 更新：读取→修改→写回 */
+int store_stats_update(const char *path, stats_update_fn fn, void *ctx) {
+    char *content = util_read_file(path);
+    if (!content) return -1;
+
+    JsonParse jp = json_parse_root(content);
+    if (jp.error) { free(content); return -1; }
+
+    /* 调用回调修改（我们用 StrBuf 重新序列化整个对象） */
+    fn(ctx, jp.val);
+
+    /* 重新序列化 */
+    StrBuf buf;
+    sb_init(&buf);
+    sb_append_char(&buf, '{');
+    JsonObjectIter it;
+    json_obj_iter_init(&it, jp.val);
+    int first = 1;
+    while (json_obj_iter_next(&it)) {
+        if (!first) sb_append(&buf, ",");
+        first = 0;
+        sb_append_json_string(&buf, it.key);
+        sb_append_char(&buf, ':');
+        /* 值直接取原始文本 */
+        size_t vlen = it.val.end - it.val.start;
+        sb_appendn(&buf, jp.val.src + it.val.start, vlen);
+    }
+    sb_append_char(&buf, '}');
+    sb_append_char(&buf, '\n');
+
+    int rc = util_write_file(path, buf.data);
+    sb_free(&buf);
+    free(content);
+    return rc;
+}
+
+/* ============================================================
+ * events.jsonl 操作
+ * ============================================================ */
+
+static _Thread_local int g_store_event_stream_json = 0;
+
+void store_event_set_stream_json(int enabled) {
+    g_store_event_stream_json = enabled ? 1 : 0;
+}
+
+int store_event_stream_json_enabled(void) {
+    return g_store_event_stream_json;
+}
+
+int store_event_append(const SessionPaths *p, const char *json_str) {
+    if (g_store_event_stream_json) {
+        printf("%s\n", json_str);
+        fflush(stdout);
+    }
+    return jsonl_append(p->events, json_str);
+}
+
+int store_event_lines(const SessionPaths *p, char ***out, int *out_count) {
+    return store_conv_line_count(p->events, out, out_count);
+}
+
+/* ============================================================
+ * summary / plan 文件操作
+ * ============================================================ */
+
+char *store_summary_get(const SessionPaths *p) {
+    char *s = util_read_file(p->summary);
+    if (s) {
+        size_t len = strlen(s);
+        while (len > 0 && (s[len-1] == '\n' || s[len-1] == '\r'))
+            s[--len] = '\0';
+        if (len == 0) { free(s); return NULL; }
+    }
+    return s;
+}
+
+int store_summary_set(const SessionPaths *p, const char *content) {
+    return util_write_file(p->summary, content);
+}
+
+char *store_plan_draft_read(const SessionPaths *p) {
+    return util_read_file(p->plan_draft);
+}
+
+int store_plan_draft_set(const SessionPaths *p, const char *content) {
+    return util_write_file(p->plan_draft, content);
+}
+
+int store_plan_draft_clear(const SessionPaths *p) {
+    return util_write_file(p->plan_draft, "");
+}
+
+int store_plan_set(const SessionPaths *p, const char *content) {
+    return util_write_file(p->plan, content);
+}
+
+int store_plan_clear(const SessionPaths *p) {
+    return util_write_file(p->plan, "");
+}
+
+/* ==== ba_display.c ==== */
+/*
+ * ba_display.c - synchronous display layer, ported from bash-agent
+ * display.c / agent_tool_display_summary. Rendering rules, ANSI colors,
+ * truncation and stream-json shapes are verbatim; linenoise output calls
+ * degrade to plain stdio because busyagent is always non-interactive.
+ *
+ * Copyright (C) 2026 by Lloyd Zhou <lloydzhou@qq.com>
+ *
+ * Licensed under GPLv2, see file LICENSE in this source tree.
+ */
+#include "libbb.h"
+#include <string.h>
+#include <stdio.h>
+
+/* ---- DisplayState（逐字移植） ---- */
+static void ds_init(BaDisplay *ds) {
+    memset(ds, 0, sizeof(*ds));
+    ds->last_char[0] = '\n';
+    ds->last_char[1] = '\0';
+    ds->prev_was_thinking = 0;
+}
+
+static void ds_update_last_char(BaDisplay *ds, const char *text) {
+    if (!text || !*text) return;
+    {
+        const char *p = text;
+        const char *last = p;
+        while (*p) {
+            last = p;
+            unsigned char c = (unsigned char)*p;
+            if (c < 0x80) p++;
+            else if (c < 0xE0) p += 2;
+            else if (c < 0xF0) p += 3;
+            else p += 4;
+        }
+        size_t len = p - last;
+        if (len > 0 && len < 8) {
+            memcpy(ds->last_char, last, len);
+            ds->last_char[len] = '\0';
+        }
+    }
+}
+
+/* linenoiseWrite 的非交互等价（busyagent 无 raw-mode 终端） */
+static void lw_write(const char *s, size_t n) {
+    /* bash-agent 的 linenoiseWrite 为即时输出；流式 delta 不能滞留在
+     * stdout 缓冲（tty 全缓冲/管道场景会整体延迟到退出才可见） */
+    fwrite(s, 1, n, stdout);
+    fflush(stdout);
+}
+
+#include <stdarg.h>
+static void lw_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    fflush(stdout);
+}
+
+static void ensure_newline(BaDisplay *ds) {
+    if (ds->last_char[0] != '\n') {
+        lw_write("\n", 1);
+        ds->last_char[0] = '\n';
+        ds->last_char[1] = '\0';
+    }
+}
+
+void ba_disp_init(BaDisplay *d, BaDisplayFormat fmt)
+{
+    ds_init(d);
+    d->format = fmt;
+    d->out = stdout;
+}
+
+/* ---- tool_call 摘要（逐字移植 agent_tool_display_summary） ---- */
+char *ba_tool_call_summary(const char *name, const char *input_json)
+{
+    char *field = NULL;
+    JsonParse jp = json_parse_root(input_json && input_json[0] ? input_json : "{}");
+
+    if (!jp.error) {
+        if (!strcmp(name, "Read") || !strcmp(name, "Write") || !strcmp(name, "Edit")) {
+            field = json_get_string(jp.val, "path");
+        } else if (!strcmp(name, "Glob") || !strcmp(name, "Grep")) {
+            field = json_get_string(jp.val, "pattern");
+        } else if (!strcmp(name, "Bash")) {
+            field = json_get_string(jp.val, "command");
+            /* 替换换行为空格，截断过长命令（对齐 bash 版行为） */
+            if (field) {
+                char *p;
+                while ((p = strchr(field, '\n')) != NULL) *p = ' ';
+                size_t flen = strlen(field);
+                if (flen > 80) {
+                    size_t slen = util_utf8_truncate_len(field, 77);
+                    char *trunc = malloc(slen + 4);
+                    memcpy(trunc, field, slen);
+                    strcpy(trunc + slen, "...");
+                    free(field);
+                    field = trunc;
+                }
+            }
+        } else if (!strcmp(name, "TodoWrite")) {
+            JsonVal todos_arr = json_get(jp.val, "todos");
+            if (todos_arr.type == JSON_ARRAY) {
+                int total = json_array_len(todos_arr);
+                int comp = 0;
+                for (int ti = 0; ti < total; ti++) {
+                    JsonVal it = json_array_get(todos_arr, ti);
+                    char *st = json_get_string(it, "status");
+                    if (st && strcmp(st, "completed") == 0) comp++;
+                    free(st);
+                }
+                char buf2[32];
+                snprintf(buf2, sizeof(buf2), "%d/%d", comp, total);
+                field = xstrdup(buf2);
+            }
+        } else if (!strcmp(name, "Skill")) {
+            field = json_get_string(jp.val, "name");
+        } else if (!strcmp(name, "SubAgent")) {
+            field = json_get_string(jp.val, "description");
+        }
+    }
+
+    if (field)
+        return field;
+    if (input_json && input_json[0]) {
+        size_t len = strlen(input_json);
+        size_t cut = len > 80 ? util_utf8_truncate_len(input_json, 77) : len;
+        char *s = xmalloc(cut + 4);
+        memcpy(s, input_json, cut);
+        strcpy(s + cut, len > 80 ? "..." : "");
+        return s;
+    }
+    return xstrdup("");
+}
+
+/* ---- 渲染主体：逐字移植 render_message 双分支 ---- */
+char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
+{
+    StrBuf buf;
+
+    if (ds->format == BA_FMT_NONE)
+        return NULL;
+
+    if (ds->format == BA_FMT_STREAM_JSON) {
+        sb_init(&buf);
+        switch (msg->type) {
+        case BA_DM_TEXT:
+            sb_append(&buf, "{\"type\":\"text\",\"content\":");
+            sb_append_json_string(&buf, msg->content ? msg->content : "");
+            sb_append_char(&buf, '}');
+            break;
+        case BA_DM_THINKING:
+            sb_append(&buf, "{\"type\":\"thinking\",\"content\":");
+            sb_append_json_string(&buf, msg->content ? msg->content : "");
+            sb_append_char(&buf, '}');
+            break;
+        case BA_DM_TOOL_CALL:
+            sb_append(&buf, "{\"type\":\"tool_call\",\"name\":");
+            sb_append_json_string(&buf, msg->tool_name ? msg->tool_name : "");
+            sb_append(&buf, ",\"id\":");
+            sb_append_json_string(&buf, msg->tool_id ? msg->tool_id : "");
+            sb_append(&buf, ",\"input\":");
+            sb_append(&buf, (msg->tool_input && msg->tool_input[0]) ? msg->tool_input : "{}");
+            sb_append_char(&buf, '}');
+            break;
+        case BA_DM_TOOL_RESULT:
+            sb_append(&buf, "{\"type\":\"tool_result\",\"tool_use_id\":");
+            sb_append_json_string(&buf, msg->tool_id ? msg->tool_id : "");
+            sb_append(&buf, ",\"name\":");
+            sb_append_json_string(&buf, msg->tool_name ? msg->tool_name : "");
+            sb_append(&buf, ",\"content\":");
+            sb_append_json_string(&buf, msg->content ? msg->content : "");
+            sb_append_char(&buf, '}');
+            break;
+        case BA_DM_USAGE:
+            sb_appendf(&buf, "{\"type\":\"usage\",\"input_tokens\":%d,\"output_tokens\":%d,"
+                       "\"cache_read_input_tokens\":%d,\"cache_creation_input_tokens\":%d,"
+                       "\"kind\":\"agent\"}",
+                       msg->in_tokens, msg->out_tokens,
+                       msg->cache_read_tokens, msg->cache_creation_tokens);
+            break;
+        case BA_DM_STOP:
+            sb_append(&buf, "{\"type\":\"stop\",\"reason\":");
+            sb_append_json_string(&buf, msg->content ? msg->content : "");
+            sb_append_char(&buf, '}');
+            break;
+        case BA_DM_ERROR:
+            sb_append(&buf, "{\"type\":\"error\",\"message\":");
+            sb_append_json_string(&buf, msg->content ? msg->content : "");
+            sb_append_char(&buf, '}');
+            break;
+        case BA_DM_SUB_AGENT_START:
+            sb_append(&buf, "{\"type\":\"sub_agent_start\",\"session_id\":");
+            sb_append_json_string(&buf, msg->session_id ? msg->session_id : "");
+            sb_append_char(&buf, '}');
+            break;
+        case BA_DM_SUB_AGENT_RESULT:
+            sb_append(&buf, "{\"type\":\"sub_agent_result\",\"session_id\":");
+            sb_append_json_string(&buf, msg->session_id ? msg->session_id : "");
+            sb_appendf(&buf, ",\"status\":\"%s\"",
+                       msg->tool_exit_code == 0 ? "ok" : "failed");
+            sb_appendf(&buf, ",\"input_tokens\":%d,\"output_tokens\":%d}",
+                       msg->in_tokens, msg->out_tokens);
+            break;
+        case BA_DM_ASYNC_TASK_RESULT:
+            sb_append(&buf, "{\"type\":\"async_task_result\",\"task_id\":");
+            sb_append_json_string(&buf, msg->session_id ? msg->session_id : "");
+            sb_appendf(&buf, ",\"exit_code\":%d,\"output\":",
+                       msg->tool_exit_code);
+            sb_append_json_string(&buf, msg->content ? msg->content : "");
+            sb_append_char(&buf, '}');
+            break;
+        default:
+            sb_free(&buf);
+            return NULL;
+        }
+        fprintf(ds->out, "%s\n", buf.data);
+        fflush(ds->out);
+        return buf.data;
+    }
+
+    /* human 模式（ANSI/截断规则逐字移植） */
+    switch (msg->type) {
+    case BA_DM_THINKING:
+        if (msg->content)
+            lw_printf("\x1b[90m%s\x1b[0m", msg->content);
+        ds_update_last_char(ds, msg->content);
+        ds->prev_was_thinking = 1;
+        break;
+
+    case BA_DM_TEXT:
+        if (msg->content) {
+            if (ds->prev_was_thinking && ds->last_char[0] != '\n') {
+                lw_write("\n", 1);
+                ds->last_char[0] = '\n';
+            }
+            lw_write(msg->content, strlen(msg->content));
+            ds_update_last_char(ds, msg->content);
+        }
+        ds->prev_was_thinking = 0;
+        break;
+
+    case BA_DM_TOOL_CALL: {
+        ensure_newline(ds);
+        const char *name = msg->tool_name ? msg->tool_name : "unknown";
+        const char *summary = msg->content ? msg->content : "";
+        lw_printf("\x1b[33m[tool] %s(%s)\x1b[0m\n", name, summary);
+        ds->last_char[0] = '\n';
+        ds->prev_was_thinking = 0;
+        break;
+    }
+
+    case BA_DM_TOOL_RESULT:
+        if (msg->content && msg->content[0]) {
+            if (ds->prev_was_thinking && ds->last_char[0] != '\n')
+                lw_write("\n", 1);
+            ds->prev_was_thinking = 0;
+            lw_printf("%s\n", msg->content);
+            ds->last_char[0] = '\n';
+        }
+        break;
+
+    case BA_DM_USAGE:
+        break;
+
+    case BA_DM_STOP:
+        ensure_newline(ds);
+        if (msg->content && strcmp(msg->content, "interrupted") == 0)
+            lw_printf("\x1b[36mInterrupted.\x1b[0m\n");
+        ds->last_char[0] = '\n';
+        break;
+
+    case BA_DM_ERROR:
+        ensure_newline(ds);
+        lw_printf("\x1b[31mError: %s\x1b[0m\n",
+                msg->content ? msg->content : "unknown");
+        ds->last_char[0] = '\n';
+        break;
+
+    case BA_DM_CONTEXT_UPDATE:
+        ensure_newline(ds);
+        lw_printf("\x1b[36mContext compacted (%s).\x1b[0m\n",
+                msg->tool_name ? msg->tool_name : "auto");
+        ds->last_char[0] = '\n';
+        break;
+
+    case BA_DM_SUB_AGENT_START:
+        break;   /* human 无输出（display.c:250 同款） */
+
+    case BA_DM_SUB_AGENT_RESULT: {
+        ensure_newline(ds);
+        if (msg->tool_exit_code == 0)
+            lw_printf("\x1b[35m[sub-agent %s] completed (in=%d, out=%d)\x1b[0m\n",
+                    msg->session_id ? msg->session_id : "?",
+                    msg->in_tokens, msg->out_tokens);
+        else
+            lw_printf("\x1b[31m[sub-agent %s] failed\x1b[0m\n",
+                    msg->session_id ? msg->session_id : "?");
+        if (msg->tool_name && msg->tool_name[0]) {
+            int tlen = (int)util_utf8_truncate_len(msg->tool_name, 120);
+            lw_printf("\x1b[90m%.*s%s\x1b[0m\n",
+                    tlen, msg->tool_name,
+                    strlen(msg->tool_name) > 120 ? "\xe2\x80\xa6" : "");
+        }
+        if (msg->content && msg->content[0]) {
+            int clen = (int)util_utf8_truncate_len(msg->content, 120);
+            lw_printf("%.*s%s\n",
+                    clen, msg->content,
+                    strlen(msg->content) > 120 ? "\xe2\x80\xa6" : "");
+        }
+        ds->last_char[0] = '\n';
+        ds->prev_was_thinking = 0;
+        break;
+    }
+
+    case BA_DM_ASYNC_TASK_RESULT: {
+        ensure_newline(ds);
+        lw_printf("\x1b[%sm[bg-bash %s] exit_code=%d\x1b[0m\n",
+                msg->tool_exit_code == 0 ? "36" : "31",
+                msg->session_id ? msg->session_id : "?", msg->tool_exit_code);
+        if (msg->content && msg->content[0]) {
+            int clen = (int)util_utf8_truncate_len(msg->content, 120);
+            lw_printf("%.*s%s\n",
+                    clen, msg->content,
+                    strlen(msg->content) > 120 ? "\xe2\x80\xa6" : "");
+        }
+        ds->last_char[0] = '\n';
+        ds->prev_was_thinking = 0;
+        break;
+    }
+
+    default:
+        break;
+    }
+    return NULL;
+}
+
+/* ==== ba_transport.c ==== */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <time.h>
+#include <unistd.h>
+
+
+static void emit_simple_event(sse_callback_fn callback, void *ctx,
+                              SseEventType type, const char *content);
+static void fill_openai_usage_event(SseEvent *evt, JsonVal usage);
+static void process_residual_json(StreamCtx *sctx, const char *provider,
+                              sse_callback_fn callback, void *ctx);
+
+static void streamctx_free_openai_tools(StreamCtx *sctx) {
+    for (int i = 0; i < sctx->responses_item_count; i++) FREE_PTR(sctx->responses_item_ids[i]);
+    FREE_PTR(sctx->responses_item_ids);
+    FREE_PTR(sctx->responses_item_indexes);
+    sctx->responses_item_count = 0;
+    sctx->responses_item_cap = 0;
+    for (int i = 0; i < sctx->openai_tool_count; i++) {
+        FREE_PTR(sctx->openai_tools[i].id);
+        FREE_PTR(sctx->openai_tools[i].name);
+        sb_free(&sctx->openai_tools[i].arguments);
+    }
+    FREE_PTR(sctx->openai_tools);
+    sctx->openai_tool_count = 0;
+    sctx->openai_tool_cap = 0;
+}
+
+static void streamctx_reset_openai_tool(OpenAIToolAccum *tool) {
+    FREE_PTR(tool->id);
+    FREE_PTR(tool->name);
+    sb_free(&tool->arguments);
+    memset(tool, 0, sizeof(*tool));
+}
+
+static OpenAIToolAccum *streamctx_ensure_openai_tool(StreamCtx *sctx, int idx) {
+    for (int i = 0; i < sctx->openai_tool_count; i++) {
+        if (sctx->openai_tools[i].index == idx) return &sctx->openai_tools[i];
+    }
+    if (sctx->openai_tool_count >= sctx->openai_tool_cap) {
+        int old_cap = sctx->openai_tool_cap;
+        sctx->openai_tool_cap = sctx->openai_tool_cap ? sctx->openai_tool_cap * 2 : 4;
+        sctx->openai_tools = realloc(sctx->openai_tools,
+            (size_t)sctx->openai_tool_cap * sizeof(*sctx->openai_tools));
+        memset(sctx->openai_tools + old_cap, 0,
+            (size_t)(sctx->openai_tool_cap - old_cap) * sizeof(*sctx->openai_tools));
+    }
+    OpenAIToolAccum *tool = &sctx->openai_tools[sctx->openai_tool_count++];
+    tool->index = idx;
+    sb_init(&tool->arguments);
+    return tool;
+}
+
+static void streamctx_emit_openai_tool_calls(StreamCtx *sctx) {
+    for (int i = 0; i < sctx->openai_tool_count; i++) {
+        OpenAIToolAccum *tool = &sctx->openai_tools[i];
+        if (tool->arguments.len == 0) continue;
+        SseEvent evt;
+        memset(&evt, 0, sizeof(evt));
+        evt.type = SSE_TOOL_CALL;
+        evt.tool_id = tool->id ? tool->id : "";
+        evt.tool_name = tool->name ? tool->name : "";
+        evt.tool_input = tool->arguments.data ? tool->arguments.data : "{}";
+        sctx->callback(sctx->ctx, &evt);
+        streamctx_reset_openai_tool(tool);
+    }
+    sctx->openai_tool_count = 0;
+}
+
+static void parse_openai_sse_event(StreamCtx *sctx, const char *data, size_t data_len) {
+    if (data_len == 0) return;
+    if (strcmp(data, "[DONE]") == 0) return;
+
+    size_t pos = 0;
+    JsonParse jp = json_parse(data, &pos);
+    if (jp.error) return;
+
+    char *obj_type = json_get_string(jp.val, "object");
+    if (!obj_type || strcmp(obj_type, "chat.completion.chunk") != 0) {
+        FREE_PTR(obj_type);
+        return;
+    }
+    FREE_PTR(obj_type);
+
+    JsonVal choices = json_get(jp.val, "choices");
+    if (choices.type == JSON_ARRAY) {
+        JsonVal choice = json_array_get(choices, 0);
+        JsonVal delta = json_get(choice, "delta");
+        char *content = json_get_string(delta, "content");
+        if (content) {
+            emit_simple_event(sctx->callback, sctx->ctx, SSE_TEXT, content);
+            FREE_PTR(content);
+        }
+        char *reasoning = json_get_string(delta, "reasoning_content");
+        if (!reasoning) reasoning = json_get_string(delta, "reasoning");
+        if (reasoning) {
+            emit_simple_event(sctx->callback, sctx->ctx, SSE_THINKING, reasoning);
+            FREE_PTR(reasoning);
+        }
+        JsonVal tool_calls = json_get(delta, "tool_calls");
+        if (tool_calls.type == JSON_ARRAY) {
+            int tc_len = json_array_len(tool_calls);
+            for (int i = 0; i < tc_len; i++) {
+                JsonVal tc = json_array_get(tool_calls, i);
+                int idx = json_get_int(tc, "index");
+                JsonVal fn = json_get(tc, "function");
+                OpenAIToolAccum *tool = streamctx_ensure_openai_tool(sctx, idx);
+                char *id = json_get_string(tc, "id");
+                char *name = json_get_string(fn, "name");
+                char *arguments = json_get_string(fn, "arguments");
+                /* 非标准 OpenAI 兼容 API（如 sensenova）在后续 chunk 中
+                 * 发送空字符串 "" 而非省略字段，必须用 [0] 检查避免覆盖 */
+                if (id && id[0]) {
+                    FREE_PTR(tool->id);
+                    tool->id = id;
+                } else {
+                    FREE_PTR(id);
+                }
+                if (name && name[0]) {
+                    FREE_PTR(tool->name);
+                    tool->name = name;
+                } else {
+                    FREE_PTR(name);
+                }
+                if (arguments) {
+                    sb_append(&tool->arguments, arguments);
+                    FREE_PTR(arguments);
+                }
+            }
+        }
+        char *finish = json_get_string(choice, "finish_reason");
+        /* 非标准 API 可能用空字符串 "" 代替 null（如 sensenova），
+         * 空字符串不应触发 STOP */
+        if (finish && finish[0]) {
+            if (strcmp(finish, "tool_calls") == 0) {
+                streamctx_emit_openai_tool_calls(sctx);
+                emit_simple_event(sctx->callback, sctx->ctx, SSE_STOP, "tool_use");
+            } else if (strcmp(finish, "stop") == 0) {
+                emit_simple_event(sctx->callback, sctx->ctx, SSE_STOP, "end_turn");
+            } else if (strcmp(finish, "length") == 0) {
+                emit_simple_event(sctx->callback, sctx->ctx, SSE_STOP, "max_tokens");
+            } else {
+                emit_simple_event(sctx->callback, sctx->ctx, SSE_STOP, finish);
+            }
+            FREE_PTR(finish);
+        }
+    }
+
+    JsonVal usage = json_get(jp.val, "usage");
+    if (usage.type != JSON_NULL) {
+        SseEvent evt;
+        memset(&evt, 0, sizeof(evt));
+        evt.type = SSE_USAGE;
+        fill_openai_usage_event(&evt, usage);
+        sctx->callback(sctx->ctx, &evt);
+    }
+}
+
+
+
+static int responses_tool_index(StreamCtx *sctx, JsonVal root, JsonVal item) {
+    char *item_id = json_get_string(root, "item_id");
+    if (!item_id && item.type != JSON_NULL) item_id = json_get_string(item, "id");
+    JsonVal output_index = json_get(root, "output_index");
+    int idx = output_index.type == JSON_NUMBER ? json_get_int(root, "output_index") : -1;
+    if (idx < 0 && item_id) {
+        for (int i = 0; i < sctx->responses_item_count; i++) {
+            if (strcmp(sctx->responses_item_ids[i], item_id) == 0) { idx = sctx->responses_item_indexes[i]; break; }
+        }
+    }
+    if (idx >= 0 && item_id) {
+        int found = 0;
+        for (int i = 0; i < sctx->responses_item_count; i++) if (strcmp(sctx->responses_item_ids[i], item_id) == 0) { found = 1; break; }
+        if (!found) {
+            if (sctx->responses_item_count >= sctx->responses_item_cap) {
+                sctx->responses_item_cap = sctx->responses_item_cap ? sctx->responses_item_cap * 2 : 4;
+                sctx->responses_item_ids = realloc(sctx->responses_item_ids, (size_t)sctx->responses_item_cap * sizeof(char *));
+                sctx->responses_item_indexes = realloc(sctx->responses_item_indexes, (size_t)sctx->responses_item_cap * sizeof(int));
+            }
+            int pos = sctx->responses_item_count++;
+            sctx->responses_item_ids[pos] = util_strdup(item_id);
+            sctx->responses_item_indexes[pos] = idx;
+        }
+    }
+    FREE_PTR(item_id);
+    return idx;
+}
+
+static void responses_record_usage(StreamCtx *sctx, JsonVal response) {
+    JsonVal usage = json_get(response, "usage");
+    if (usage.type == JSON_NULL) usage = response;
+    sctx->responses_output_tokens = json_get_int(usage, "output_tokens");
+    JsonVal input_details = json_get(usage, "input_tokens_details");
+    int nested_cached = input_details.type == JSON_NULL ? 0 : json_get_int(input_details, "cached_tokens");
+    sctx->responses_cache_read_tokens = nested_cached > 0
+        ? nested_cached
+        : json_get_int(usage, "cached_tokens");
+    sctx->responses_input_tokens = json_get_int(usage, "input_tokens") - sctx->responses_cache_read_tokens;
+    if (sctx->responses_input_tokens < 0) sctx->responses_input_tokens = 0;
+}
+
+static void responses_emit_usage(StreamCtx *sctx) {
+    SseEvent evt;
+    memset(&evt, 0, sizeof(evt));
+    evt.type = SSE_USAGE;
+    evt.in_tokens = sctx->responses_input_tokens;
+    evt.out_tokens = sctx->responses_output_tokens;
+    evt.cache_read_tokens = sctx->responses_cache_read_tokens;
+    sctx->callback(sctx->ctx, &evt);
+}
+
+static void parse_responses_sse_event(StreamCtx *sctx, const char *event, const char *data, size_t data_len) {
+    if (data_len == 0) return;
+    size_t pos = 0;
+    JsonParse jp = json_parse(data, &pos);
+    if (jp.error) return;
+    JsonVal root = jp.val;
+    if (strcmp(event, "response.reasoning_text.delta") == 0) {
+        char *delta = json_get_string(root, "delta");
+        if (delta && delta[0]) emit_simple_event(sctx->callback, sctx->ctx, SSE_THINKING, delta);
+        FREE_PTR(delta);
+    } else if (strcmp(event, "response.output_text.delta") == 0) {
+        char *delta = json_get_string(root, "delta");
+        if (delta) {
+            char *text = delta;
+            if (!sctx->responses_saw_text) while (*text == '\n' || *text == '\r') text++;
+            if (*text) { sctx->responses_saw_text = 1; emit_simple_event(sctx->callback, sctx->ctx, SSE_TEXT, text); }
+        }
+        FREE_PTR(delta);
+    } else if (strcmp(event, "response.output_item.added") == 0 || strcmp(event, "response.output_item.done") == 0) {
+        JsonVal item = json_get(root, "item");
+        char *type = json_get_string(item, "type");
+        if (type && strcmp(type, "function_call") == 0) {
+            int idx = responses_tool_index(sctx, root, item);
+            if (idx < 0) { FREE_PTR(type); return; }
+            OpenAIToolAccum *tool = streamctx_ensure_openai_tool(sctx, idx);
+            char *id = json_get_string(item, "call_id");
+            char *name = json_get_string(item, "name");
+            char *args = json_get_string(item, "arguments");
+            if (id && id[0]) { FREE_PTR(tool->id); tool->id = id; } else FREE_PTR(id);
+            if (name && name[0]) { FREE_PTR(tool->name); tool->name = name; } else FREE_PTR(name);
+            if (args && args[0]) { sb_truncate(&tool->arguments, 0); sb_append(&tool->arguments, args); }
+            FREE_PTR(args);
+        }
+        FREE_PTR(type);
+    } else if (strcmp(event, "response.function_call_arguments.delta") == 0) {
+        int idx = responses_tool_index(sctx, root, json_get(root, "item"));
+        if (idx < 0) return;
+        OpenAIToolAccum *tool = streamctx_ensure_openai_tool(sctx, idx);
+        char *delta = json_get_string(root, "delta");
+        if (delta) { sb_append(&tool->arguments, delta); FREE_PTR(delta); }
+    } else if (strcmp(event, "response.completed") == 0) {
+        JsonVal response = json_get(root, "response");
+        if (response.type == JSON_NULL) response = root;
+        responses_record_usage(sctx, response);
+        int has_tools = sctx->openai_tool_count > 0;
+        streamctx_emit_openai_tool_calls(sctx);
+        responses_emit_usage(sctx);
+        emit_simple_event(sctx->callback, sctx->ctx, SSE_STOP, has_tools ? "tool_use" : "end_turn");
+        sctx->responses_terminal = 1;
+    } else if (strcmp(event, "response.failed") == 0 || strcmp(event, "response.incomplete") == 0 || strcmp(event, "error") == 0) {
+        JsonVal response = json_get(root, "response");
+        if (response.type == JSON_NULL) response = root;
+        responses_record_usage(sctx, response);
+        JsonVal error = json_get(response, "error");
+        char *message = json_get_string(error, "message");
+        if (!message) message = json_get_string(response, "message");
+        if (!message) message = json_get_string(response, "reason");
+        if (!message) message = util_strdup(strcmp(event, "response.incomplete") == 0 ? "Response incomplete" : (strcmp(event, "error") == 0 ? "Stream error" : "Response failed"));
+        emit_simple_event(sctx->callback, sctx->ctx, SSE_ERROR, message);
+        FREE_PTR(message);
+        responses_emit_usage(sctx);
+        emit_simple_event(sctx->callback, sctx->ctx, SSE_STOP, "error");
+        sctx->responses_terminal = 1;
+    }
+}
+
+/* 喂入一块解码后的响应体字节，内部按行切分 SSE 事件。
+ * 由 bb_http.c 的数据泵调用；返回 0 表示收到取消信号应中止。 */
+int sse_stream_feed(StreamCtx *sctx, const char *ptr, size_t total) {
+    if (sctx->cancelled && *(sctx->cancelled)) return 0;
+
+    for (size_t i = 0; i < total; i++) {
+        if (sctx->cancelled && *(sctx->cancelled)) return 0;
+        if (ptr[i] == '\n') {
+            char *line = sctx->line_buf.data;
+            size_t llen;
+            if (!line) {   /* empty line before any data (SSE allows it) */
+                continue;
+            }
+            llen = strlen(line);
+            if (llen > 0 && line[llen-1] == '\r') line[--llen] = '\0';
+
+            if (strncmp(line, "event: ", 7) == 0 && strcmp(sctx->provider, "responses") == 0) {
+                FREE_PTR(sctx->event);
+                sctx->event = util_strdup(line + 7);
+            } else if (strncmp(line, "data: ", 6) == 0) {
+                const char *data = line + 6;
+                if (strcmp(sctx->provider, "openai") == 0) parse_openai_sse_event(sctx, data, strlen(data));
+                else if (strcmp(sctx->provider, "responses") == 0) parse_responses_sse_event(sctx, sctx->event ? sctx->event : "", data, strlen(data));
+                else sse_parse_event(sctx->provider, data, strlen(data), sctx->callback, sctx->ctx);
+            } else if (strncmp(line, "data:", 5) == 0) {
+                const char *data = line + 5;
+                while (*data == ' ') data++;
+                if (strcmp(sctx->provider, "openai") == 0) parse_openai_sse_event(sctx, data, strlen(data));
+                else if (strcmp(sctx->provider, "responses") == 0) parse_responses_sse_event(sctx, sctx->event ? sctx->event : "", data, strlen(data));
+                else sse_parse_event(sctx->provider, data, strlen(data), sctx->callback, sctx->ctx);
+            }
+            sb_truncate(&sctx->line_buf, 0);
+        } else {
+            sb_append_char(&sctx->line_buf, ptr[i]);
+        }
+    }
+    return 1;
+}
+
+/* 初始化/释放 StreamCtx（原 http_post_sse 中的内联初始化抽出） */
+void sse_stream_init(StreamCtx *sctx, const char *provider,
+                     sse_callback_fn callback, void *ctx,
+                     volatile int *cancelled) {
+    memset(sctx, 0, sizeof(*sctx));
+    sctx->callback = callback;
+    sctx->ctx = ctx;
+    sb_init(&sctx->line_buf);
+    sctx->cancelled = cancelled;
+    sctx->provider = (char *)provider;
+}
+
+
+/* 流结束后：处理非 SSE 的残留 JSON、检查 responses 是否收到终止事件。
+ * 对应原 curl 版 http_post_sse 成功分支的收尾逻辑。 */
+void sse_stream_finish(StreamCtx *sctx, const char *provider,
+                       sse_callback_fn callback, void *ctx) {
+    process_residual_json(sctx, provider, callback, ctx);
+    if (strcmp(provider, "responses") == 0 && !sctx->responses_terminal) {
+        emit_simple_event(callback, ctx, SSE_ERROR, "Stream interrupted (no response.completed received)");
+        emit_simple_event(callback, ctx, SSE_STOP, "error");
+    }
+}
+
+void sse_stream_free(StreamCtx *sctx) {
+    sb_free(&sctx->line_buf);
+    FREE_PTR(sctx->event);
+    streamctx_free_openai_tools(sctx);
+}
+
+/* ============================================================
+ * HTTP 请求
+ * ============================================================ */
+
+/* forward declaration — 定义在 sse_parse_event 之前 */
+static void emit_simple_event(sse_callback_fn callback, void *ctx,
+                              SseEventType type, const char *content);
+
+static int openai_cached_tokens(JsonVal usage) {
+    int cached = json_get_int(usage, "cached_tokens");
+    if (cached > 0) return cached;
+    JsonVal details = json_get(usage, "prompt_tokens_details");
+    if (details.type != JSON_NULL) cached = json_get_int(details, "cached_tokens");
+    return cached;
+}
+
+static void fill_openai_usage_event(SseEvent *evt, JsonVal usage) {
+    int prompt = json_get_int(usage, "prompt_tokens");
+    int cached = openai_cached_tokens(usage);
+    evt->out_tokens = json_get_int(usage, "completion_tokens");
+    evt->cache_read_tokens = cached;
+    if (prompt > 0) {
+        evt->in_tokens = prompt - cached;
+        if (evt->in_tokens < 0) evt->in_tokens = 0;
+    }
+}
+
+/* 处理非 SSE 响应：如果 line_buf 中有残留 JSON，作为完整响应解析 */
+static void process_residual_json(StreamCtx *sctx, const char *provider,
+                                  sse_callback_fn callback, void *ctx) {
+    if (!sctx->line_buf.data || sctx->line_buf.len == 0) return;
+    char *residual = sctx->line_buf.data;
+    while (*residual == ' ' || *residual == '\t' || *residual == '\r' || *residual == '\n') residual++;
+    if (*residual != '{') return;
+
+    size_t pos = 0;
+    JsonParse jp = json_parse(residual, &pos);
+    if (jp.error) return;
+
+    char *err_msg = json_get_string(jp.val, "error");
+    if (err_msg) {
+        emit_simple_event(callback, ctx, SSE_ERROR, err_msg);
+        free(err_msg);
+    } else if (strcmp(provider, "claude") == 0) {
+        JsonVal content = json_get(jp.val, "content");
+        if (content.type == JSON_ARRAY) {
+            int clen = json_array_len(content);
+            for (int i = 0; i < clen; i++) {
+                JsonVal block = json_array_get(content, i);
+                char *btype = json_get_string(block, "type");
+                if (btype && strcmp(btype, "text") == 0) {
+                    char *txt = json_get_string(block, "text");
+                    if (txt) { emit_simple_event(callback, ctx, SSE_TEXT, txt); free(txt); }
+                } else if (btype && strcmp(btype, "thinking") == 0) {
+                    char *txt = json_get_string(block, "thinking");
+                    if (txt) { emit_simple_event(callback, ctx, SSE_THINKING, txt); free(txt); }
+                } else if (btype && strcmp(btype, "tool_use") == 0) {
+                    char *id = json_get_string(block, "id");
+                    char *name = json_get_string(block, "name");
+                    SseEvent evt;
+                    memset(&evt, 0, sizeof(evt));
+                    evt.type = SSE_TOOL_CALL;
+                    evt.tool_id = id;
+                    evt.tool_name = name;
+                    evt.tool_input = "{}";
+                    callback(ctx, &evt);
+                    free(id); free(name);
+                }
+                free(btype);
+            }
+        }
+        char *stop_reason = json_get_string(jp.val, "stop_reason");
+        if (stop_reason) {
+            emit_simple_event(callback, ctx, SSE_STOP, stop_reason);
+            free(stop_reason);
+        }
+        JsonVal usage = json_get(jp.val, "usage");
+        if (usage.type != JSON_NULL) {
+            SseEvent evt;
+            memset(&evt, 0, sizeof(evt));
+            evt.type = SSE_USAGE;
+            evt.in_tokens = json_get_int(usage, "input_tokens");
+            evt.out_tokens = json_get_int(usage, "output_tokens");
+            evt.cache_read_tokens = json_get_int(usage, "cache_read_input_tokens");
+            evt.cache_creation_tokens = json_get_int(usage, "cache_creation_input_tokens");
+            callback(ctx, &evt);
+        }
+    } else {
+        JsonVal choices = json_get(jp.val, "choices");
+        if (choices.type == JSON_ARRAY) {
+            JsonVal choice = json_array_get(choices, 0);
+            JsonVal msg = json_get(choice, "message");
+            char *content = json_get_string(msg, "content");
+            if (content) {
+                emit_simple_event(callback, ctx, SSE_TEXT, content);
+                free(content);
+            }
+            char *reasoning = json_get_string(msg, "reasoning_content");
+            if (!reasoning) reasoning = json_get_string(msg, "reasoning");
+            if (reasoning) {
+                emit_simple_event(callback, ctx, SSE_THINKING, reasoning);
+                free(reasoning);
+            }
+            JsonVal tool_calls = json_get(msg, "tool_calls");
+            if (tool_calls.type == JSON_ARRAY) {
+                int tc_len = json_array_len(tool_calls);
+                for (int i = 0; i < tc_len; i++) {
+                    JsonVal tc = json_array_get(tool_calls, i);
+                    JsonVal fn = json_get(tc, "function");
+                    char *id = json_get_string(tc, "id");
+                    char *name = json_get_string(fn, "name");
+                    char *arguments = json_get_string(fn, "arguments");
+                    SseEvent evt;
+                    memset(&evt, 0, sizeof(evt));
+                    evt.type = SSE_TOOL_CALL;
+                    evt.tool_id = id;
+                    evt.tool_name = name;
+                    evt.tool_input = arguments ? arguments : (char *)"{}";
+                    callback(ctx, &evt);
+                    free(id);
+                    free(name);
+                    free(arguments);
+                }
+            }
+            char *finish = json_get_string(choice, "finish_reason");
+            if (finish) {
+                if (strcmp(finish, "tool_calls") == 0) emit_simple_event(callback, ctx, SSE_STOP, "tool_use");
+                else if (strcmp(finish, "stop") == 0) emit_simple_event(callback, ctx, SSE_STOP, "end_turn");
+                else emit_simple_event(callback, ctx, SSE_STOP, finish);
+                free(finish);
+            }
+        }
+        JsonVal usage = json_get(jp.val, "usage");
+        if (usage.type != JSON_NULL) {
+            SseEvent evt;
+            memset(&evt, 0, sizeof(evt));
+            evt.type = SSE_USAGE;
+            fill_openai_usage_event(&evt, usage);
+            callback(ctx, &evt);
+        }
+    }
+}
+
+
+/* ============================================================
+ * SSE 事件解析
+ * ============================================================ */
+
+static void emit_simple_event(sse_callback_fn callback, void *ctx,
+                              SseEventType type, const char *content) {
+    SseEvent evt;
+    memset(&evt, 0, sizeof(evt));
+    evt.type = type;
+    evt.content = (char *)content;  /* 临时，不 free */
+    callback(ctx, &evt);
+}
+
+/* 在回调中复制字符串的工具函数 */
+/* 保留备用 */
+#if 0
+static char *dup_and_free(char *s) {
+    return util_strdup(s);
+}
+#endif
+
+int sse_parse_event(const char *provider, const char *data, size_t data_len,
+                    sse_callback_fn callback, void *ctx) {
+    if (data_len == 0) return 0;
+    if (strcmp(data, "[DONE]") == 0) {
+        if (strcmp(provider, "claude") == 0) emit_simple_event(callback, ctx, SSE_STOP, "end_turn");
+        return 0;
+    }
+
+    /* 解析 JSON */
+    size_t pos = 0;
+    JsonParse jp = json_parse(data, &pos);
+    if (jp.error) return 0;
+
+    if (strcmp(provider, "claude") == 0) {
+        /* Claude SSE 格式 */
+        char *type = json_get_string(jp.val, "type");
+        if (!type) return 0;
+
+        if (strcmp(type, "content_block_delta") == 0) {
+            JsonVal delta = json_get(jp.val, "delta");
+            char *dtype = json_get_string(delta, "type");
+            if (dtype && strcmp(dtype, "text_delta") == 0) {
+                char *text = json_get_string(delta, "text");
+                if (text) { emit_simple_event(callback, ctx, SSE_TEXT, text); free(text); }
+            } else if (dtype && strcmp(dtype, "thinking_delta") == 0) {
+                char *text = json_get_string(delta, "thinking");
+                if (text) { emit_simple_event(callback, ctx, SSE_THINKING, text); free(text); }
+            } else if (dtype && strcmp(dtype, "input_json_delta") == 0) {
+                /* 工具调用 input 增量 */
+                char *partial = json_get_string(delta, "partial_json");
+                if (partial) {
+                    SseEvent evt;
+                    memset(&evt, 0, sizeof(evt));
+                    evt.type = SSE_TOOL_INPUT_DELTA;
+                    evt.content = partial;
+                    evt.tool_id = NULL; /* index 用于匹配 */
+                    callback(ctx, &evt);
+                    free(partial);
+                }
+            }
+            free(dtype);
+        } else if (strcmp(type, "content_block_start") == 0) {
+            JsonVal cb = json_get(jp.val, "content_block");
+            char *cb_type = json_get_string(cb, "type");
+            if (cb_type && strcmp(cb_type, "tool_use") == 0) {
+                char *id = json_get_string(cb, "id");
+                char *name = json_get_string(cb, "name");
+                SseEvent evt;
+                memset(&evt, 0, sizeof(evt));
+                evt.type = SSE_TOOL_CALL_START;
+                evt.tool_id = id;
+                evt.tool_name = name;
+                callback(ctx, &evt);
+                /* 回调中已复制，这里释放 */
+                free(id);
+                free(name);
+            }
+            free(cb_type);
+        } else if (strcmp(type, "content_block_stop") == 0) {
+            /* 工具调用完成 — 由累积器在收到 stop 后统一处理 */
+        } else if (strcmp(type, "message_delta") == 0) {
+            JsonVal delta = json_get(jp.val, "delta");
+            char *stop_reason = json_get_string(delta, "stop_reason");
+            if (stop_reason) {
+                emit_simple_event(callback, ctx, SSE_STOP, stop_reason);
+                free(stop_reason);
+            }
+            JsonVal usage = json_get(jp.val, "usage");
+            if (usage.type != JSON_NULL) {
+                SseEvent evt;
+                memset(&evt, 0, sizeof(evt));
+                evt.type = SSE_USAGE;
+                evt.out_tokens = json_get_int(usage, "output_tokens");
+                /* input/cache_* 字段仅在 message_start 未提供时取（与 Rust 版对齐）
+                 * OpenAI 路径无 message_start，通过 transport 合成 message_delta */
+                int it = json_get_int(usage, "input_tokens");
+                int cr = json_get_int(usage, "cache_read_input_tokens");
+                int cc = json_get_int(usage, "cache_creation_input_tokens");
+                if (it > 0) evt.in_tokens = it;
+                if (cr > 0) evt.cache_read_tokens = cr;
+                if (cc > 0) evt.cache_creation_tokens = cc;
+                callback(ctx, &evt);
+            }
+        } else if (strcmp(type, "message_start") == 0) {
+            JsonVal msg = json_get(jp.val, "message");
+            JsonVal usage = json_get(msg, "usage");
+            if (usage.type != JSON_NULL) {
+                SseEvent evt;
+                memset(&evt, 0, sizeof(evt));
+                evt.type = SSE_USAGE;
+                evt.in_tokens = json_get_int(usage, "input_tokens");
+                evt.cache_read_tokens = json_get_int(usage, "cache_read_input_tokens");
+                evt.cache_creation_tokens = json_get_int(usage, "cache_creation_input_tokens");
+                callback(ctx, &evt);
+            }
+        } else if (strcmp(type, "error") == 0) {
+            /* Claude 错误形如 {"type":"error","error":{"type":..,"message":..}} */
+            char *msg = NULL;
+            JsonVal err_obj = json_get(jp.val, "error");
+            if (err_obj.type == JSON_OBJECT)
+                msg = json_get_string(err_obj, "message");
+            if (!msg) msg = json_get_string(jp.val, "error");
+            if (!msg) msg = json_get_string(jp.val, "message");
+            emit_simple_event(callback, ctx, SSE_ERROR, msg ? msg : "unknown error");
+            free(msg);
+        }
+        free(type);
+    } else {
+        /* OpenAI SSE 格式 */
+        char *obj_type = json_get_string(jp.val, "object");
+        if (!obj_type) return 0;
+
+        if (strcmp(obj_type, "chat.completion.chunk") == 0) {
+            JsonVal choices = json_get(jp.val, "choices");
+            if (choices.type == JSON_ARRAY) {
+                JsonVal choice = json_array_get(choices, 0);
+                JsonVal delta = json_get(choice, "delta");
+                char *content = json_get_string(delta, "content");
+                if (content) {
+                    emit_simple_event(callback, ctx, SSE_TEXT, content);
+                    free(content);
+                }
+                char *reasoning = json_get_string(delta, "reasoning_content");
+                if (!reasoning) reasoning = json_get_string(delta, "reasoning");
+                if (reasoning) {
+                    emit_simple_event(callback, ctx, SSE_THINKING, reasoning);
+                    free(reasoning);
+                }
+                JsonVal tool_calls = json_get(delta, "tool_calls");
+                if (tool_calls.type == JSON_ARRAY) {
+                            int tc_len = json_array_len(tool_calls);
+                            for (int i = 0; i < tc_len; i++) {
+                                JsonVal tc = json_array_get(tool_calls, i);
+                                JsonVal fn = json_get(tc, "function");
+                                char *id = json_get_string(tc, "id");
+                                char *name = json_get_string(fn, "name");
+                        char *arguments = json_get_string(fn, "arguments");
+                        if (id || name) {
+                            SseEvent evt;
+                            memset(&evt, 0, sizeof(evt));
+                            evt.type = SSE_TOOL_CALL_START;
+                            evt.tool_id = id;
+                            evt.tool_name = name;
+                            callback(ctx, &evt);
+                        }
+                        if (arguments) {
+                            SseEvent evt;
+                            memset(&evt, 0, sizeof(evt));
+                            evt.type = SSE_TOOL_INPUT_DELTA;
+                            evt.content = arguments;
+                            callback(ctx, &evt);
+                        }
+                        free(id);
+                        free(name);
+                        free(arguments);
+                    }
+                }
+                char *finish = json_get_string(choice, "finish_reason");
+                if (finish) {
+                    if (strcmp(finish, "tool_calls") == 0) {
+                        emit_simple_event(callback, ctx, SSE_STOP, "tool_use");
+                    } else if (strcmp(finish, "stop") == 0) {
+                        emit_simple_event(callback, ctx, SSE_STOP, "end_turn");
+                    } else if (strcmp(finish, "length") == 0) {
+                        emit_simple_event(callback, ctx, SSE_STOP, "max_tokens");
+                    } else {
+                        emit_simple_event(callback, ctx, SSE_STOP, finish);
+                    }
+                    free(finish);
+                }
+            }
+            JsonVal usage = json_get(jp.val, "usage");
+            if (usage.type != JSON_NULL) {
+                SseEvent evt;
+                memset(&evt, 0, sizeof(evt));
+                evt.type = SSE_USAGE;
+                fill_openai_usage_event(&evt, usage);
+                callback(ctx, &evt);
+            }
+        }
+        free(obj_type);
+    }
+    return 0;
+}
+
+/* ============================================================
+ * SSE 累积器
+ * ============================================================ */
+
+void sse_accum_init(SseAccumulator *acc) {
+    memset(acc, 0, sizeof(*acc));
+    sb_init(&acc->text);
+    sb_init(&acc->thinking);
+    acc->tool_cap = 8;
+    acc->tools = calloc(acc->tool_cap, sizeof(ToolCallAccum));
+    acc->tool_count = 0;
+    acc->current_block_index = -1;
+}
+
+void sse_accum_free(SseAccumulator *acc) {
+    sb_free(&acc->text);
+    sb_free(&acc->thinking);
+    for (int i = 0; i < acc->tool_count; i++) {
+        FREE_PTR(acc->tools[i].id);
+        FREE_PTR(acc->tools[i].name);
+        sb_free(&acc->tools[i].input_json);
+    }
+    free(acc->tools);
+    FREE_PTR(acc->current_block_type);
+    FREE_PTR(acc->current_tool_id);
+    FREE_PTR(acc->current_tool_name);
+    FREE_PTR(acc->stop_reason);
+    FREE_PTR(acc->error);
+}
+
+void sse_accum_callback(void *ctx, const SseEvent *evt) {
+    SseAccumulator *acc = (SseAccumulator *)ctx;
+
+    switch (evt->type) {
+    case SSE_TEXT:
+        sb_append(&acc->text, evt->content);
+        break;
+
+    case SSE_THINKING:
+        sb_append(&acc->thinking, evt->content);
+        break;
+
+    case SSE_TOOL_CALL_START: {
+        if (acc->tool_count >= acc->tool_cap) {
+            acc->tool_cap *= 2;
+            acc->tools = realloc(acc->tools, acc->tool_cap * sizeof(ToolCallAccum));
+        }
+        ToolCallAccum *tc = &acc->tools[acc->tool_count];
+        memset(tc, 0, sizeof(*tc));
+        sb_init(&tc->input_json);
+        tc->id = util_strdup(evt->tool_id);
+        tc->name = util_strdup(evt->tool_name);
+        acc->tool_count++;
+        break;
+    }
+
+    case SSE_TOOL_INPUT_DELTA: {
+        if (acc->tool_count > 0 && evt->content) {
+            sb_append(&acc->tools[acc->tool_count - 1].input_json, evt->content);
+        }
+        break;
+    }
+
+    case SSE_TOOL_CALL: {
+        /* 完整的工具调用（非增量模式，如 OpenAI） */
+        if (acc->tool_count >= acc->tool_cap) {
+            acc->tool_cap *= 2;
+            acc->tools = realloc(acc->tools, acc->tool_cap * sizeof(ToolCallAccum));
+        }
+        ToolCallAccum *tc = &acc->tools[acc->tool_count];
+        memset(tc, 0, sizeof(*tc));
+        tc->id = util_strdup(evt->tool_id ? evt->tool_id : "");
+        tc->name = util_strdup(evt->tool_name ? evt->tool_name : "");
+        sb_init(&tc->input_json);
+        sb_append(&tc->input_json, evt->tool_input ? evt->tool_input : "{}");
+        acc->tool_count++;
+        break;
+    }
+
+    case SSE_USAGE:
+        if (evt->in_tokens > 0) acc->in_tokens = evt->in_tokens;
+        if (evt->out_tokens > 0) acc->out_tokens = evt->out_tokens;
+        if (evt->cache_read_tokens > 0) acc->cache_read_tokens = evt->cache_read_tokens;
+        if (evt->cache_creation_tokens > 0) acc->cache_creation_tokens = evt->cache_creation_tokens;
+        break;
+
+    case SSE_STOP:
+        acc->stopped = 1;
+        if (evt->content) {
+            FREE_PTR(acc->stop_reason);
+            acc->stop_reason = util_strdup(evt->content);
+        }
+        break;
+
+    case SSE_ERROR:
+        FREE_PTR(acc->error);
+        acc->error = util_strdup(evt->content ? evt->content : "unknown error");
+        break;
+
+    case SSE_RETRY:
+        /* 清空当前累积（对齐 stream_display_callback） */
+        sb_truncate(&acc->text, 0);
+        sb_truncate(&acc->thinking, 0);
+        for (int i = 0; i < acc->tool_count; i++) {
+            FREE_PTR(acc->tools[i].id);
+            FREE_PTR(acc->tools[i].name);
+            sb_free(&acc->tools[i].input_json);
+        }
+        acc->tool_count = 0;
+        acc->stopped = 0;
+        FREE_PTR(acc->stop_reason);
+        acc->in_tokens = 0;
+        acc->out_tokens = 0;
+        acc->cache_read_tokens = 0;
+        acc->cache_creation_tokens = 0;
+        break;
+    }
+}
+
+/* ============================================================
+ * 请求体构建
+ * ============================================================ */
+
+char *build_claude_request(const char *model, const char *system_prompt,
+                           const char *tools_json,
+                           char **conv_lines, int conv_line_count,
+                           int max_tokens, const char *thinking, const char *effort) {
+    StrBuf buf;
+    sb_init(&buf);
+
+    /* 字段顺序对齐 Go/Rust 的 map 字母序：
+     * max_tokens → messages → model → output_config → stream → system → thinking → tools */
+    sb_append(&buf, "{\"max_tokens\":");
+    sb_appendf(&buf, "%d", max_tokens);
+
+    /* messages */
+    sb_append(&buf, ",\"messages\":[");
+    for (int i = 0; i < conv_line_count; i++) {
+        if (i > 0) sb_append(&buf, ",");
+        sb_append(&buf, conv_lines[i]);
+    }
+    sb_append(&buf, "]");
+
+    /* model */
+    sb_append(&buf, ",\"model\":");
+    sb_append_json_string(&buf, model);
+
+    /* output_config (仅 thinking != disabled) */
+    if (thinking && strcmp(thinking, "disabled") != 0) {
+        sb_append(&buf, ",\"output_config\":{\"effort\":");
+        sb_append_json_string(&buf, effort ? effort : "high");
+        sb_append(&buf, "}");
+    }
+
+    /* stream */
+    sb_append(&buf, ",\"stream\":true");
+
+    /* system prompt */
+    if (system_prompt && system_prompt[0]) {
+        sb_append(&buf, ",\"system\":");
+        sb_append_json_string(&buf, system_prompt);
+    }
+
+    /* thinking (仅 thinking != disabled) */
+    if (thinking && strcmp(thinking, "disabled") != 0) {
+        sb_append(&buf, ",\"thinking\":{\"type\":");
+        sb_append_json_string(&buf, thinking);
+        sb_append(&buf, "}");
+    }
+
+    /* tools */
+    if (tools_json) {
+        sb_append(&buf, ",\"tools\":");
+        sb_append(&buf, tools_json);
+    }
+
+    sb_append(&buf, "}");
+
+    char *result = buf.data;
+    /* 不要 sb_free，因为我们返回 buf.data */
+    return result;
+}
+
+static void sb_append_json_val(StrBuf *sb, JsonVal v) {
+    if (v.type == JSON_NULL || !v.src) {
+        sb_append(sb, "null");
+        return;
+    }
+    sb_appendn(sb, v.src + v.start, v.end - v.start);
+}
+
+static void openai_convert_tools(StrBuf *out, JsonVal tools_val) {
+    if (tools_val.type != JSON_ARRAY) {
+        sb_append(out, "[]");
+        return;
+    }
+    sb_append_char(out, '[');
+    int n = json_array_len(tools_val);
+    for (int i = 0; i < n; i++) {
+        JsonVal td = json_array_get(tools_val, i);
+        if (i > 0) sb_append_char(out, ',');
+        char *type = json_get_string(td, "type");
+        if (type && strcmp(type, "function") == 0) {
+            sb_append_json_val(out, td);
+            FREE_PTR(type);
+            continue;
+        }
+        FREE_PTR(type);
+        char *name = json_get_string(td, "name");
+        char *desc = json_get_string(td, "description");
+        JsonVal params = json_get(td, "input_schema");
+        if (params.type == JSON_NULL) params = json_get(td, "parameters");
+        sb_append(out, "{\"type\":\"function\",\"function\":{\"name\":");
+        sb_append_json_string(out, name ? name : "");
+        sb_append(out, ",\"description\":");
+        sb_append_json_string(out, desc ? desc : "");
+        sb_append(out, ",\"parameters\":");
+        if (params.type == JSON_NULL) sb_append(out, "{}");
+        else sb_append_json_val(out, params);
+        sb_append(out, "}}");
+        FREE_PTR(name);
+        FREE_PTR(desc);
+    }
+    sb_append_char(out, ']');
+}
+
+static void openai_convert_assistant_message(StrBuf *out, JsonVal content_val) {
+    StrBuf text, reasoning, tool_calls;
+    sb_init(&text);
+    sb_init(&reasoning);
+    sb_init(&tool_calls);
+
+    int n = json_array_len(content_val);
+    for (int i = 0; i < n; i++) {
+        JsonVal block = json_array_get(content_val, i);
+        char *btype = json_get_string(block, "type");
+        if (!btype) continue;
+        if (strcmp(btype, "thinking") == 0) {
+            char *t = json_get_string(block, "thinking");
+            if (t) { sb_append(&reasoning, t); FREE_PTR(t); }
+        } else if (strcmp(btype, "text") == 0) {
+            char *t = json_get_string(block, "text");
+            if (t) { sb_append(&text, t); FREE_PTR(t); }
+        } else if (strcmp(btype, "tool_use") == 0) {
+            char *id = json_get_string(block, "id");
+            char *name = json_get_string(block, "name");
+            JsonVal input = json_get(block, "input");
+            if (tool_calls.len > 0) sb_append_char(&tool_calls, ',');
+            sb_append(&tool_calls, "{\"id\":");
+            sb_append_json_string(&tool_calls, id ? id : "");
+            sb_append(&tool_calls, ",\"type\":\"function\",\"function\":{\"name\":");
+            sb_append_json_string(&tool_calls, name ? name : "");
+            sb_append(&tool_calls, ",\"arguments\":");
+            if (input.type == JSON_NULL) sb_append_json_string(&tool_calls, "{}");
+            else {
+                StrBuf arg;
+                sb_init(&arg);
+                sb_append_json_val(&arg, input);
+                sb_append_json_string(&tool_calls, arg.data ? arg.data : "{}");
+                sb_free(&arg);
+            }
+            sb_append(&tool_calls, "}}");
+            FREE_PTR(id);
+            FREE_PTR(name);
+        }
+        FREE_PTR(btype);
+    }
+
+    sb_append(out, "{\"role\":\"assistant\",\"reasoning_content\":");
+    sb_append_json_string(out, reasoning.data ? reasoning.data : "");
+    sb_append(out, ",\"content\":");
+    sb_append_json_string(out, text.data ? text.data : "");
+    if (tool_calls.len > 0) {
+        sb_append(out, ",\"tool_calls\":[");
+        sb_append(out, tool_calls.data);
+        sb_append_char(out, ']');
+    }
+    sb_append_char(out, '}');
+
+    sb_free(&text);
+    sb_free(&reasoning);
+    sb_free(&tool_calls);
+}
+
+static int openai_convert_tool_results(StrBuf *out, JsonVal content_val) {
+    int written = 0;
+    int n = json_array_len(content_val);
+    for (int i = 0; i < n; i++) {
+        JsonVal block = json_array_get(content_val, i);
+        char *btype = json_get_string(block, "type");
+        if (!btype || strcmp(btype, "tool_result") != 0) {
+            FREE_PTR(btype);
+            continue;
+        }
+        char *tool_use_id = json_get_string(block, "tool_use_id");
+        char *content = json_get_string(block, "content");
+        if (written > 0) sb_append_char(out, ',');
+        sb_append(out, "{\"role\":\"tool\",\"tool_call_id\":");
+        sb_append_json_string(out, tool_use_id ? tool_use_id : "");
+        sb_append(out, ",\"content\":");
+        sb_append_json_string(out, content ? content : "");
+        sb_append_char(out, '}');
+        written++;
+        FREE_PTR(tool_use_id);
+        FREE_PTR(content);
+        FREE_PTR(btype);
+    }
+    return written;
+}
+
+static void openai_convert_messages(StrBuf *out, JsonVal messages_val) {
+    sb_append_char(out, '[');
+    int wrote = 0;
+    int n = json_array_len(messages_val);
+    for (int i = 0; i < n; i++) {
+        JsonVal msg = json_array_get(messages_val, i);
+        char *role = json_get_string(msg, "role");
+        JsonVal content = json_get(msg, "content");
+        if (role && strcmp(role, "assistant") == 0 && content.type == JSON_ARRAY) {
+            if (wrote > 0) sb_append_char(out, ',');
+            openai_convert_assistant_message(out, content);
+            wrote++;
+        } else if (role && strcmp(role, "user") == 0 && content.type == JSON_ARRAY) {
+            int before = wrote;
+            if (wrote > 0 && json_array_len(content) > 0) {
+                /* openai_convert_tool_results handles commas after the first item */
+            }
+            if (wrote > 0) {
+                StrBuf tmp;
+                sb_init(&tmp);
+                int tool_written = openai_convert_tool_results(&tmp, content);
+                if (tool_written > 0) {
+                    sb_append_char(out, ',');
+                    sb_append(out, tmp.data);
+                    wrote += tool_written;
+                } else {
+                    if (wrote > 0) sb_append_char(out, ',');
+                    sb_append_json_val(out, msg);
+                    wrote++;
+                }
+                sb_free(&tmp);
+            } else {
+                int tool_written = openai_convert_tool_results(out, content);
+                if (tool_written > 0) wrote += tool_written;
+                else {
+                    sb_append_json_val(out, msg);
+                    wrote++;
+                }
+            }
+            (void)before;
+        } else {
+            if (wrote > 0) sb_append_char(out, ',');
+            sb_append_json_val(out, msg);
+            wrote++;
+        }
+        FREE_PTR(role);
+    }
+    sb_append_char(out, ']');
+}
+
+char *convert_to_openai(const char *claude_body) {
+    JsonParse jp = json_parse_root(claude_body);
+    if (jp.error) return util_strdup(claude_body);
+
+    char *model = json_get_string(jp.val, "model");
+    int max_tokens = json_get_int(jp.val, "max_tokens");
+    JsonVal system_val = json_get(jp.val, "system");
+    JsonVal thinking_val = json_get(jp.val, "thinking");
+    JsonVal output_config_val = json_get(jp.val, "output_config");
+    JsonVal messages_val = json_get(jp.val, "messages");
+    JsonVal tools_val = json_get(jp.val, "tools");
+
+    StrBuf messages, tools, result;
+    sb_init(&messages);
+    sb_init(&tools);
+    sb_init(&result);
+
+    openai_convert_messages(&messages, messages_val);
+    if (tools_val.type == JSON_ARRAY && json_array_len(tools_val) > 0) {
+        openai_convert_tools(&tools, tools_val);
+    }
+
+    sb_append(&result, "{\"model\":");
+    sb_append_json_string(&result, model ? model : "");
+    sb_append(&result, ",\"max_tokens\":");
+    sb_appendf(&result, "%d", max_tokens);
+    sb_append(&result, ",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+
+    if (system_val.type != JSON_NULL) {
+        char *sys = json_as_string(system_val);
+        if (sys && sys[0]) {
+            StrBuf with_system;
+            sb_init(&with_system);
+            sb_append(&with_system, "[{\"role\":\"system\",\"content\":");
+            sb_append_json_string(&with_system, sys);
+            sb_append_char(&with_system, '}');
+            if (messages.len > 2) {
+                sb_append_char(&with_system, ',');
+                sb_appendn(&with_system, messages.data + 1, messages.len - 2);
+            }
+            sb_append_char(&with_system, ']');
+            sb_free(&messages);
+            messages = with_system;
+        }
+        FREE_PTR(sys);
+    }
+
+    char *thinking_type = json_get_string(thinking_val, "type");
+    if (thinking_type &&
+        (strcmp(thinking_type, "adaptive") == 0 || strcmp(thinking_type, "enabled") == 0)) {
+        sb_append(&result, ",\"thinking\":{\"type\":\"enabled\"}");
+        char *effort = json_get_string(output_config_val, "effort");
+        sb_append(&result, ",\"reasoning_effort\":");
+        sb_append_json_string(&result, (effort && effort[0]) ? effort : "high");
+        FREE_PTR(effort);
+    }
+    FREE_PTR(thinking_type);
+
+    if (tools.len > 0 && strcmp(tools.data, "[]") != 0) {
+        sb_append(&result, ",\"tools\":");
+        sb_append(&result, tools.data);
+    }
+
+    sb_append(&result, ",\"messages\":");
+    sb_append(&result, messages.data ? messages.data : "[]");
+    sb_append_char(&result, '}');
+
+    FREE_PTR(model);
+    sb_free(&messages);
+    sb_free(&tools);
+    return result.data;
+}
+
+
+static void responses_convert_tools(StrBuf *out, JsonVal tools_val) {
+    sb_append_char(out, '[');
+    int wrote = 0;
+    int n = json_array_len(tools_val);
+    for (int i = 0; i < n; i++) {
+        JsonVal tool = json_array_get(tools_val, i);
+        char *name = json_get_string(tool, "name");
+        if (!name || !name[0]) { FREE_PTR(name); continue; }
+        char *desc = json_get_string(tool, "description");
+        JsonVal parameters = json_get(tool, "input_schema");
+        if (parameters.type == JSON_NULL) parameters = json_get(tool, "parameters");
+        if (wrote++) sb_append_char(out, ',');
+        sb_append(out, "{\"type\":\"function\",\"name\":");
+        sb_append_json_string(out, name);
+        sb_append(out, ",\"description\":");
+        sb_append_json_string(out, desc ? desc : "");
+        sb_append(out, ",\"parameters\":");
+        if (parameters.type == JSON_NULL) sb_append(out, "{}"); else sb_append_json_val(out, parameters);
+        sb_append_char(out, '}');
+        FREE_PTR(name); FREE_PTR(desc);
+    }
+    sb_append_char(out, ']');
+}
+
+static void responses_convert_messages(StrBuf *out, JsonVal messages_val) {
+    sb_append_char(out, '[');
+    int wrote = 0;
+    int n = json_array_len(messages_val);
+    for (int i = 0; i < n; i++) {
+        JsonVal msg = json_array_get(messages_val, i);
+        char *role = json_get_string(msg, "role");
+        JsonVal content = json_get(msg, "content");
+        if (role && strcmp(role, "assistant") == 0 && content.type == JSON_ARRAY) {
+            StrBuf text; sb_init(&text);
+            int blocks = json_array_len(content);
+            for (int j = 0; j < blocks; j++) {
+                JsonVal block = json_array_get(content, j);
+                char *type = json_get_string(block, "type");
+                if (type && strcmp(type, "text") == 0) {
+                    char *value = json_get_string(block, "text");
+                    if (value) { sb_append(&text, value); FREE_PTR(value); }
+                } else if (type && strcmp(type, "tool_use") == 0) {
+                    char *id = json_get_string(block, "id");
+                    char *name = json_get_string(block, "name");
+                    JsonVal input = json_get(block, "input");
+                    if (wrote++) sb_append_char(out, ',');
+                    sb_append(out, "{\"type\":\"function_call\",\"call_id\":"); sb_append_json_string(out, id ? id : "");
+                    sb_append(out, ",\"name\":"); sb_append_json_string(out, name ? name : "");
+                    sb_append(out, ",\"arguments\":");
+                    StrBuf args; sb_init(&args); if (input.type == JSON_NULL) sb_append(&args, "{}"); else sb_append_json_val(&args, input);
+                    sb_append_json_string(out, args.data ? args.data : "{}"); sb_free(&args); sb_append_char(out, '}');
+                    FREE_PTR(id); FREE_PTR(name);
+                }
+                FREE_PTR(type);
+            }
+            if (text.len > 0) { if (wrote++) sb_append_char(out, ','); sb_append(out, "{\"role\":\"assistant\",\"content\":"); sb_append_json_string(out, text.data); sb_append_char(out, '}'); }
+            sb_free(&text);
+        } else if (role && strcmp(role, "user") == 0 && content.type == JSON_ARRAY) {
+            int blocks = json_array_len(content);
+            for (int j = 0; j < blocks; j++) {
+                JsonVal block = json_array_get(content, j);
+                char *type = json_get_string(block, "type");
+                if (type && strcmp(type, "tool_result") == 0) {
+                    char *id = json_get_string(block, "tool_use_id"); char *value = json_get_string(block, "content");
+                    if (wrote++) sb_append_char(out, ','); sb_append(out, "{\"type\":\"function_call_output\",\"call_id\":"); sb_append_json_string(out, id ? id : ""); sb_append(out, ",\"output\":"); sb_append_json_string(out, value ? value : ""); sb_append_char(out, '}');
+                    FREE_PTR(id); FREE_PTR(value);
+                } else if (type && strcmp(type, "text") == 0) {
+                    char *value = json_get_string(block, "text"); if (wrote++) sb_append_char(out, ','); sb_append(out, "{\"role\":\"user\",\"content\":"); sb_append_json_string(out, value ? value : ""); sb_append_char(out, '}'); FREE_PTR(value);
+                }
+                FREE_PTR(type);
+            }
+        } else { if (wrote++) sb_append_char(out, ','); sb_append_json_val(out, msg); }
+        FREE_PTR(role);
+    }
+    sb_append_char(out, ']');
+}
+
+char *convert_to_responses(const char *claude_body) {
+    JsonParse jp = json_parse_root(claude_body);
+    if (jp.error) return util_strdup(claude_body);
+    char *model = json_get_string(jp.val, "model");
+    int max_tokens = json_get_int(jp.val, "max_tokens");
+    JsonVal system = json_get(jp.val, "system");
+    JsonVal thinking = json_get(jp.val, "thinking");
+    JsonVal output = json_get(jp.val, "output_config");
+    JsonVal messages = json_get(jp.val, "messages");
+    JsonVal tools_val = json_get(jp.val, "tools");
+    StrBuf input, tools, result; sb_init(&input); sb_init(&tools); sb_init(&result);
+    responses_convert_messages(&input, messages);
+    if (tools_val.type == JSON_ARRAY && json_array_len(tools_val)) responses_convert_tools(&tools, tools_val);
+    sb_append(&result, "{\"model\":"); sb_append_json_string(&result, model ? model : "");
+    sb_append(&result, ",\"input\":"); sb_append(&result, input.data ? input.data : "[]");
+    sb_appendf(&result, ",\"max_output_tokens\":%d,\"stream\":true", max_tokens);
+    if (system.type != JSON_NULL) { char *value = json_as_string(system); if (value && value[0]) { sb_append(&result, ",\"instructions\":"); sb_append_json_string(&result, value); } FREE_PTR(value); }
+    char *thinking_type = json_get_string(thinking, "type");
+    if (thinking_type && (!strcmp(thinking_type, "adaptive") || !strcmp(thinking_type, "enabled"))) { char *effort = json_get_string(output, "effort"); sb_append(&result, ",\"reasoning\":{\"effort\":"); sb_append_json_string(&result, effort && effort[0] ? effort : "high"); sb_append_char(&result, '}'); FREE_PTR(effort); }
+    FREE_PTR(thinking_type);
+    if (tools.len && strcmp(tools.data, "[]")) { sb_append(&result, ",\"tools\":"); sb_append(&result, tools.data); }
+    sb_append_char(&result, '}');
+    FREE_PTR(model); sb_free(&input); sb_free(&tools);
+    return result.data;
+}
+
+/* ==== ba_prompt.c ==== */
+/*
+ * ba_prompt.c - system prompt construction, ported verbatim from
+ * bash-agent's agent_build_prompt suite (agent.c). Section order, XML
+ * tags and section text are kept identical; adaptations are limited to:
+ *   - agent identity string: bash-agent -> busyagent
+ *   - skill dirs: .claude/skills dropped, replaced by generic agent dirs
+ *     (cwd/skills, ~/.agents/skills, $BB_AGENT_HOME/skills)
+ *   - Bash background / SubAgent sync guidance lines match busyagent's
+ *     actual single-turn semantics
+ *
+ * Copyright (C) 2026 by Lloyd Zhou <lloydzhou@qq.com>
+ *
+ * Licensed under GPLv2, see file LICENSE in this source tree.
+ */
+#include "libbb.h"
+#include <dirent.h>
+#include <sys/utsname.h>
+
+/* ============================================================
+ * system prompt 构建 — 辅助函数（逐字移植）
+ * ============================================================ */
+
+/* 追加 XML section：<tag>\ncontent\n</tag> 或 <tag name="name">\ncontent\n</tag> */
+static void prompt_append_attr_escaped(StrBuf *buf, const char *src) {
+    if (!src) return;
+    for (; *src; src++) {
+        unsigned char c = (unsigned char)*src;
+        switch (c) {
+            case '"':  sb_append(buf, "\\\""); break;
+            case '\\': sb_append(buf, "\\\\"); break;
+            case '\b': sb_append(buf, "\\b"); break;
+            case '\f': sb_append(buf, "\\f"); break;
+            case '\n': sb_append(buf, "\\n"); break;
+            case '\r': sb_append(buf, "\\r"); break;
+            case '\t': sb_append(buf, "\\t"); break;
+            default:
+                if (c < 0x20) sb_appendf(buf, "\\u%04x", c);
+                else sb_append_char(buf, c);
+                break;
+        }
+    }
+}
+
+static void prompt_append_section(StrBuf *buf, const char *tag,
+                                   const char *content, const char *name) {
+    if (!content || !content[0]) return;
+    size_t content_len = strlen(content);
+    while (content_len > 0 &&
+           (content[content_len - 1] == '\n' || content[content_len - 1] == '\r')) {
+        content_len--;
+    }
+    if (content_len == 0) return;
+    if (name && name[0]) {
+        sb_appendf(buf, "<%s name=\"", tag);
+        prompt_append_attr_escaped(buf, name);
+        sb_append(buf, "\">\n");
+        sb_appendn(buf, content, content_len);
+        sb_appendf(buf, "\n</%s>\n", tag);
+    } else {
+        sb_appendf(buf, "<%s>\n", tag);
+        sb_appendn(buf, content, content_len);
+        sb_appendf(buf, "\n</%s>\n", tag);
+    }
+}
+
+/* util_path_join 等价物（busybox 侧无该 helper） */
+static char *pj(const char *a, const char *b) {
+    return xasprintf("%s/%s", a, b);
+}
+
+/* util_read_file 等价物 */
+static char *read_all(const char *path) {
+    int fd = open(path, O_RDONLY);
+    long sz;
+    char *buf;
+    if (fd < 0)
+        return NULL;
+    sz = xlseek(fd, 0, SEEK_END);
+    xlseek(fd, 0, SEEK_SET);
+    buf = xzalloc(sz + 1);
+    sz = full_read(fd, buf, sz);
+    if (sz < 0) sz = 0;
+    buf[sz] = '\0';
+    close(fd);
+    return buf;
+}
+
+/* 检测 locale：LC_ALL → LC_MESSAGES → LANG → "en_US"，去掉 .xxx 后缀 */
+static const char *detect_locale(void) {
+    static char buf[128];
+    const char *loc = getenv("LC_ALL");
+    if (!loc || !loc[0]) loc = getenv("LC_MESSAGES");
+    if (!loc || !loc[0]) loc = getenv("LANG");
+    if (!loc || !loc[0]) loc = "en_US";
+    strncpy(buf, loc, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    {
+        char *dot = strchr(buf, '.');
+        if (dot) *dot = '\0';
+    }
+    return buf;
+}
+
+/* 在 dir 下查找指令文件（AGENTS.md / AGENT.md；通用 agent 目录，不绑定特定工具），
+ * 返回内容（需 free），无则 NULL。bash-agent 还会找 CLAUDE.md 变体，此处按
+ * 项目决定不绑 Claude 目录。 */
+static char *find_instruction_file(const char *dir) {
+    const char *candidates[] = { "AGENTS.md", "AGENT.md", NULL };
+    int i;
+
+    for (i = 0; candidates[i]; i++) {
+        char *path = pj(dir, candidates[i]);
+        char *content = read_all(path);
+        free(path);
+        if (content && content[0])
+            return content;
+        free(content);
+    }
+    return NULL;
+}
+
+/* 从 SKILL.md 内容中提取摘要：优先 description: 行，否则取第一个非空非标题非---行 */
+static void extract_skill_summary(const char *md, StrBuf *out) {
+    const char *p = md;
+    char line[1024];
+    int found = 0;
+    char fallback[1024] = "";
+
+    while (*p) {
+        /* 读取一行 */
+        int li = 0;
+        while (*p && *p != '\n' && li < (int)sizeof(line) - 1) {
+            line[li++] = *p++;
+        }
+        line[li] = '\0';
+        if (*p == '\n') p++;
+
+        /* trim */
+        {
+            char *s = line;
+            while (*s == ' ' || *s == '\t') s++;
+            {
+                char *e = s + strlen(s);
+                while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) e--;
+                *e = '\0';
+                if (*s == '\0') continue;
+
+                /* description: 行 */
+                if (strncmp(s, "description:", 12) == 0) {
+                    char *val = s + 12;
+                    while (*val == ' ' || *val == '\t') val++;
+                    /* 去掉引号 */
+                    size_t vl = strlen(val);
+                    if (vl >= 2 && ((val[0] == '"' && val[vl-1] == '"') ||
+                                    (val[0] == '\'' && val[vl-1] == '\''))) {
+                        val++;
+                        vl -= 2;
+                    }
+                    sb_appendn(out, val, vl);
+                    found = 1;
+                    return;
+                }
+                /* fallback：非标题、非---、非``` */
+                if (!found && fallback[0] == '\0' && s[0] != '#' &&
+                    !(s[0] == '-' && s[1] == '-' && s[2] == '-' && s[3] == '\0') &&
+                    !(s[0] == '`' && s[1] == '`' && s[2] == '`')) {
+                    strncpy(fallback, s, sizeof(fallback) - 1);
+                    fallback[sizeof(fallback) - 1] = '\0';
+                }
+            }
+        }
+    }
+    if (!found && fallback[0]) {
+        sb_append(out, fallback);
+    }
+}
+
+/* 扫描 skill 目录列表（去重），构建 skill-index。
+ * busyagent 目录序：cwd/skills > $HOME/.agents/skills > bag_home/skills */
+static void build_skill_index(StrBuf *index, const char *cwd,
+                              const char *agents_home, const char *bag_home) {
+    char *dirs[4];
+    int dcount = 0;
+    {
+        dirs[dcount++] = xasprintf("%s/skills", cwd);
+        if (agents_home && agents_home[0])
+            dirs[dcount++] = xasprintf("%s/.agents/skills", agents_home);
+        if (bag_home && bag_home[0])
+            dirs[dcount++] = xasprintf("%s/skills", bag_home);
+    }
+
+    /* 去重 seen 列表 */
+    char *seen[256];
+    int seen_count = 0;
+
+    for (int d = 0; d < dcount; d++) {
+        DIR *dir = opendir(dirs[d]);
+        if (!dir) continue;
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            /* 检查是否已 seen */
+            int dup = 0;
+            for (int s = 0; s < seen_count; s++) {
+                if (strcmp(seen[s], ent->d_name) == 0) { dup = 1; break; }
+            }
+            if (dup) continue;
+
+            /* 检查 SKILL.md 是否存在 */
+            char *skill_md = xasprintf("%s/%s/SKILL.md", dirs[d], ent->d_name);
+            char *md_content = read_all(skill_md);
+            free(skill_md);
+            if (!md_content || !md_content[0]) { free(md_content); continue; }
+
+            /* 记录 seen */
+            if (seen_count < 256) seen[seen_count++] = util_strdup(ent->d_name);
+
+            /* 提取摘要 */
+            StrBuf summary;
+            sb_init(&summary);
+            extract_skill_summary(md_content, &summary);
+            free(md_content);
+
+            sb_appendf(index, "- %s", ent->d_name);
+            if (summary.len > 0) sb_appendf(index, ": %s", summary.data);
+            sb_append_char(index, '\n');
+            sb_free(&summary);
+        }
+        closedir(dir);
+    }
+    for (int d = 0; d < dcount; d++) free(dirs[d]);
+    for (int s = 0; s < seen_count; s++) free(seen[s]);
+}
+
+char *ba_load_skill(const char *skill_name, const char *cwd,
+                    const char *agents_home, const char *bag_home,
+                    char **out_skill_dir) {
+    char *dirs[4];
+    int dcount = 0;
+    char *content = NULL;
+    int d;
+
+    dirs[dcount++] = xasprintf("%s/skills", cwd);
+    if (agents_home && agents_home[0])
+        dirs[dcount++] = xasprintf("%s/.agents/skills", agents_home);
+    if (bag_home && bag_home[0])
+        dirs[dcount++] = xasprintf("%s/skills", bag_home);
+
+    for (d = 0; d < dcount && !content; d++) {
+        char *skill_dir_path = xasprintf("%s/%s", dirs[d], skill_name);
+        char *md_path = xasprintf("%s/SKILL.md", skill_dir_path);
+        content = read_all(md_path);
+        free(md_path);
+        if (content) {
+            /* 替换 ${BA_AGENT_SKILL_DIR} 占位符 */
+            const char *placeholder = strstr(content, "${BA_AGENT_SKILL_DIR}");
+            if (placeholder) {
+                StrBuf replaced;
+                sb_init(&replaced);
+                size_t prefix_len = placeholder - content;
+                sb_appendn(&replaced, content, prefix_len);
+                sb_append(&replaced, skill_dir_path);
+                sb_append(&replaced, placeholder + strlen("${BA_AGENT_SKILL_DIR}"));
+                free(content);
+                content = replaced.data;
+            }
+            /* 格式: Base directory: <dir>\n\n<content>（与 bash-agent 一致） */
+            StrBuf full;
+            sb_init(&full);
+            sb_appendf(&full, "Base directory: %s\n\n%s", skill_dir_path, content);
+            free(content);
+            content = full.data;
+            if (out_skill_dir) *out_skill_dir = skill_dir_path;
+            else free(skill_dir_path);
+        } else {
+            free(skill_dir_path);
+        }
+    }
+    for (d = 0; d < dcount; d++) free(dirs[d]);
+    return content;
+}
+
+/* ============================================================
+ * system prompt 构建 — 主函数（块顺序与文本对齐 bash-agent）
+ * ============================================================ */
+
+char *ba_build_prompt(const BaPromptCtx *ctx) {
+    StrBuf buf;
+    sb_init(&buf);
+
+    const char *locale = detect_locale();
+    int is_zh = (locale[0] == 'z' && locale[1] == 'h');
+
+    /* 1. agent-identity */
+    {
+        const char *identity = "You are busyagent, a lightweight coding agent that runs as a busybox applet.";
+        if (is_zh) identity = "你是 busyagent，一个以 busybox applet 形式运行的轻量级编码智能体。";
+        prompt_append_section(&buf, "agent-identity", identity, NULL);
+    }
+
+    /* 2. environment */
+    {
+        struct utsname uts;
+        StrBuf env;
+        char *sh_env = getenv("SHELL");
+        sb_init(&env);
+        sb_appendf(&env, "lang: %s\n", detect_locale());
+        sb_appendf(&env, "pwd: %s\n", ctx->cwd ? ctx->cwd : "?");
+        sb_appendf(&env, "home: %s\n", ctx->home ? ctx->home : "?");
+        if (uname(&uts) == 0)
+            sb_appendf(&env, "platform: %s\n", uts.sysname);
+        else
+            sb_append(&env, "platform: unknown\n");
+        sb_appendf(&env, "shell: %s", sh_env && sh_env[0] ? sh_env : "/bin/sh");
+        prompt_append_section(&buf, "environment", env.data, NULL);
+        sb_free(&env);
+    }
+
+    /* 3. rules */
+    {
+        const char *rules = "- Be concise and concrete. Lead with the answer. Use short sections or bullets when they improve readability. No pleasantries, no explanations unless asked. Raw results only.\n"
+                            "- Prefer safe, exact edits.\n"
+                            "- Report failures clearly.";
+        prompt_append_section(&buf, "rules", rules, NULL);
+    }
+
+    /* 4. using-your-tools */
+    {
+        const char *tool_guidance =
+            "- Use Read for a single file. If you need multiple files, call Read multiple times.\n"
+            "- Read supports optional offset and limit parameters to read specific line ranges (saves tokens for large files). Output includes line numbers.\n"
+            "- Use Glob and Grep for one pattern at a time.\n"
+            "- Grep supports a context parameter to show surrounding lines — use it to get enough text for Edit directly from Grep output, avoiding a separate Read.\n"
+            "- Use multiple tool calls in one response when they are independent.\n"
+            "- Prefer dedicated tools over Bash when a dedicated tool fits the task.\n"
+            "- For Edit: copy old_string exactly (including whitespace/indent/newlines). If you already know the location from prior context, use Read with offset/limit. If you need to locate the text first, use Grep with context — its output is often sufficient for Edit without an extra Read.\n"
+            "- For skills, first check the skill-index section, then use Skill(name) for the matching skill.\n"
+            "- Bash supports background=true for long-running commands. Returns task_id immediately; this build delivers the output by writing it to a temp file - read that file with Read to fetch results (bash-agent injects it via async events instead).";
+        prompt_append_section(&buf, "using-your-tools", tool_guidance, NULL);
+    }
+
+    /* 5. sub-agent-guidance（同步语义微调，其余逐字） */
+    {
+        const char *sag =
+            "- **When to use**: delegating independent sub-tasks that do NOT need your current conversation context — e.g. investigating a separate file, running a focused search, testing a hypothesis in isolation.\n"
+            "- **Recursion limit**: only the main agent may launch SubAgent. A child agent must not call SubAgent again; the runtime rejects nested launches.\n"
+            "- **When NOT to use**: tasks that depend on your working context, conversation history, or intermediate state. The child agent starts with a blank slate.\n"
+            "- **Prompt design**: write a complete, self-contained prompt. Include all file paths, function names, error messages, and constraints the child needs. Assume zero shared context.\n"
+            "- **Result handling**: this build runs the sub-agent synchronously; its final answer is returned directly as this call's result. Interpret it in your next turn before acting.";
+        prompt_append_section(&buf, "sub-agent-guidance", sag, NULL);
+    }
+
+    /* 6. todo-guidance（逐字） */
+    {
+        const char *todo =
+            "- Use TodoWrite proactively for complex multi-step implementation, debugging, refactoring, review, or multi-file tasks.\n"
+            "- Do not use TodoWrite for trivial single-step, single-command, or purely informational requests.\n"
+            "- After receiving a non-trivial task, create an initial checklist before or as you begin work.\n"
+            "- When you use TodoWrite, write the full updated checklist for the current session, not a partial diff.\n"
+            "- Keep the checklist short, concrete, and actionable.\n"
+            "- Prefer exactly one in_progress item when work is actively underway.\n"
+            "- Mark items completed immediately after finishing them, and remove stale items that no longer matter.";
+        prompt_append_section(&buf, "todo-guidance", todo, NULL);
+    }
+
+    /* 7. plan-lifecycle-guidance */
+    {
+        StrBuf plg;
+        sb_init(&plg);
+        sb_append(&plg, "- **PLANNING WORKFLOW** — For complex multi-step tasks (3+ steps OR multi-file OR user requests planning)\n");
+        sb_appendf(&plg, "- **Files**: PLAN_DRAFT_FILE: %s | PLAN_FILE: %s\n",
+                   ctx->plan_draft ? ctx->plan_draft : "<not set>",
+                   ctx->plan ? ctx->plan : "<not set>");
+        sb_append(&plg, "- **Why draft first?** Writing to PLAN_FILE immediately invalidates the system prompt cache. Use PLAN_DRAFT_FILE for all drafting iterations to avoid this cost.\n");
+        sb_append(&plg, "- **Drafting phase** (PLAN_DRAFT_FILE non-empty → you are drafting):\n"
+                        "  Every user reply MUST be classified as exactly ONE of:\n"
+                        "  ① REVISE (any feedback/question/change) → Write/Edit PLAN_DRAFT_FILE → ask confirmation → stay in drafting\n"
+                        "  ② CONFIRM (explicit ok/go/confirmed) → call PlanConfirm IMMEDIATELY (before any other action) → TodoWrite checklist → execute\n"
+                        "  ③ CANCEL (explicit cancel/forget it) → empty out PLAN_DRAFT_FILE → exit to idle\n"
+                        "  ⚠ On CONFIRM you MUST call PlanConfirm first — no edits, no tool calls before it.\n");
+        sb_append(&plg, "- **Execution phase**: after PlanConfirm → TodoWrite checklist → execute tasks → PlanClear when all done\n"
+                        "- **Plan vs Todo**: PLAN_FILE=locked plan (only via PlanConfirm), PLAN_DRAFT_FILE=draft (edit freely), TodoWrite=progress tracker. Do NOT mix.");
+        prompt_append_section(&buf, "plan-lifecycle-guidance", plg.data, NULL);
+        sb_free(&plg);
+    }
+
+    /* 8. instruction-files */
+    {
+        StrBuf ifiles;
+        char *gc = find_instruction_file(ctx->home);
+        char *pc = ctx->cwd ? find_instruction_file(ctx->cwd) : NULL;
+
+        sb_init(&ifiles);
+        if (gc && gc[0]) {
+            prompt_append_section(&ifiles, "instruction-file", gc, "global");
+        }
+        if (pc && pc[0]) {
+            prompt_append_section(&ifiles, "instruction-file", pc, "project");
+        }
+        if (ifiles.len > 0 && ifiles.data[ifiles.len - 1] == '\n')
+            sb_truncate(&ifiles, ifiles.len - 1);
+        prompt_append_section(&buf, "instruction-files", ifiles.data, NULL);
+        sb_free(&ifiles);
+        free(gc);
+        free(pc);
+    }
+
+    /* 9. skill-index */
+    {
+        StrBuf si;
+        sb_init(&si);
+        build_skill_index(&si, ctx->cwd, getenv("HOME"), ctx->home);
+        if (si.len > 0 && si.data[si.len - 1] == '\n')
+            sb_truncate(&si, si.len - 1);
+        prompt_append_section(&buf, "skill-index", si.data, NULL);
+        sb_free(&si);
+    }
+
+    /* 11. current-plan */
+    {
+        char *plan = ctx->plan ? read_all(ctx->plan) : NULL;
+        if (plan && plan[0]) {
+            /* bash 版 name 属性 = plan 文件路径 */
+            prompt_append_section(&buf, "current-plan", plan, ctx->plan);
+        }
+        free(plan);
+    }
+
+    /* 13. output-language */
+    {
+        StrBuf ol;
+        sb_init(&ol);
+        if (is_zh) {
+            sb_append(&ol, "再次强调：必须使用中文进行所有输出，包括你的思考过程（Chain of Thought/推理/thinking）！严禁在思考或回答中出现任何英文内容！");
+        } else {
+            sb_appendf(&ol, "MUST use \"%s\" for all output, including your Chain of Thought/reasoning/thinking! Never mix languages! Code, commands, and file content remain as-is.", locale);
+        }
+        prompt_append_section(&buf, "output-language", ol.data, NULL);
+        sb_free(&ol);
+    }
+
+    /* 去掉末尾 \n（bash 版 printf '%s' "${output%$'\\n'}"） */
+    if (buf.len > 0 && buf.data[buf.len - 1] == '\n') {
+        buf.data[buf.len - 1] = '\0';
+        buf.len--;
+    }
+
+    return buf.data;
+}
+
+/* ==== ba_tools.c ==== */
+/*
+ * ba_tools - table-driven tool execution for busyagent
+ *
+ * Tool definitions live in $BB_AGENT_HOME/tools.json — the only source,
+ * never embedded in the binary. A sample lives at scripts/tools.example.json.
+ * Each
+ * tool carries an "exec" mapping: {"applet": "grep", "argv": ["-nH", "-e",
+ * "$pattern", "$path"]}. At execution time argv templates are expanded with
+ * values from the model's input JSON (missing optional values drop their
+ * argument), then dispatched:
+ *
+ *   - applet is NOFORK  -> run_nofork_applet() in a forked child (direct
+ *     in-process call, no exec: the busybox advantage)
+ *   - anything else     -> fork + execl(bb_busybox_exec_path, applet, ...)
+ *
+ * Children run with piped stdout/stderr and are SIGKILLed on timeout.
+ *
+ * Copyright (C) 2026 by Lloyd Zhou <lloydzhou@qq.com>
+ *
+ * Licensed under GPLv2, see file LICENSE in this source tree.
+ */
+#include "libbb.h"
+#include "busybox.h"   /* for APPLET_IS_NOFORK */
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define BA_TOOL_TIMEOUT_MS   120000
+#define BA_OUTPUT_MAX        (128 * 1024)
+
+/* ---- tool table ---- */
+
+typedef struct {
+	char *name;            /* LLM-visible tool name */
+	char *applet;          /* busybox applet to dispatch */
+	char **argv_tpl;       /* argv template strings, $var placeholders */
+	int argv_count;
+} BaTool;
+
+static BaTool *g_tools;
+static int g_tool_count;
+static char *g_tools_json_text;   /* 当前生效的 tools 数组原文 */
+static const SessionPaths *g_paths;   /* 内置状态工具（Plan*）的会话落点 */
+
+static char *read_file_all(const char *path)
+{
+	long sz;
+	char *buf;
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return NULL;
+	sz = xlseek(fd, 0, SEEK_END);
+	xlseek(fd, 0, SEEK_SET);
+	buf = xzalloc(sz + 1);
+	sz = full_read(fd, buf, sz);
+	if (sz < 0)
+		sz = 0;
+	buf[sz] = '\0';
+	close(fd);
+	return buf;
+}
+
+/* Parse one tools JSON text into the global table. Returns 0 on success. */
+static int ba_tools_parse(const char *json)
+{
+	JsonParse jp = json_parse_root(json);
+	JsonVal arr, item;
+	int n, i;
+
+	if (jp.error)
+		return -1;
+	arr = jp.val;
+	n = json_array_len(arr);
+	if (n <= 0)
+		return -1;
+
+	g_tools = xzalloc(n * sizeof(BaTool));
+	g_tool_count = n;
+
+	for (i = 0; i < n; i++) {
+		JsonVal exec, argv_val;
+		int an, j;
+
+		item = json_array_get(arr, i);
+		g_tools[i].name = json_get_string(item, "name");
+		exec = json_get(item, "exec");
+		g_tools[i].applet = json_get_string(exec, "applet");
+		argv_val = json_get(exec, "argv");
+		an = json_array_len(argv_val);
+		if (an > 0) {
+			g_tools[i].argv_tpl = xzalloc(an * sizeof(char *));
+			g_tools[i].argv_count = an;
+			for (j = 0; j < an; j++)
+				g_tools[i].argv_tpl[j] = json_string_val(json_array_get(argv_val, j));
+		}
+	}
+	return 0;
+}
+
+/* Load tools from $BB_AGENT_HOME/tools.json. The file is the only
+ * source: nothing is embedded in the binary. Missing or broken file
+ * means "no tools" — plain Q&A still works, requests just omit tools. */
+void ba_tools_set_paths(const SessionPaths *paths)
+{
+	g_paths = paths;
+}
+
+int ba_tools_init(const char *home, const SessionPaths *paths)
+{
+	char *path = NULL;
+	char *data = NULL;
+
+	if (g_tools)
+		return g_tool_count;
+	g_paths = paths;
+
+	if (home && home[0])
+		path = xasprintf("%s/tools.json", home);
+	if (path)
+		data = read_file_all(path);
+	if (data && ba_tools_parse(data) == 0) {
+		g_tools_json_text = data;
+	} else {
+		if (data)
+			bb_error_msg("tools.json parse failed, dynamic zone ignored (builtins remain)");
+		else
+			bb_error_msg("no %s — builtin 11 tools active, dynamic zone empty "
+				     "(busyagent -i exports a starter table)", path);
+		free(data);
+		g_tools_json_text = NULL;
+	}
+	free(path);
+	return g_tool_count;
+}
+
+void ba_tools_free(void)
+{
+	int i, j;
+	for (i = 0; i < g_tool_count; i++) {
+		free(g_tools[i].name);
+		free(g_tools[i].applet);
+		for (j = 0; j < g_tools[i].argv_count; j++)
+			free(g_tools[i].argv_tpl[j]);
+		free(g_tools[i].argv_tpl);
+	}
+	free(g_tools);
+	g_tools = NULL;
+	g_tool_count = 0;
+	free(g_tools_json_text);
+	g_tools_json_text = NULL;
+}
+
+/* span 复制：JsonVal 是 (src,start,end) 视图 */
+static char *val_span_dup(const char *src, JsonVal v)
+{
+    size_t n = v.end - v.start;
+    char *s = xmalloc(n + 1);
+    memcpy(s, src + v.start, n);
+    s[n] = '\0';
+    return s;
+}
+
+/* 当前生效的 tools 数组（LLM 视角：剥离 busyagent 专有的 exec 字段）。
+ * 无工具表时返回 NULL —— 调用方据此在请求中省略 tools 字段。 */
+/* LLM 看到的 tools 数组 = 内置 11 项 + 动态区（剥离 exec）。
+ * 无动态区时仅内置（sh 锚点保证能力完备）。 */
+char *ba_tools_json(void)
+{
+    const char *src = g_tools_json_text;
+    StrBuf sb;
+
+    if (!src)
+        return util_strdup(ba_builtin_schemas);
+
+    {
+        JsonParse jp = json_parse_root(src);
+        int n, i;
+        if (jp.error)
+            return util_strdup(ba_builtin_schemas);
+        n = json_array_len(jp.val);
+        sb_init(&sb);
+        sb_append(&sb, ba_builtin_schemas);
+        sb_truncate(&sb, sb.len - 2);   /* 去掉 "]\n" 结尾，追加动态区 */
+        for (i = 0; i < n; i++) {
+            JsonVal item = json_array_get(jp.val, i);
+            char *nm = json_get_string(item, "name");
+            /* 内置名不允许动态区覆盖 */
+            if (nm && (!strcmp(nm, "Read") || !strcmp(nm, "Write") || !strcmp(nm, "Edit")
+                    || !strcmp(nm, "Bash") || !strcmp(nm, "Glob") || !strcmp(nm, "Grep")
+                    || !strcmp(nm, "TodoWrite") || !strcmp(nm, "PlanConfirm")
+                    || !strcmp(nm, "PlanClear") || !strcmp(nm, "Skill")
+                    || !strcmp(nm, "SubAgent"))) {
+                bb_error_msg("tools.json: '%s' shadows a builtin, skipped", nm);
+                free(nm);
+                continue;
+            }
+            {
+                char *desc = json_get_string(item, "description");
+                JsonVal sch = json_get(item, "input_schema");
+                char *sch_txt = (sch.type != JSON_NULL) ? val_span_dup(src, sch) : NULL;
+                sb_append(&sb, ",\n  {\n    \"name\":");
+                sb_append_json_string(&sb, nm ? nm : "");
+                sb_append(&sb, ",\"description\":");
+                sb_append_json_string(&sb, desc ? desc : "");
+                sb_append(&sb, ",\"input_schema\":");
+                sb_append(&sb, sch_txt && sch_txt[0] ? sch_txt : "{}");
+                sb_append(&sb, "}\n");
+                free(nm); free(desc); free(sch_txt);
+            }
+        }
+        sb_append(&sb, "]\n");
+    }
+    return sb.data;
+}
+
+/* 动态区示例模板（-i 导出）：与内置 11 项不重叠的 POSIX 直给原语 */
+static const char ba_tools_template[] =
+"[\n"
+"  {\n"
+"    \"name\": \"ls\",\n"
+"    \"description\": \"List directory contents (busybox ls).\",\n"
+"    \"exec\": { \"applet\": \"ls\", \"argv\": [\"-la\", \"$path\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"Directory or file (default cwd)\" } } }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"head\",\n"
+"    \"description\": \"Print the first lines of a file (busybox head).\",\n"
+"    \"exec\": { \"applet\": \"head\", \"argv\": [\"-n\", \"${lines}\", \"$path\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to read\" },\n"
+"                      \"lines\": { \"type\": \"integer\", \"description\": \"Number of lines (default 10)\" } },\n"
+"      \"required\": [\"path\"] }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"tail\",\n"
+"    \"description\": \"Print the last lines of a file (busybox tail).\",\n"
+"    \"exec\": { \"applet\": \"tail\", \"argv\": [\"-n\", \"${lines}\", \"$path\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to read\" },\n"
+"                      \"lines\": { \"type\": \"integer\", \"description\": \"Number of lines (default 10)\" } },\n"
+"      \"required\": [\"path\"] }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"wc\",\n"
+"    \"description\": \"Count lines, words and bytes of a file (busybox wc).\",\n"
+"    \"exec\": { \"applet\": \"wc\", \"argv\": [\"$path\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to count\" } },\n"
+"      \"required\": [\"path\"] }\n"
+"  },\n"
+"  {\n"
+"    \"name\": \"stat\",\n"
+"    \"description\": \"Display file status (size, mode, timestamps; busybox stat).\",\n"
+"    \"exec\": { \"applet\": \"stat\", \"argv\": [\"$path\"] },\n"
+"    \"input_schema\": { \"type\": \"object\",\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to inspect\" } },\n"
+"      \"required\": [\"path\"] }\n"
+"  }\n"
+"]\n";
+
+/* 导出动态区示例模板到 path。条目名不得与内置 11 项重叠
+ * （运行期同样强制过滤）。返回 0 成功；-1 已存在；-2 写失败。 */
+int ba_tools_write_template(const char *path)
+{
+	int fd;
+	char *dir;
+
+	if (access(path, F_OK) == 0)
+		return -1;
+	dir = xstrdup(path);
+	{
+		char *slash = strrchr(dir, '/');
+		if (slash && slash != dir) {
+			*slash = '\0';
+			bb_make_directory(dir, 0755, FILEUTILS_RECUR);
+		}
+	}
+	free(dir);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+	if (fd < 0)
+		return -2;
+	if (full_write(fd, ba_tools_template, strlen(ba_tools_template)) < 0) {
+		close(fd);
+		return -2;
+	}
+	close(fd);
+	return 0;
+}
+
+/* ---- execution ---- */
+
+struct out_buf {
+	char *data;
+	size_t len;
+	size_t cap;
+};
+
+static void out_append(struct out_buf *b, const char *ptr, size_t n)
+{
+	if (b->len + n + 1 > b->cap) {
+		size_t nc = b->cap ? b->cap * 2 : 4096;
+		while (nc < b->len + n + 1)
+			nc *= 2;
+		if (nc > BA_OUTPUT_MAX + 1)
+			nc = BA_OUTPUT_MAX + 1;
+		if (nc <= b->len)
+			return;   /* full */
+		b->data = xrealloc(b->data, nc);
+		b->cap = nc;
+	}
+	if (b->len + n > BA_OUTPUT_MAX)
+		n = BA_OUTPUT_MAX - b->len;
+	memcpy(b->data + b->len, ptr, n);
+	b->len += n;
+	b->data[b->len] = '\0';
+}
+
+/* Run one argv in a forked child with captured output.
+ * NOFORK applets -> run_nofork_applet() direct call; others -> exec
+ * busybox itself with the applet name. */
+static int run_captured(const char *applet, char **argv,
+			struct out_buf *out, struct out_buf *err,
+			int timeout_ms)
+{
+	int pipe_out[2], pipe_err[2];
+	pid_t pid;
+	int applet_no = find_applet_by_name(applet);
+	int nofork = (applet_no >= 0 && APPLET_IS_NOFORK(applet_no));
+	int status = 0;
+	int64_t deadline;
+	char buf[4096];
+
+	if (applet_no < 0 && strcmp(applet, "sh") != 0)
+		return -1;   /* unknown and not sh: refuse */
+
+	xpipe(pipe_out);
+	xpipe(pipe_err);
+
+	pid = fork();
+	if (pid < 0) {
+		close(pipe_out[0]); close(pipe_out[1]);
+		close(pipe_err[0]); close(pipe_err[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		/* child */
+		signal(SIGPIPE, SIG_DFL);
+		close(pipe_out[0]); close(pipe_err[0]);
+		xmove_fd(xopen("/dev/null", O_RDONLY), STDIN_FILENO);
+		xmove_fd(pipe_out[1], STDOUT_FILENO);
+		xmove_fd(pipe_err[1], STDERR_FILENO);
+		if (nofork) {
+			/* NOFORK applets must never run in the parent process:
+			 * they mutate global busybox state. We are forked. */
+			_exit(run_nofork_applet(applet_no, argv));
+		}
+		BB_EXECVP(bb_busybox_exec_path, argv);
+		/* argv[0] must be the applet name for busybox dispatch */
+		_exit(127);
+	}
+	close(pipe_out[1]); close(pipe_err[1]);
+
+	deadline = (int64_t)monotonic_ms() + timeout_ms;
+	for (;;) {
+		struct pollfd pfd[2];
+		int nready;
+
+		pfd[0].fd = pipe_out[0];
+		pfd[0].events = POLLIN;
+		pfd[1].fd = pipe_err[0];
+		pfd[1].events = POLLIN;
+		nready = poll(pfd, 2, 100);
+		if (nready > 0) {
+			if (pfd[0].revents & (POLLIN | POLLHUP)) {
+				ssize_t n = read(pipe_out[0], buf, sizeof(buf));
+				if (n > 0) out_append(out, buf, n);
+			}
+			if (pfd[1].revents & (POLLIN | POLLHUP)) {
+				ssize_t n = read(pipe_err[0], buf, sizeof(buf));
+				if (n > 0) out_append(err, buf, n);
+			}
+		}
+		if (waitpid(pid, &status, WNOHANG) == pid) {
+			ssize_t n;
+			while ((n = read(pipe_out[0], buf, sizeof(buf))) > 0)
+				out_append(out, buf, n);
+			while ((n = read(pipe_err[0], buf, sizeof(buf))) > 0)
+				out_append(err, buf, n);
+			break;
+		}
+		if (monotonic_ms() > deadline) {
+			kill(pid, SIGKILL);
+			waitpid(pid, &status, 0);
+			status = -2;   /* timeout marker */
+			break;
+		}
+	}
+	close(pipe_out[0]); close(pipe_err[0]);
+	return status;
+}
+
+static void result_wrap(StrBuf *sb, int status, struct out_buf *out,
+			struct out_buf *err)
+{
+	if (status == -2) {
+		sb_append(sb, "Error: command timed out\n");
+		return;
+	}
+	if (status == -1) {
+		sb_append(sb, "Error: failed to start command\n");
+		return;
+	}
+	if (out->data && out->len)
+		sb_append(sb, out->data);
+	if (err->data && err->len) {
+		sb_append(sb, "\n[stderr]\n");
+		sb_append(sb, err->data);
+	}
+	if ((!out->data || !out->len) && (!err->data || !err->len)) {
+		char tmp[64];
+		snprintf(tmp, sizeof(tmp), "(no output, exit %d)",
+			 WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+		sb_append(sb, tmp);
+	}
+}
+
+static const BaTool *find_tool(const char *name)
+{
+	int i;
+	for (i = 0; i < g_tool_count; i++)
+		if (g_tools[i].name && strcmp(g_tools[i].name, name) == 0)
+			return &g_tools[i];
+	return NULL;
+}
+
+/* Expand one argv template token: "$var" -> value from input JSON;
+ * a token that references a missing key expands to NULL (dropped). */
+static char *expand_token(const char *tpl, JsonVal input)
+{
+	char key[128];
+	const char *p;
+
+	if (tpl[0] != '$')
+		return util_strdup(tpl);
+	p = tpl + 1;
+	if (p[0] == '{' && p[strlen(p) - 1] == '}') {
+		/* ${name} */
+		size_t n = strlen(p) - 2;
+		if (n >= sizeof(key))
+			return NULL;
+		memcpy(key, p + 1, n);
+		key[n] = '\0';
+		p = key;
+	}
+	return json_get_string(input, p);
+}
+
+char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
+{
+	StrBuf sb;
+	JsonParse jp;
+	const BaTool *tool;
+	char **argv;
+	int argc, i, ai = 0;
+	struct out_buf out = { NULL, 0, 0 }, err = { NULL, 0, 0 };
+	int status;
+
+	sb_init(&sb);
+
+	jp = json_parse_root(input_json && input_json[0] ? input_json : "{}");
+	if (jp.error) {
+		sb_append(&sb, "Error: invalid tool input JSON");
+		return sb.data;
+	}
+
+	/* ---- 内置保留名（L2/L3）：主循环语义，不走 exec 映射 ---- */
+
+	if (strcmp(name, "Bash") == 0) {
+		char *cmd = json_get_string(jp.val, "command");
+		int background = json_get_bool(jp.val, "background", false);
+		int tmo_sec = json_get_int(jp.val, "timeout");
+		int tmo_ms = json_get_int(jp.val, "timeout_ms");
+
+		if (!cmd || !cmd[0]) {
+			sb_append(&sb, "Error: Bash requires 'command'");
+			free(cmd);
+			return sb.data;
+		}
+
+		if (background) {
+			/* 对齐 bash-agent async_bash_thread_fn：mkstemp 临时文件接
+			 * stdout/stderr，setpgid 进程组隔离，立即返回 task_id。
+			 * 差异：bash-agent 经 msgqueue 以 async_task_result 事件回注；
+			 * 单 turn 无该通道，故告知模型稍后用 Read 读临时文件。 */
+			char tmp_template[] = "/tmp/ba_async_bash_XXXXXX";
+			int tmpfd = mkstemp(tmp_template);
+			pid_t pid;
+			char tid[80], resp[512];
+
+			if (tmpfd < 0) {
+				sb_append(&sb, "Error: failed to create temp file for background command");
+				free(cmd);
+				return sb.data;
+			}
+
+			snprintf(tid, sizeof(tid), "task_%u_%d",
+			         (unsigned)time(NULL), (int)getpid());
+			pid = fork();
+			if (pid < 0) {
+				sb_append(&sb, "Error: failed to fork background command");
+				close(tmpfd);
+				free(cmd);
+				return sb.data;
+			}
+			if (pid == 0) {
+				/* 双 fork：孙进程由 init 收养，busyagent 立即返回 */
+				pid_t pid2 = fork();
+				if (pid2 == 0) {
+					setpgid(0, 0);
+					{
+						int devnull = open("/dev/null", O_RDONLY);
+						if (devnull >= 0) {
+							dup2(devnull, STDIN_FILENO);
+							close(devnull);
+						}
+						dup2(tmpfd, STDOUT_FILENO);
+						dup2(tmpfd, STDERR_FILENO);
+						close(tmpfd);
+						execl(bb_busybox_exec_path, "sh", "-c", cmd, (char *)NULL);
+						_exit(127);
+					}
+				}
+				_exit(0);   /* 中间代立即退出 */
+			}
+			setpgid(pid, pid);
+			close(tmpfd);
+			while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+				continue;   /* 只收中间代；真任务由 init 收养 */
+
+			snprintf(resp, sizeof(resp),
+			         "Async task started: task_id=%s. Output file (read it with "
+			         "Read when needed): %s", tid, tmp_template);
+			sb_append(&sb, resp);
+			free(cmd);
+			return sb.data;
+		}
+
+		{
+			char *sh_argv[4];
+			int tmo = tmo_ms;
+			if (!tmo && tmo_sec > 0)
+				tmo = tmo_sec * 1000;   /* bash-agent 秒制参数兼容 */
+			if (!tmo)
+				tmo = timeout_ms;
+
+			sh_argv[0] = (char *)"sh";
+			sh_argv[1] = (char *)"-c";
+			sh_argv[2] = cmd;
+			sh_argv[3] = NULL;
+			status = run_captured("sh", sh_argv, &out, &err, tmo);
+			result_wrap(&sb, status, &out, &err);
+		}
+		free(cmd);
+		free(out.data);
+		free(err.data);
+		return sb.data;
+	}
+
+	if (strcmp(name, "Read") == 0) {
+		/* cat -n 语义：整文件或 offset/limit 分页（纯 C，无 fork） */
+		char *path = json_get_string(jp.val, "path");
+		int offset = json_get_int(jp.val, "offset");
+		int limit = json_get_int(jp.val, "limit");
+		char *data, *p;
+		size_t lineno = 0, count = 0;
+
+		if (!path || !path[0]) {
+			sb_append(&sb, "Error: Read requires 'path'");
+			free(path);
+			return sb.data;
+		}
+		data = read_file_all(path);
+		if (!data) {
+			sb_appendf(&sb, "Error: cannot read %s", path);
+			free(path);
+			return sb.data;
+		}
+		p = data;
+		while (*p) {
+			char *next = strchr(p, '\n');
+			int ll = next ? (int)(next - p) : (int)strlen(p);
+			lineno++;
+			if ((!offset || lineno >= (size_t)offset)
+			 && (!limit || count < (size_t)limit)) {
+				sb_appendf(&sb, "%6zu\t%.*s\n", lineno, ll, p);
+				count++;
+			}
+			if (!next)
+				break;
+			p = next + 1;
+		}
+		if (offset && lineno < (size_t)offset)
+			sb_appendf(&sb, "(file has only %zu lines)", lineno);
+		free(data);
+		free(path);
+		return sb.data;
+	}
+
+	if (strcmp(name, "Write") == 0) {
+		char *path = json_get_string(jp.val, "path");
+		char *content = json_get_string(jp.val, "content");
+		int fd;
+
+		if (!path || !path[0] || !content) {
+			sb_append(&sb, "Error: Write requires 'path' and 'content'");
+			free(path); free(content);
+			return sb.data;
+		}
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd < 0) {
+			sb_appendf(&sb, "Error: cannot write %s", path);
+		} else if (full_write(fd, content, strlen(content)) < 0) {
+			close(fd);
+			sb_appendf(&sb, "Error: short write to %s", path);
+		} else {
+			close(fd);
+			sb_append(&sb, "wrote ");
+			sb_append(&sb, path);
+		}
+		free(path); free(content);
+		return sb.data;
+	}
+
+	if (strcmp(name, "Edit") == 0) {
+		char *path = json_get_string(jp.val, "path");
+		char *old_s = json_get_string(jp.val, "old_string");
+		char *new_s = json_get_string(jp.val, "new_string");
+		char *data, *hit, *second;
+
+		if (!path || !old_s || !old_s[0] || !new_s) {
+			sb_append(&sb, "Error: Edit requires 'path', 'old_string', 'new_string'");
+			free(path); free(old_s); free(new_s);
+			return sb.data;
+		}
+		data = read_file_all(path);
+		if (!data) {
+			sb_appendf(&sb, "Error: cannot read %s", path);
+			free(path); free(old_s); free(new_s);
+			return sb.data;
+		}
+		hit = strstr(data, old_s);
+		if (!hit) {
+			sb_append(&sb, "Error: old_string not found in ");
+			sb_append(&sb, path);
+		} else {
+			second = strstr(hit + 1, old_s);
+			if (second) {
+				sb_append(&sb, "Error: old_string occurs more than once in ");
+				sb_append(&sb, path);
+			} else {
+				StrBuf nb;
+				sb_init(&nb);
+				sb_append(&nb, data);
+				sb_truncate(&nb, hit - data);   /* 前段 */
+				sb_append(&nb, new_s);          /* 替换文本 */
+				sb_append(&nb, hit + strlen(old_s)); /* 后段 */
+				{
+					int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+					if (fd < 0) {
+						sb_appendf(&sb, "Error: cannot write %s", path);
+					} else if (full_write(fd, nb.data, nb.len) < 0) {
+						close(fd);
+						sb_appendf(&sb, "Error: short write to %s", path);
+					} else {
+						close(fd);
+						sb_append(&sb, "edited ");
+						sb_append(&sb, path);
+					}
+				}
+				sb_free(&nb);
+			}
+		}
+		free(data);
+		free(path); free(old_s); free(new_s);
+		return sb.data;
+	}
+
+	if (strcmp(name, "Glob") == 0) {
+		char *pattern = json_get_string(jp.val, "pattern");
+		char *gpath = json_get_string(jp.val, "path");
+		char *gv[6];
+		int gi = 0;
+
+		if (!pattern || !pattern[0]) {
+			sb_append(&sb, "Error: Glob requires 'pattern'");
+			free(pattern); free(gpath);
+			return sb.data;
+		}
+		gv[gi++] = (char *)"find";
+		gv[gi++] = (gpath && gpath[0]) ? gpath : (char *)".";
+		gv[gi++] = (char *)"-name";
+		gv[gi++] = pattern;
+		gv[gi] = NULL;
+		status = run_captured("find", gv, &out, &err, timeout_ms);
+		result_wrap(&sb, status, &out, &err);
+		free(pattern); free(gpath);
+		free(out.data);
+		free(err.data);
+		return sb.data;
+	}
+
+	if (strcmp(name, "Grep") == 0) {
+		char *pattern = json_get_string(jp.val, "pattern");
+		char *gpath = json_get_string(jp.val, "path");
+		char *glob_f = json_get_string(jp.val, "glob");
+		int ctx = json_get_int(jp.val, "context");
+		char ctxs[16];
+		char *ctx_dup = NULL, *inc_dup = NULL;
+		char *gv[12];
+		int gi = 0;
+
+		if (!pattern || !pattern[0]) {
+			sb_append(&sb, "Error: Grep requires 'pattern'");
+			free(pattern); free(gpath); free(glob_f);
+			return sb.data;
+		}
+		gv[gi++] = (char *)"grep";
+		if (glob_f && glob_f[0]) {
+			inc_dup = xasprintf("--include=%s", glob_f);
+			gv[gi++] = inc_dup;
+		}
+		if (ctx > 0) {
+			snprintf(ctxs, sizeof(ctxs), "-%d", ctx);
+			ctx_dup = xstrdup(ctxs);
+			gv[gi++] = ctx_dup;
+		}
+		gv[gi++] = (char *)"-nH";
+		gv[gi++] = (char *)"-r";
+		gv[gi++] = (char *)"-e";
+		gv[gi++] = pattern;
+		if (gpath && gpath[0])
+			gv[gi++] = gpath;
+		gv[gi] = NULL;
+		status = run_captured("grep", gv, &out, &err, timeout_ms);
+		result_wrap(&sb, status, &out, &err);
+		free(ctx_dup);
+		free(pattern); free(gpath);
+		free(out.data);
+		free(err.data);
+		return sb.data;
+	}
+
+	if (strcmp(name, "TodoWrite") == 0) {
+		/* todos 数组 → markdown checklist，仅作为 tool_result 回喂。
+		 * 持久化由 conversation history 承担（本工具的完整调用记录
+		 * 就是状态本身），不落盘、不注入 system prompt。 */
+		JsonVal todos = json_get(jp.val, "todos");
+		int total, i;
+		if (todos.type != JSON_ARRAY) {
+			sb_append(&sb, "OK");   /* 对齐 bash-agent：非法形状不报错 */
+			return sb.data;
+		}
+		total = json_array_len(todos);
+		for (i = 0; i < total; i++) {
+			JsonVal item = json_array_get(todos, i);
+			char *content = json_get_string(item, "content");
+			char *st = json_get_string(item, "status");
+			sb_append(&sb, "- [");
+			sb_append(&sb, (st && strcmp(st, "completed") == 0) ? "x" : " ");
+			sb_append(&sb, "] ");
+			sb_append(&sb, content ? content : "");
+			sb_append(&sb, "\n");
+			free(content); free(st);
+		}
+		/* 去掉末尾换行（对齐 bash-agent） */
+		if (sb.len > 0 && sb.data[sb.len - 1] == '\n') {
+			sb.data[sb.len - 1] = '\0';
+			sb.len--;
+		}
+		return sb.data;
+	}
+
+	if (strcmp(name, "PlanConfirm") == 0) {
+		char *draft = g_paths ? store_plan_draft_read(g_paths) : NULL;
+		if (!draft || !draft[0]) {
+			sb_append(&sb, "Error: no plan draft to confirm (write it first)");
+			free(draft);
+			return sb.data;
+		}
+		store_plan_set(g_paths, draft);
+		store_plan_draft_clear(g_paths);
+		/* 注：bash-agent 由 agent_loop 在 compact 后执行 mv；本实现为单 turn
+ * 同步模型、无 compact 机制，故在此直接落盘 */
+		sb_append(&sb, "Plan confirmed and locked in.");
+		free(draft);
+		return sb.data;
+	}
+
+	if (strcmp(name, "PlanClear") == 0) {
+		if (g_paths)
+			store_plan_clear(g_paths);
+		sb_append(&sb, "Plan cleared.");
+		return sb.data;
+	}
+
+	if (strcmp(name, "Skill") == 0) {
+		/* L2 知识级：经 ba_load_skill 统一搜索
+		 * cwd/skills > ~/.agents/skills > $BB_AGENT_HOME/skills，
+		 * 支持 ${BA_AGENT_SKILL_DIR} 占位符替换 */
+		char *skill = json_get_string(jp.val, "name");
+		const char *agents_home = getenv("HOME");
+		const char *bag_home = getenv("BB_AGENT_HOME");
+		char *cwd = xrealloc_getcwd_or_warn(NULL);
+		char *content;
+
+		if (!skill || !skill[0]) {
+			sb_append(&sb, "Error: Skill requires 'name'");
+			free(skill); free(cwd);
+			return sb.data;
+		}
+		content = ba_load_skill(skill, cwd,
+					(agents_home && agents_home[0]) ? agents_home : NULL,
+					bag_home ? bag_home : "/tmp/busyagent",
+					NULL);
+		free(cwd);
+		if (!content) {
+			sb_appendf(&sb, "Error: skill '%s' not found "
+				     "(searched $CWD/skills, ~/.agents/skills, $BB_AGENT_HOME/skills)", skill);
+			free(skill);
+			return sb.data;
+		}
+		sb_append(&sb, content);
+		free(content);
+		free(skill);
+		return sb.data;
+	}
+
+	if (strcmp(name, "SubAgent") == 0) {
+		/* 占位：由 turn 循环层截获处理（bash-agent tools.c 同款） */
+		sb_append(&sb, "SubAgent handled by agent layer");
+		return sb.data;
+	}
+
+	/* ---- L0/L1：exec 映射 ---- */
+
+	tool = find_tool(name);
+	if (!tool || !tool->applet) {
+		sb_appendf(&sb, "Error: tool '%s' is not in the tool table", name);
+		return sb.data;
+	}
+
+	/* argv[0] = applet name (busybox dispatch convention) */
+	argc = tool->argv_count + 1;
+	argv = xzalloc(argc * sizeof(char *));
+	argv[ai++] = tool->applet;
+	for (i = 0; i < tool->argv_count; i++) {
+		char *v = expand_token(tool->argv_tpl[i], jp.val);
+		if (!v) {
+			/* missing optional key: drop this argument */
+			argc--;
+			continue;
+		}
+		argv[ai++] = v;
+	}
+	argv[ai] = NULL;
+
+	if (timeout_ms <= 0)
+		timeout_ms = BA_TOOL_TIMEOUT_MS;
+	status = run_captured(tool->applet, argv, &out, &err, timeout_ms);
+	result_wrap(&sb, status, &out, &err);
+
+	for (i = 1; i < ai; i++)
+		free(argv[i]);
+	free(argv);
+	free(out.data);
+	free(err.data);
+	return sb.data;
+}
