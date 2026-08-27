@@ -26,7 +26,7 @@ busyagent [-vnu] [-k KEY] [-m MODEL] [-p PROVIDER] [-t TURNS] [-s ID] [-o FMT] [
     -c          explicit alias of the default continue-by-cwd behaviour
     -o FMT      text (default) | json (stream-json events on stdout)
     -v          verbose: request/response diagnostics on stderr
-    -i          print the resolved system prompt and exit
+    -i [PATH]   write a starter tools.json (default $BB_AGENT_HOME/tools.json) and exit
 
     With no PROMPT argument the prompt is read from stdin;
     if stdin is a tty an interactive REPL is started instead
