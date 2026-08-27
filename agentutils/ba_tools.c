@@ -491,42 +491,59 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 		}
 
 		if (background) {
-			/* nohup 式脱离：双 fork 免僵尸，输出写日志文件，
-			 * 返回 task_id 与日志路径供后续 Read/cat 查看 */
-			static unsigned bg_seq = 0;
-			const char *bh = getenv("BB_AGENT_HOME");
-			char tid[40], *logpath, *logdir;
-			pid_t p1 = fork();
+			/* 对齐 bash-agent async_bash_thread_fn：mkstemp 临时文件接
+			 * stdout/stderr，setpgid 进程组隔离，立即返回 task_id。
+			 * 差异：bash-agent 经 msgqueue 以 async_task_result 事件回注；
+			 * 单 turn 无该通道，故告知模型稍后用 Read 读临时文件。 */
+			char tmp_template[] = "/tmp/ba_async_bash_XXXXXX";
+			int tmpfd = mkstemp(tmp_template);
+			pid_t pid;
+			char tid[80], resp[512];
 
-			if (p1 < 0) {
-				sb_append(&sb, "Error: failed to start background command");
+			if (tmpfd < 0) {
+				sb_append(&sb, "Error: failed to create temp file for background command");
 				free(cmd);
 				return sb.data;
 			}
-			if (p1 == 0) {
-				pid_t p2 = fork();   /* 双 fork：孙进程由 init 收养 */
-				if (p2 == 0) {
-					snprintf(tid, sizeof(tid), "task_%u_%d",
-					         (unsigned)time(NULL), ++bg_seq);
-					logpath = xasprintf("%s/tasks/%s.log", bh, tid);
-					close(0);
-					xmove_fd(xopen("/dev/null", O_RDONLY), STDIN_FILENO);
-					xmove_fd(xopen3(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644), STDOUT_FILENO);
-					xmove_fd(dup(STDOUT_FILENO), STDERR_FILENO);
-					execl(bb_busybox_exec_path, "sh", "sh", "-c", cmd, (char *)NULL);
-					_exit(127);
-				}
-				_exit(0);   /* 中间子进程立即退出，父进程 waitpid 回收 */
-			}
-			waitpid(p1, &status, 0);
 
-			logdir = xasprintf("%s/tasks", bh);
-			bb_make_directory(logdir, 0755, FILEUTILS_RECUR);
-			sb_appendf(&sb,
-			           "Started in background. Read its output later with "
-			           "Read(path=\"%s\"). Log file: %s.log",
-			           logpath, tid);
-			free(logpath); free(logdir);
+			snprintf(tid, sizeof(tid), "task_%u_%d",
+			         (unsigned)time(NULL), (int)getpid());
+			pid = fork();
+			if (pid < 0) {
+				sb_append(&sb, "Error: failed to fork background command");
+				close(tmpfd);
+				free(cmd);
+				return sb.data;
+			}
+			if (pid == 0) {
+				/* 双 fork：孙进程由 init 收养，busyagent 立即返回 */
+				pid_t pid2 = fork();
+				if (pid2 == 0) {
+					setpgid(0, 0);
+					{
+						int devnull = open("/dev/null", O_RDONLY);
+						if (devnull >= 0) {
+							dup2(devnull, STDIN_FILENO);
+							close(devnull);
+						}
+						dup2(tmpfd, STDOUT_FILENO);
+						dup2(tmpfd, STDERR_FILENO);
+						close(tmpfd);
+						execl(bb_busybox_exec_path, "sh", "-c", cmd, (char *)NULL);
+						_exit(127);
+					}
+				}
+				_exit(0);   /* 中间代立即退出 */
+			}
+			setpgid(pid, pid);
+			close(tmpfd);
+			while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+				continue;   /* 只收中间代；真任务由 init 收养 */
+
+			snprintf(resp, sizeof(resp),
+			         "Async task started: task_id=%s. Output file (read it with "
+			         "Read when needed): %s", tid, tmp_template);
+			sb_append(&sb, resp);
 			free(cmd);
 			return sb.data;
 		}

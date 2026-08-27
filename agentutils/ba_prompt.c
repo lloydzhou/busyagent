@@ -337,7 +337,7 @@ char *ba_build_prompt(const BaPromptCtx *ctx) {
             "- Prefer dedicated tools over Bash when a dedicated tool fits the task.\n"
             "- For Edit: copy old_string exactly (including whitespace/indent/newlines). If you already know the location from prior context, use Read with offset/limit. If you need to locate the text first, use Grep with context — its output is often sufficient for Edit without an extra Read.\n"
             "- For skills, first check the skill-index section, then use Skill(name) for the matching skill.\n"
-            "- Bash background=true runs detached and writes output to a log file; read the log later with Read to fetch results.";
+            "- Bash supports background=true for long-running commands. Returns task_id immediately; this build delivers the output by writing it to a temp file - read that file with Read to fetch results (bash-agent injects it via async events instead).";
         prompt_append_section(&buf, "using-your-tools", tool_guidance, NULL);
     }
 
