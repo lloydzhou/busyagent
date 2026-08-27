@@ -82,8 +82,8 @@ SessionPaths store_session_paths_for(const char *home, const char *cwd, const ch
     StrBuf buf;
     sb_init(&buf);
 
-    /* base_dir = ~/.bash-agent/projects/<key> */
-    sb_appendf(&buf, "%s/.bash-agent/projects/%s", home, key);
+    /* base_dir = $BB_AGENT_HOME/projects/<key> */
+    sb_appendf(&buf, "%s/projects/%s", home, key);
     p.base_dir = util_strdup(buf.data);
 
     /* session_dir = base_dir/<session-id> */
@@ -222,7 +222,7 @@ char *store_session_resolve_continue(const char *home, const char *cwd) {
     char *key = store_session_project_key(cwd);
     StrBuf buf;
     sb_init(&buf);
-    sb_appendf(&buf, "%s/.bash-agent/projects/%s", home, key);
+    sb_appendf(&buf, "%s/projects/%s", home, key);
 
     DIR *dir = opendir(buf.data);
     if (!dir) { sb_free(&buf); free(key); return NULL; }
@@ -236,7 +236,7 @@ char *store_session_resolve_continue(const char *home, const char *cwd) {
         /* 尝试解析目录名为时间戳: YYYYMMDD-HHMMSS-XXXX */
         struct stat st;
         sb_truncate(&buf, 0);
-        sb_appendf(&buf, "%s/.bash-agent/projects/%s/%s", home, key, entry->d_name);
+        sb_appendf(&buf, "%s/projects/%s/%s", home, key, entry->d_name);
         if (stat(buf.data, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
         /* 优先用 events.jsonl 的 mtime，fallback 到目录 mtime（对齐 bash/rust） */
         time_t mtime = st.st_mtime;
@@ -263,7 +263,7 @@ int store_session_list_rows(const char *home, const char *cwd, StrBuf *out) {
     char *key = store_session_project_key(cwd);
     StrBuf buf;
     sb_init(&buf);
-    sb_appendf(&buf, "%s/.bash-agent/projects/%s", home, key);
+    sb_appendf(&buf, "%s/projects/%s", home, key);
 
     struct dirent **namelist;
     int n = scandir(buf.data, &namelist, NULL, alphasort);
@@ -279,7 +279,7 @@ int store_session_list_rows(const char *home, const char *cwd, StrBuf *out) {
         if (entry->d_name[0] == '.') { free(entry); continue; }
         struct stat st;
         sb_truncate(&buf, 0);
-        sb_appendf(&buf, "%s/.bash-agent/projects/%s/%s", home, key, entry->d_name);
+        sb_appendf(&buf, "%s/projects/%s/%s", home, key, entry->d_name);
         if (stat(buf.data, &st) != 0 || !S_ISDIR(st.st_mode)) { free(entry); continue; }
         names[valid] = util_strdup(entry->d_name);
         mtimes[valid] = st.st_mtime;
@@ -306,7 +306,7 @@ int store_session_list_rows(const char *home, const char *cwd, StrBuf *out) {
         int i = order[idx];
         struct stat st;
         sb_truncate(&buf, 0);
-        sb_appendf(&buf, "%s/.bash-agent/projects/%s/%s", home, key, names[i]);
+        sb_appendf(&buf, "%s/projects/%s/%s", home, key, names[i]);
         stat(buf.data, &st);
 
         /* modified: 目录 mtime，格式 YYYY-MM-DD HH:MM（对齐 bash） */

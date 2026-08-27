@@ -411,7 +411,15 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	}
 
 	/* session resolution: --session > --new > default(cwd latest) */
-	home = xstrdup(home_env && home_env[0] ? home_env : "/tmp/busyagent");
+	{
+		if (home_env && home_env[0]) {
+			home = xstrdup(home_env);
+		} else {
+			/* 持久会话记忆需要持久位置：$HOME/.busyagent */
+			const char *h = getenv("HOME");
+			home = (h && h[0]) ? xasprintf("%s/.busyagent", h) : xstrdup("/tmp/busyagent");
+		}
+	}
 	cwd = xrealloc_getcwd_or_warn(NULL);
 	if (session_arg && session_arg[0]) {
 		session_id = xstrdup(session_arg);
@@ -435,7 +443,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	}
 
 	/* 提示（如缺失/损坏）由 ba_tools_init 内部给出：缺表即纯 chat 降级 */
-	ba_tools_init(home);
+	ba_tools_init(home, &paths);
 
 	/* record user turn */
 	{

@@ -27,7 +27,9 @@
 #include "ba_util.h"
 #include "ba_json.h"
 #include "ba_transport.h"
+#include "ba_store.h"
 #include "ba_tools.h"
+#include "ba_builtin_schemas.h"
 
 #define BA_TOOL_TIMEOUT_MS   120000
 #define BA_OUTPUT_MAX        (128 * 1024)
@@ -44,6 +46,7 @@ typedef struct {
 static BaTool *g_tools;
 static int g_tool_count;
 static char *g_tools_json_text;   /* 当前生效的 tools 数组原文 */
+static const SessionPaths *g_paths;   /* 内置状态工具（Plan*）的会话落点 */
 
 static char *read_file_all(const char *path)
 {
@@ -103,13 +106,14 @@ static int ba_tools_parse(const char *json)
 /* Load tools from $BB_AGENT_HOME/tools.json. The file is the only
  * source: nothing is embedded in the binary. Missing or broken file
  * means "no tools" — plain Q&A still works, requests just omit tools. */
-int ba_tools_init(const char *home)
+int ba_tools_init(const char *home, const SessionPaths *paths)
 {
 	char *path = NULL;
 	char *data = NULL;
 
 	if (g_tools)
 		return g_tool_count;
+	g_paths = paths;
 
 	if (home && home[0])
 		path = xasprintf("%s/tools.json", home);
@@ -119,9 +123,9 @@ int ba_tools_init(const char *home)
 		g_tools_json_text = data;
 	} else {
 		if (data)
-			bb_error_msg("tools.json parse failed, continuing without tools");
+			bb_error_msg("tools.json parse failed, dynamic zone ignored (builtins remain)");
 		else
-			bb_error_msg("no %s — continuing as plain chat agent "
+			bb_error_msg("no %s — builtin 11 tools active, dynamic zone empty "
 				     "(busyagent -i exports a starter table)", path);
 		free(data);
 		g_tools_json_text = NULL;
@@ -159,62 +163,70 @@ static char *val_span_dup(const char *src, JsonVal v)
 
 /* 当前生效的 tools 数组（LLM 视角：剥离 busyagent 专有的 exec 字段）。
  * 无工具表时返回 NULL —— 调用方据此在请求中省略 tools 字段。 */
+/* LLM 看到的 tools 数组 = 内置 11 项 + 动态区（剥离 exec）。
+ * 无动态区时仅内置（sh 锚点保证能力完备）。 */
 char *ba_tools_json(void)
 {
     const char *src = g_tools_json_text;
-    JsonParse jp;
     StrBuf sb;
-    int n, i;
 
     if (!src)
-        return NULL;
-    jp = json_parse_root(src);
-    if (jp.error)
-        return util_strdup(src);
-    n = json_array_len(jp.val);
-    sb_init(&sb);
-    sb_append_char(&sb, '[');
-    for (i = 0; i < n; i++) {
-        JsonVal item = json_array_get(jp.val, i);
-        char *name = json_get_string(item, "name");
-        char *desc = json_get_string(item, "description");
-        JsonVal sch = json_get(item, "input_schema");
-        char *sch_txt = val_span_dup(src, sch);
-        if (i > 0) sb_append_char(&sb, ',');
-        sb_append(&sb, "{\"name\":");
-        sb_append_json_string(&sb, name ? name : "");
-        sb_append(&sb, ",\"description\":");
-        sb_append_json_string(&sb, desc ? desc : "");
-        sb_append(&sb, ",\"input_schema\":");
-        sb_append(&sb, sch_txt && sch_txt[0] ? sch_txt : "{}");
-        sb_append_char(&sb, '}');
-        free(name); free(desc); free(sch_txt);
+        return util_strdup(ba_builtin_schemas);
+
+    {
+        JsonParse jp = json_parse_root(src);
+        int n, i;
+        if (jp.error)
+            return util_strdup(ba_builtin_schemas);
+        n = json_array_len(jp.val);
+        sb_init(&sb);
+        sb_append(&sb, ba_builtin_schemas);
+        sb_truncate(&sb, sb.len - 2);   /* 去掉 "]\n" 结尾，追加动态区 */
+        for (i = 0; i < n; i++) {
+            JsonVal item = json_array_get(jp.val, i);
+            char *nm = json_get_string(item, "name");
+            /* 内置名不允许动态区覆盖 */
+            if (nm && (!strcmp(nm, "Read") || !strcmp(nm, "Write") || !strcmp(nm, "Edit")
+                    || !strcmp(nm, "Bash") || !strcmp(nm, "Glob") || !strcmp(nm, "Grep")
+                    || !strcmp(nm, "TodoWrite") || !strcmp(nm, "PlanConfirm")
+                    || !strcmp(nm, "PlanClear") || !strcmp(nm, "Skill")
+                    || !strcmp(nm, "SubAgent"))) {
+                bb_error_msg("tools.json: '%s' shadows a builtin, skipped", nm);
+                free(nm);
+                continue;
+            }
+            {
+                char *desc = json_get_string(item, "description");
+                JsonVal sch = json_get(item, "input_schema");
+                char *sch_txt = (sch.type != JSON_NULL) ? val_span_dup(src, sch) : NULL;
+                sb_append(&sb, ",\n  {\n    \"name\":");
+                sb_append_json_string(&sb, nm ? nm : "");
+                sb_append(&sb, ",\"description\":");
+                sb_append_json_string(&sb, desc ? desc : "");
+                sb_append(&sb, ",\"input_schema\":");
+                sb_append(&sb, sch_txt && sch_txt[0] ? sch_txt : "{}");
+                sb_append(&sb, "}\n");
+                free(nm); free(desc); free(sch_txt);
+            }
+        }
+        sb_append(&sb, "]\n");
     }
-    sb_append_char(&sb, ']');
     return sb.data;
 }
 
+/* 动态区示例模板（-i 导出）：与内置 11 项不重叠的 POSIX 直给原语 */
 static const char ba_tools_template[] =
 "[\n"
 "  {\n"
-"    \"name\": \"sh\",\n"
-"    \"description\": \"Execute a shell script via busybox sh (pipelines, redirection, loops, any applet). This is the primary entry point: compose busybox commands freely. Output truncated at 128KB.\",\n"
-"    \"exec\": { \"applet\": \"sh\", \"argv\": [\"-c\", \"$command\"] },\n"
+"    \"name\": \"ls\",\n"
+"    \"description\": \"List directory contents (busybox ls).\",\n"
+"    \"exec\": { \"applet\": \"ls\", \"argv\": [\"-la\", \"$path\"] },\n"
 "    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"command\": { \"type\": \"string\", \"description\": \"The shell script to execute\" } },\n"
-"      \"required\": [\"command\"] }\n"
-"  },\n"
-"  {\n"
-"    \"name\": \"cat\",\n"
-"    \"description\": \"Print a file to stdout (busybox cat, direct in-process call).\",\n"
-"    \"exec\": { \"applet\": \"cat\", \"argv\": [\"$path\"] },\n"
-"    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to read\" } },\n"
-"      \"required\": [\"path\"] }\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"Directory or file (default cwd)\" } } }\n"
 "  },\n"
 "  {\n"
 "    \"name\": \"head\",\n"
-"    \"description\": \"Print the first lines of a file (busybox head). Prefer over cat for large files.\",\n"
+"    \"description\": \"Print the first lines of a file (busybox head).\",\n"
 "    \"exec\": { \"applet\": \"head\", \"argv\": [\"-n\", \"${lines}\", \"$path\"] },\n"
 "    \"input_schema\": { \"type\": \"object\",\n"
 "      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to read\" },\n"
@@ -231,48 +243,25 @@ static const char ba_tools_template[] =
 "      \"required\": [\"path\"] }\n"
 "  },\n"
 "  {\n"
-"    \"name\": \"ls\",\n"
-"    \"description\": \"List directory contents (busybox ls).\",\n"
-"    \"exec\": { \"applet\": \"ls\", \"argv\": [\"-la\", \"$path\"] },\n"
+"    \"name\": \"wc\",\n"
+"    \"description\": \"Count lines, words and bytes of a file (busybox wc).\",\n"
+"    \"exec\": { \"applet\": \"wc\", \"argv\": [\"$path\"] },\n"
 "    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"Directory or file (default cwd)\" } } }\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to count\" } },\n"
+"      \"required\": [\"path\"] }\n"
 "  },\n"
 "  {\n"
-"    \"name\": \"grep\",\n"
-"    \"description\": \"Search file contents with a regular expression (busybox grep). If path is omitted, searches the current directory recursively.\",\n"
-"    \"exec\": { \"applet\": \"grep\", \"argv\": [\"-nH\", \"-r\", \"-e\", \"$pattern\", \"$path\"] },\n"
+"    \"name\": \"stat\",\n"
+"    \"description\": \"Display file status (size, mode, timestamps; busybox stat).\",\n"
+"    \"exec\": { \"applet\": \"stat\", \"argv\": [\"$path\"] },\n"
 "    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"pattern\": { \"type\": \"string\", \"description\": \"Regular expression\" },\n"
-"                      \"path\": { \"type\": \"string\", \"description\": \"File or directory (default cwd, recursive)\" } },\n"
-"      \"required\": [\"pattern\"] }\n"
-"  },\n"
-"  {\n"
-"    \"name\": \"find\",\n"
-"    \"description\": \"Find files by name pattern (busybox find).\",\n"
-"    \"exec\": { \"applet\": \"find\", \"argv\": [\"$path\", \"-name\", \"${pattern}\"] },\n"
-"    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"Search root (default cwd)\" },\n"
-"                      \"pattern\": { \"type\": \"string\", \"description\": \"Name glob, e.g. *.c\" } } }\n"
-"  },\n"
-"  {\n"
-"    \"name\": \"Skill\",\n"
-"    \"description\": \"Load a skill (prompt/playbook stored under $BB_AGENT_HOME/skills/<name>/SKILL.md) into this conversation. Its content becomes part of your instructions; follow it.\",\n"
-"    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"name\": { \"type\": \"string\", \"description\": \"Skill name\" } },\n"
-"      \"required\": [\"name\"] }\n"
-"  },\n"
-"  {\n"
-"    \"name\": \"SubAgent\",\n"
-"    \"description\": \"Run a fresh busyagent session on a self-contained prompt and return its final answer. Use for isolated sub-tasks that deserve their own context.\",\n"
-"    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"prompt\": { \"type\": \"string\", \"description\": \"Complete, self-contained task description\" },\n"
-"                      \"description\": { \"type\": \"string\", \"description\": \"Short task summary\" } },\n"
-"      \"required\": [\"prompt\"] }\n"
+"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to inspect\" } },\n"
+"      \"required\": [\"path\"] }\n"
 "  }\n"
 "]\n";
 
-/* 导出模板到 path（默认由调用方决定，通常 $BB_AGENT_HOME/tools.json）。
- * 返回 0 成功；-1 文件已存在（不覆盖）；-2 写入失败。 */
+/* 导出动态区示例模板到 path。条目名不得与内置 11 项重叠
+ * （运行期同样强制过滤）。返回 0 成功；-1 已存在；-2 写失败。 */
 int ba_tools_write_template(const char *path)
 {
 	int fd;
@@ -488,30 +477,291 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 
 	/* ---- 内置保留名（L2/L3）：主循环语义，不走 exec 映射 ---- */
 
-	if (strcmp(name, "Skill") == 0) {
-		/* L2 知识级：读技能包全文作为 tool_result 回喂（in-context 生效） */
-		char *skill = json_get_string(jp.val, "name");
-		const char *home = getenv("BB_AGENT_HOME");
-		char *path;
-		if (!skill || !skill[0]) {
-			sb_append(&sb, "Error: Skill requires 'name'");
-			free(skill);
+	if (strcmp(name, "Bash") == 0) {
+		char *cmd = json_get_string(jp.val, "command");
+		char *sh_argv[4];
+		int tmo = json_get_int(jp.val, "timeout_ms");
+		if (!cmd || !cmd[0]) {
+			sb_append(&sb, "Error: Bash requires 'command'");
+			free(cmd);
 			return sb.data;
 		}
-		path = xasprintf("%s/skills/%s/SKILL.md",
-				 (home && home[0]) ? home : "/tmp/busyagent", skill);
-		{
-			char *data = read_file_all(path);
+		sh_argv[0] = (char *)"sh";
+		sh_argv[1] = (char *)"-c";
+		sh_argv[2] = cmd;
+		sh_argv[3] = NULL;
+		status = run_captured("sh", sh_argv, &out, &err, tmo > 0 ? tmo : timeout_ms);
+		result_wrap(&sb, status, &out, &err);
+		free(cmd);
+		free(out.data);
+		free(err.data);
+		return sb.data;
+	}
+
+	if (strcmp(name, "Read") == 0) {
+		/* cat -n 语义：整文件或 offset/limit 分页（纯 C，无 fork） */
+		char *path = json_get_string(jp.val, "path");
+		int offset = json_get_int(jp.val, "offset");
+		int limit = json_get_int(jp.val, "limit");
+		char *data, *p;
+		size_t lineno = 0, count = 0;
+
+		if (!path || !path[0]) {
+			sb_append(&sb, "Error: Read requires 'path'");
 			free(path);
-			if (!data) {
-				sb_appendf(&sb, "Error: skill '%s' not found under $BB_AGENT_HOME/skills/", skill);
-				free(skill);
-				return sb.data;
-			}
-			sb_append(&sb, data);
-			free(data);
+			return sb.data;
 		}
+		data = read_file_all(path);
+		if (!data) {
+			sb_appendf(&sb, "Error: cannot read %s", path);
+			free(path);
+			return sb.data;
+		}
+		p = data;
+		while (*p) {
+			char *next = strchr(p, '\n');
+			int ll = next ? (int)(next - p) : (int)strlen(p);
+			lineno++;
+			if ((!offset || lineno >= (size_t)offset)
+			 && (!limit || count < (size_t)limit)) {
+				sb_appendf(&sb, "%6zu\t%.*s\n", lineno, ll, p);
+				count++;
+			}
+			if (!next)
+				break;
+			p = next + 1;
+		}
+		if (offset && lineno < (size_t)offset)
+			sb_appendf(&sb, "(file has only %zu lines)", lineno);
+		free(data);
+		free(path);
+		return sb.data;
+	}
+
+	if (strcmp(name, "Write") == 0) {
+		char *path = json_get_string(jp.val, "path");
+		char *content = json_get_string(jp.val, "content");
+		int fd;
+
+		if (!path || !path[0] || !content) {
+			sb_append(&sb, "Error: Write requires 'path' and 'content'");
+			free(path); free(content);
+			return sb.data;
+		}
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd < 0) {
+			sb_appendf(&sb, "Error: cannot write %s", path);
+		} else if (full_write(fd, content, strlen(content)) < 0) {
+			close(fd);
+			sb_appendf(&sb, "Error: short write to %s", path);
+		} else {
+			close(fd);
+			sb_append(&sb, "wrote ");
+			sb_append(&sb, path);
+		}
+		free(path); free(content);
+		return sb.data;
+	}
+
+	if (strcmp(name, "Edit") == 0) {
+		char *path = json_get_string(jp.val, "path");
+		char *old_s = json_get_string(jp.val, "old_string");
+		char *new_s = json_get_string(jp.val, "new_string");
+		char *data, *hit, *second;
+
+		if (!path || !old_s || !old_s[0] || !new_s) {
+			sb_append(&sb, "Error: Edit requires 'path', 'old_string', 'new_string'");
+			free(path); free(old_s); free(new_s);
+			return sb.data;
+		}
+		data = read_file_all(path);
+		if (!data) {
+			sb_appendf(&sb, "Error: cannot read %s", path);
+			free(path); free(old_s); free(new_s);
+			return sb.data;
+		}
+		hit = strstr(data, old_s);
+		if (!hit) {
+			sb_append(&sb, "Error: old_string not found in ");
+			sb_append(&sb, path);
+		} else {
+			second = strstr(hit + 1, old_s);
+			if (second) {
+				sb_append(&sb, "Error: old_string occurs more than once in ");
+				sb_append(&sb, path);
+			} else {
+				StrBuf nb;
+				sb_init(&nb);
+				sb_append(&nb, data);
+				sb_truncate(&nb, hit - data);   /* 前段 */
+				sb_append(&nb, new_s);          /* 替换文本 */
+				sb_append(&nb, hit + strlen(old_s)); /* 后段 */
+				{
+					int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+					if (fd < 0) {
+						sb_appendf(&sb, "Error: cannot write %s", path);
+					} else if (full_write(fd, nb.data, nb.len) < 0) {
+						close(fd);
+						sb_appendf(&sb, "Error: short write to %s", path);
+					} else {
+						close(fd);
+						sb_append(&sb, "edited ");
+						sb_append(&sb, path);
+					}
+				}
+				sb_free(&nb);
+			}
+		}
+		free(data);
+		free(path); free(old_s); free(new_s);
+		return sb.data;
+	}
+
+	if (strcmp(name, "Glob") == 0) {
+		char *pattern = json_get_string(jp.val, "pattern");
+		char *gpath = json_get_string(jp.val, "path");
+		char *gv[6];
+		int gi = 0;
+
+		if (!pattern || !pattern[0]) {
+			sb_append(&sb, "Error: Glob requires 'pattern'");
+			free(pattern); free(gpath);
+			return sb.data;
+		}
+		gv[gi++] = (char *)"find";
+		gv[gi++] = (gpath && gpath[0]) ? gpath : (char *)".";
+		gv[gi++] = (char *)"-name";
+		gv[gi++] = pattern;
+		gv[gi] = NULL;
+		status = run_captured("find", gv, &out, &err, timeout_ms);
+		result_wrap(&sb, status, &out, &err);
+		free(pattern); free(gpath);
+		free(out.data);
+		free(err.data);
+		return sb.data;
+	}
+
+	if (strcmp(name, "Grep") == 0) {
+		char *pattern = json_get_string(jp.val, "pattern");
+		char *gpath = json_get_string(jp.val, "path");
+		int ctx = json_get_int(jp.val, "context");
+		char ctxs[16];
+		char *ctx_dup = NULL;
+		char *gv[9];
+		int gi = 0;
+
+		if (!pattern || !pattern[0]) {
+			sb_append(&sb, "Error: Grep requires 'pattern'");
+			free(pattern); free(gpath);
+			return sb.data;
+		}
+		gv[gi++] = (char *)"grep";
+		if (ctx > 0) {
+			snprintf(ctxs, sizeof(ctxs), "-%d", ctx);
+			ctx_dup = xstrdup(ctxs);
+			gv[gi++] = ctx_dup;
+		}
+		gv[gi++] = (char *)"-nH";
+		gv[gi++] = (char *)"-r";
+		gv[gi++] = (char *)"-e";
+		gv[gi++] = pattern;
+		if (gpath && gpath[0])
+			gv[gi++] = gpath;
+		gv[gi] = NULL;
+		status = run_captured("grep", gv, &out, &err, timeout_ms);
+		result_wrap(&sb, status, &out, &err);
+		free(ctx_dup);
+		free(pattern); free(gpath);
+		free(out.data);
+		free(err.data);
+		return sb.data;
+	}
+
+	if (strcmp(name, "TodoWrite") == 0) {
+		/* todos 数组 → markdown checklist，仅作为 tool_result 回喂。
+		 * 持久化由 conversation history 承担（本工具的完整调用记录
+		 * 就是状态本身），不落盘、不注入 system prompt。 */
+		JsonVal todos = json_get(jp.val, "todos");
+		int total, i;
+		if (todos.type != JSON_ARRAY) {
+			sb_append(&sb, "Error: TodoWrite requires 'todos' array");
+			return sb.data;
+		}
+		total = json_array_len(todos);
+		for (i = 0; i < total; i++) {
+			JsonVal item = json_array_get(todos, i);
+			char *content = json_get_string(item, "content");
+			char *st = json_get_string(item, "status");
+			sb_append(&sb, "- [");
+			sb_append(&sb, (st && strcmp(st, "completed") == 0) ? "x" : " ");
+			sb_append(&sb, "] ");
+			sb_append(&sb, content ? content : "");
+			sb_append(&sb, "\n");
+			free(content); free(st);
+		}
+		return sb.data;
+	}
+
+	if (strcmp(name, "PlanConfirm") == 0) {
+		char *draft = g_paths ? store_plan_draft_read(g_paths) : NULL;
+		if (!draft || !draft[0]) {
+			sb_append(&sb, "Error: no plan draft to confirm (write it first)");
+			free(draft);
+			return sb.data;
+		}
+		store_plan_set(g_paths, draft);
+		store_plan_draft_clear(g_paths);
+		sb_append(&sb, "Plan confirmed and locked. It is now included in every request.");
+		free(draft);
+		return sb.data;
+	}
+
+	if (strcmp(name, "PlanClear") == 0) {
+		if (g_paths)
+			store_plan_clear(g_paths);
+		sb_append(&sb, "Plan cleared.");
+		return sb.data;
+	}
+
+	if (strcmp(name, "Skill") == 0) {
+		/* L2 知识级：按路径优先级搜索技能包，全文作为 tool_result 回喂。
+		 * 搜索序（先命中先用，通用 agent 目录，不绑定特定工具）：
+		 *   1. $CWD/skills/<name>/SKILL.md           项目级
+		 *   2. $HOME/.agents/skills/<name>/SKILL.md  用户级
+		 *   3. $BB_AGENT_HOME/skills/<name>/SKILL.md busyagent 自有 */
+		char *skill = json_get_string(jp.val, "name");
+		char *cwd = xrealloc_getcwd_or_warn(NULL);
+		const char *home = getenv("HOME");
+		const char *bag_home = getenv("BB_AGENT_HOME");
+		char *data = NULL, *found = NULL;
+		char *cands[3];
+		int i, n = 0;
+
+		if (!skill || !skill[0]) {
+			sb_append(&sb, "Error: Skill requires 'name'");
+			free(skill); free(cwd);
+			return sb.data;
+		}
+		if (cwd) cands[n++] = xasprintf("%s/skills/%s/SKILL.md", cwd, skill);
+		if (home && home[0]) cands[n++] = xasprintf("%s/.agents/skills/%s/SKILL.md", home, skill);
+		cands[n++] = xasprintf("%s/skills/%s/SKILL.md",
+				       (bag_home && bag_home[0]) ? bag_home : "/tmp/busyagent", skill);
+
+		for (i = 0; i < n && !data; i++) {
+			data = read_file_all(cands[i]);
+			if (data) found = cands[i];
+		}
+		if (data && data[0]) {
+			sb_appendf(&sb, "Skill: %s (from %s)\n\n", skill, found);
+			sb_append(&sb, data);
+		} else {
+			sb_appendf(&sb, "Error: skill '%s' not found "
+				     "(searched cwd/skills, ~/.agents/skills, $BB_AGENT_HOME/skills)", skill);
+		}
+		for (i = 0; i < n; i++) free(cands[i]);
+		free(data);
 		free(skill);
+		free(cwd);
 		return sb.data;
 	}
 

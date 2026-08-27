@@ -20,4 +20,4 @@ $BB busyagent -n "say ok" -u $API -k $KEY -m $MODEL -o json | head -5
 echo "rc=$?"
 
 echo "=== T7: events trace ==="
-head -4 /tmp/bbtools/.bash-agent/projects/-src/*/events.jsonl
+head -4 /tmp/bbtools/projects/-src/*/events.jsonl

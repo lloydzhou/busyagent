@@ -6,7 +6,7 @@
 /* 初始化工具表：$BB_AGENT_HOME/tools.json 不存在时用内嵌默认版生成，
  * 之后每次读取该文件；解析失败回退内嵌版（stderr 警告）。
  * 返回工具数量，0 表示不可用。 */
-int ba_tools_init(const char *home);
+int ba_tools_init(const char *home, const SessionPaths *paths);
 
 void ba_tools_free(void);
 
