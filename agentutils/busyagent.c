@@ -22,7 +22,6 @@
 //config:	tool calls with busybox applets, feed results back until the
 //config:	model finishes, then exit. Session history is stored under
 //config:	$BB_AGENT_HOME and restored automatically per working directory.
-//config:
 //applet:IF_BUSYAGENT(APPLET(busyagent, BB_DIR_USR_BIN, BB_SUID_DROP))
 //kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_impl.o
 
