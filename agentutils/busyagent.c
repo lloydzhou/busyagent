@@ -396,7 +396,7 @@ static int ba_replay_events(const SessionPaths *paths, const BaDisplay *disp,
 				util_truncate_str(content, 80);
 				{ char *nl = strchr(content, '\n');
 				  if (nl) *nl = '\0'; }
-				sb_appendf(&u, "\n\x1b[32m> %s\x1b[0m", content);
+				sb_appendf(&u, "\n\x1b[32m> %s\x1b[0m\n", content);
 				ba_display_push((BaDisplay *)disp, &(BaDisplayMsg){
 					.type = BA_DM_TEXT, .content = u.data});
 				sb_free(&u);
@@ -452,6 +452,40 @@ static int ba_replay_events(const SessionPaths *paths, const BaDisplay *disp,
 				.type = BA_DM_ERROR, .content = message});
 			free(message);
 			replayed = 1;
+		} else if (strcmp(type, "sub_agent_result") == 0) {
+			/* agent.c:638-658：thinking 截 120、text 截 200 */
+			char *sid2 = json_get_string(jp.val, "session_id");
+			char *status = json_get_string(jp.val, "status");
+			char *thinking = json_get_string(jp.val, "thinking");
+			char *text = json_get_string(jp.val, "text");
+			int in_tok = json_get_int(jp.val, "input_tokens");
+			int out_tok = json_get_int(jp.val, "output_tokens");
+
+			if (thinking)
+				thinking[util_utf8_truncate_len(thinking, 120)] = '\0';
+			if (text)
+				util_truncate_str(text, 200);
+			ba_display_push((BaDisplay *)disp, &(BaDisplayMsg){
+				.type = BA_DM_SUB_AGENT_RESULT,
+				.session_id = sid2,
+				.tool_exit_code = (status && strcmp(status, "ok") == 0) ? 0 : 1,
+				.tool_name = thinking,   /* bash-agent 复用该字段装 thinking */
+				.content = text,
+				.in_tokens = in_tok, .out_tokens = out_tok});
+			free(sid2); free(status); free(thinking); free(text);
+			replayed = 1;
+		} else if (strcmp(type, "async_task_result") == 0) {
+			char *tid = json_get_string(jp.val, "task_id");
+			int exit_code = json_get_int(jp.val, "exit_code");
+			char *output = json_get_string(jp.val, "output");
+
+			ba_display_push((BaDisplay *)disp, &(BaDisplayMsg){
+				.type = BA_DM_ASYNC_TASK_RESULT,
+				.session_id = tid,
+				.tool_exit_code = exit_code,
+				.content = output});
+			free(tid); free(output);
+			replayed = 1;
 		}
 		free(type);
 	}
@@ -475,10 +509,12 @@ static void ba_handle_async_result(const BaDisplay *disp,
 		store_event_append(paths, evt.data);
 		sb_free(&evt);
 	}
-	if (disp->format != BA_FMT_NONE) {   /* display: [bg-bash id] exit_code=N */
-		printf("\x1b[%sm[bg-bash %s] exit_code=%d\x1b[0m\n",
-		       exit_code == 0 ? "36" : "31", tid, exit_code);
-		fflush(stdout);
+	if (disp->format != BA_FMT_NONE) {   /* display: 统一 push */
+			ba_display_push((BaDisplay *)disp, &(BaDisplayMsg){
+				.type = BA_DM_ASYNC_TASK_RESULT,
+				.session_id = (char *)tid,
+				.tool_exit_code = exit_code,
+				.content = (char *)(output ? output : "")});
 	}
 	{   /* 会话注入 user 角色（agent.c:730-735）：驱动下一轮 model turn */
 		StrBuf u;

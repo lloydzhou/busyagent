@@ -195,6 +195,27 @@ char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
             sb_append_json_string(&buf, msg->content ? msg->content : "");
             sb_append_char(&buf, '}');
             break;
+        case BA_DM_SUB_AGENT_START:
+            sb_append(&buf, "{\"type\":\"sub_agent_start\",\"session_id\":");
+            sb_append_json_string(&buf, msg->session_id ? msg->session_id : "");
+            sb_append_char(&buf, '}');
+            break;
+        case BA_DM_SUB_AGENT_RESULT:
+            sb_append(&buf, "{\"type\":\"sub_agent_result\",\"session_id\":");
+            sb_append_json_string(&buf, msg->session_id ? msg->session_id : "");
+            sb_appendf(&buf, ",\"status\":\"%s\"",
+                       msg->tool_exit_code == 0 ? "ok" : "failed");
+            sb_appendf(&buf, ",\"input_tokens\":%d,\"output_tokens\":%d}",
+                       msg->in_tokens, msg->out_tokens);
+            break;
+        case BA_DM_ASYNC_TASK_RESULT:
+            sb_append(&buf, "{\"type\":\"async_task_result\",\"task_id\":");
+            sb_append_json_string(&buf, msg->session_id ? msg->session_id : "");
+            sb_appendf(&buf, ",\"exit_code\":%d,\"output\":",
+                       msg->tool_exit_code);
+            sb_append_json_string(&buf, msg->content ? msg->content : "");
+            sb_append_char(&buf, '}');
+            break;
         default:
             sb_free(&buf);
             return NULL;
@@ -268,6 +289,51 @@ char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
                 msg->tool_name ? msg->tool_name : "auto");
         ds->last_char[0] = '\n';
         break;
+
+    case BA_DM_SUB_AGENT_START:
+        break;   /* human 无输出（display.c:250 同款） */
+
+    case BA_DM_SUB_AGENT_RESULT: {
+        ensure_newline(ds);
+        if (msg->tool_exit_code == 0)
+            lw_printf("\x1b[35m[sub-agent %s] completed (in=%d, out=%d)\x1b[0m\n",
+                    msg->session_id ? msg->session_id : "?",
+                    msg->in_tokens, msg->out_tokens);
+        else
+            lw_printf("\x1b[31m[sub-agent %s] failed\x1b[0m\n",
+                    msg->session_id ? msg->session_id : "?");
+        if (msg->tool_name && msg->tool_name[0]) {
+            int tlen = (int)util_utf8_truncate_len(msg->tool_name, 120);
+            lw_printf("\x1b[90m%.*s%s\x1b[0m\n",
+                    tlen, msg->tool_name,
+                    strlen(msg->tool_name) > 120 ? "\xe2\x80\xa6" : "");
+        }
+        if (msg->content && msg->content[0]) {
+            int clen = (int)util_utf8_truncate_len(msg->content, 120);
+            lw_printf("%.*s%s\n",
+                    clen, msg->content,
+                    strlen(msg->content) > 120 ? "\xe2\x80\xa6" : "");
+        }
+        ds->last_char[0] = '\n';
+        ds->prev_was_thinking = 0;
+        break;
+    }
+
+    case BA_DM_ASYNC_TASK_RESULT: {
+        ensure_newline(ds);
+        lw_printf("\x1b[%sm[bg-bash %s] exit_code=%d\x1b[0m\n",
+                msg->tool_exit_code == 0 ? "36" : "31",
+                msg->session_id ? msg->session_id : "?", msg->tool_exit_code);
+        if (msg->content && msg->content[0]) {
+            int clen = (int)util_utf8_truncate_len(msg->content, 120);
+            lw_printf("%.*s%s\n",
+                    clen, msg->content,
+                    strlen(msg->content) > 120 ? "\xe2\x80\xa6" : "");
+        }
+        ds->last_char[0] = '\n';
+        ds->prev_was_thinking = 0;
+        break;
+    }
 
     default:
         break;
