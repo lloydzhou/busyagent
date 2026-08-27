@@ -6,9 +6,8 @@ model asks for with the surrounding busybox applets, feed the results back,
 and repeat until the model finishes.
 
 The whole thing is a normal busybox applet: enable `CONFIG_BUSYAGENT` and the
-same 1.3MB static busybox binary that provides your shell and coreutils also
-provides the agent. No libc dependency, no runtime files beyond the session
-store.
+same busybox binary that provides your shell and coreutils also provides the
+agent. No runtime files beyond the session store.
 
 ## Usage
 
@@ -50,24 +49,6 @@ The model may call any of the applets exposed in the bundled tool set
 - `SubAgent` — a child session (its own history, `sub_` prefix); `fork: true`
   copies the parent conversation first; nested SubAgent calls are rejected
 - read-only-root friendly: the session store is append-only jsonl
-
-## Configuration file
-
-Tool schemas are embedded at build time (`agentutils/ba_builtin_schemas.h`);
-there is no per-install configuration file. Everything is flags and
-environment variables listed above.
-
-## Docker
-
-The repo ships a two-stage `Dockerfile`: alpine builds a fully static
-busybox (full CJK codepoint tables so the REPL takes Chinese input), and the
-final image is `FROM scratch` containing only the rootfs with all 409+ applet
-links. Sessions live on the declared volume `/root/.busyagent`.
-
-```
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t lloydzhou/busyagent:latest --push .
-```
 
 ## Known limitations
 
