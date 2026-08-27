@@ -41,7 +41,7 @@ except Exception:
     pass
 
 sys.stderr.write("=== RAW ECHO BYTES ===\n")
-idx = buf.find(b"busyagent> ")
+idx = buf.find(b"\x1b[32m> ")
 seg = buf[idx:] if idx >= 0 else buf
 for label, chunk in (("input+echo region", seg[:200]),):
     sys.stderr.write(label + ": ")

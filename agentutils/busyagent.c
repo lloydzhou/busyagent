@@ -1136,6 +1136,34 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			 * 多行粘贴、剪贴板图片注入延后（linenoise 特性） */
 			char line[8192];
 			BaRunCtx repl;
+			/* 行编辑 state：运行期上下键历史；持久化自管
+			 * （hist_file 置空关闭 lineedit 的内建读写，
+			 * 避免与手写 append 双写交错）：history 文件
+			 * 每行一条、启动回灌 —— 角色对齐 bash-agent 的
+			 * $HOME/.bash-agent/history（HistoryLoad/Save） */
+			line_input_t *li;
+			char *hist_path;
+
+			hist_path = xasprintf("%s/history", home);
+			mkdir(home, 0755);
+			li = new_line_input_t(DO_HISTORY);
+			{
+				FILE *hf0 = fopen(hist_path, "r");
+				if (hf0) {
+					char hbuf[8192];
+					while (li->cnt_history < li->max_history
+					    && fgets(hbuf, sizeof(hbuf), hf0)) {
+						size_t hl = strlen(hbuf);
+						if (hl && hbuf[hl-1] == '\n')
+							hbuf[--hl] = '\0';
+						if (hl)
+							li->history[li->cnt_history++] =
+								xstrdup(hbuf);
+					}
+					fclose(hf0);
+					li->cur_history = li->cnt_history;
+				}
+			}
 
 			fprintf(stderr, "busyagent ready (interactive). "
 					"Type 'quit' or Ctrl-D to exit.\n");
@@ -1167,7 +1195,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			           ? BA_FMT_STREAM_JSON : BA_FMT_HUMAN;
 
 			while (1) {
-				int rl = read_line_input(NULL, "busyagent> ",
+				int rl = read_line_input(li, "\x1b[32m> \x1b[0m",
 							 line, sizeof(line));
 				if (rl <= 0)
 					break;   /* EOF / Ctrl-D */
@@ -1176,6 +1204,18 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 					continue;
 				if (!strcmp(line, "quit") || !strcmp(line, "exit"))
 					break;
+				{   /* 行级持久化（bash-agent 每行 HistoryAdd+Save
+				     * 同款语义）；quit/空行不入历史 */
+					int hf = open(hist_path,
+						O_WRONLY | O_CREAT | O_APPEND,
+						0600);
+					if (hf >= 0) {
+						full_write(hf, line,
+							   strlen(line));
+						full_write(hf, "\n", 1);
+						close(hf);
+					}
+				}
 				/* 已完成的后台任务先收割展示（交互模式不阻塞：
 				 * bash-agent input-loop 注释同款语义）。
 				 * 首次输入前 repl.paths 未建，run_session
@@ -1192,6 +1232,8 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			if (repl.paths.session_dir)
 				ba_drain_background(&repl, &repl.paths,
 						    repl.fmt, 1);
+			free_line_input_t(li);
+			free(hist_path);
 			free(api_url);
 			free(session_id);
 			free(cwd);

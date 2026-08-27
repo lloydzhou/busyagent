@@ -48,19 +48,19 @@ def send(line):
     os.write(master, (line + "\n").encode())
 
 try:
-    ok_prompt = read_until([r"busyagent> "])
+    ok_prompt = read_until([r"\x1b\[32m> \x1b\[0m"])
     print("prompt shown:", ok_prompt)
 
     send("remember the token pty-mango-77. just acknowledge briefly.")
     ok_ack = read_until([r"pty-mango-77|acknowledg"], 45)
     # wait for next prompt: proves turn loop returned to input
-    ok_prompt2 = read_until([r"busyagent> "], 20)
+    ok_prompt2 = read_until([r"\x1b\[32m> \x1b\[0m"], 20)
     print("turn1 ack seen:", ok_ack, "| second prompt:", ok_prompt2)
 
     send("what token did I tell you? answer with the token only.")
     ok_recall = read_until([r"pty-mango-77"], 45)
     print("memory across turns:", ok_recall)
-    ok_prompt3 = read_until([r"busyagent> "], 20)
+    ok_prompt3 = read_until([r"\x1b\[32m> \x1b\[0m"], 20)
 
     send("quit")
     for _ in range(30):          # up to ~9s graceful exit
