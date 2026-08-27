@@ -15,6 +15,7 @@
 //config:	bool "busyagent"
 //config:	default y
 //config:	select FEATURE_PREFER_APPLETS
+//config:	select FEATURE_EDITING
 //config:	help
 //config:	Run exactly one user turn of an LLM agent loop: build a chat
 //config:	request, stream the reply over plain HTTP (SSE), execute any
@@ -240,6 +241,72 @@ static int ba_trim_history(const char *conv_path)
 int busyagent_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 /* ---- 会话运行上下文（等价 bash-agent 的 Agent 结构体传参方式；
  * 进程内 SubAgent 与 main 共用同一入口，无全局态、无私有 env 协议） ---- */
+/* ---- background bash：派生/收割注册表
+ * 语义对齐 async_bash_thread_fn：mkstemp 接输出，完成后
+ * 主动注入 exit_code + output（不需要模型回读） ---- */
+typedef struct {
+	char task_id[80];
+	pid_t pid;
+	char tmpfile[40];
+	int active;
+} BaBgTask;
+
+#define BA_BG_MAX 16
+static BaBgTask g_bg[BA_BG_MAX];
+
+static char *ba_spawn_background(const char *cmd)
+{
+	int i;
+	for (i = 0; i < BA_BG_MAX; i++)
+		if (!g_bg[i].active)
+			break;
+	if (i == BA_BG_MAX)
+		return xstrdup("Error: too many active background tasks");
+
+	{
+		BaBgTask *t = &g_bg[i];
+		int tmpfd;
+		pid_t pid;
+
+		snprintf(t->tmpfile, sizeof(t->tmpfile), "/tmp/ba_async_bash_XXXXXX");
+		tmpfd = mkstemp(t->tmpfile);
+		if (tmpfd < 0)
+			return xstrdup("Error: failed to create temp file for background command");
+		{
+			char *nid = session_new_id();
+			snprintf(t->task_id, sizeof(t->task_id), "task_%s", nid);
+			free(nid);
+		}
+		pid = fork();
+		if (pid < 0) {
+			close(tmpfd);
+			unlink(t->tmpfile);
+			t->active = 0;
+			return xstrdup("Error: failed to start background task");
+		}
+		if (pid == 0) {
+			setpgid(0, 0);
+			close(STDIN_FILENO);
+			xopen("/dev/null", O_RDONLY);
+			xmove_fd(tmpfd, STDOUT_FILENO);
+			xmove_fd(dup(STDOUT_FILENO), STDERR_FILENO);
+			execl(bb_busybox_exec_path, "sh", "-c", cmd, (char *)NULL);
+			_exit(127);
+		}
+		setpgid(pid, pid);
+		close(tmpfd);           /* 父侧不 waitpid：完成由收割器拉取 */
+		pid = t->pid = pid;
+		t->active = 1;
+	}
+
+	{
+		StrBuf r;
+		sb_init(&r);
+		sb_appendf(&r, "Async task started: task_id=%s", g_bg[i].task_id);
+		return r.data;
+	}
+}
+
 typedef struct {
 	const char *home, *cwd;
 	char *prompt;
@@ -253,6 +320,93 @@ typedef struct {
 } BaRunCtx;
 
 static int ba_run_session(BaRunCtx *ctx);
+
+static void ba_handle_async_result(const BaDisplay *disp,
+                                   SessionPaths *paths, const char *tid,
+                                   int exit_code, const char *output)
+{
+	{   /* trace 事件（字段同 bash-agent agent.c:716-721） */
+		StrBuf evt;
+		sb_init(&evt);
+		sb_appendf(&evt, "{\"type\":\"async_task_result\",\"task_id\":\"%s\",\"exit_code\":%d,\"output\":",
+				   tid, exit_code);
+		sb_append_json_string(&evt, output ? output : "");
+		sb_append_char(&evt, '}');
+		store_event_append(paths, evt.data);
+		sb_free(&evt);
+	}
+	if (disp->format != BA_FMT_NONE) {   /* display: [bg-bash id] exit_code=N */
+		printf("\x1b[%sm[bg-bash %s] exit_code=%d\x1b[0m\n",
+		       exit_code == 0 ? "36" : "31", tid, exit_code);
+		fflush(stdout);
+	}
+	{   /* 会话注入 user 角色（agent.c:730-735）：驱动下一轮 model turn */
+		StrBuf u;
+		sb_init(&u);
+		sb_appendf(&u, "[bg-bash %s] exit_code=%d\nOutput: %s",
+			   tid, exit_code, output ? output : "");
+		store_conv_add_user(paths->conversation, u.data);
+		sb_free(&u);
+	}
+}
+
+/* drain 已完成任务：block=1 时阻塞等待（bash-agent
+ * 非交互 drain 循环 agent.c:1513 同款语义） */
+static void ba_drain_background(BaRunCtx *ctx, SessionPaths *paths,
+                                BaDisplayFormat fmt, int block)
+{
+	(void)ctx;
+	for (;;) {
+		int reaped = 0;
+		int i;
+		for (i = 0; i < 16; i++) {
+			if (!g_bg[i].active)
+				continue;
+			{
+				int st = 0;
+				pid_t r = waitpid(g_bg[i].pid, &st, block ? 0 : WNOHANG);
+				if (r == g_bg[i].pid) {
+					int code = WIFEXITED(st) ? WEXITSTATUS(st)
+					         : (WIFSIGNALED(st) ? 128 + WTERMSIG(st) : 1);
+					char *out = NULL;
+					FILE *f2 = fopen(g_bg[i].tmpfile, "r");
+					long fsz;
+					BaDisplay dtmp;
+					if (f2) {
+						fseek(f2, 0, SEEK_END);
+						fsz = ftell(f2);
+						fseek(f2, 0, SEEK_SET);
+						out = xmalloc(fsz + 1);
+						out[fread(out, 1, fsz, f2)] = '\0';
+						fclose(f2);
+					}
+					remove(g_bg[i].tmpfile);
+					memset(&dtmp, 0, sizeof(dtmp));
+					dtmp.format = fmt;
+					dtmp.out = stdout;
+					ba_handle_async_result(&dtmp, paths,
+								       g_bg[i].task_id, code, out);
+					free(out);
+					g_bg[i].active = 0;
+					reaped = 1;
+				}
+			}
+		}
+		if (!reaped)
+			break;
+		block = 0;   /* 剩下的只收已就绪的 */
+	}
+}
+
+static int ba_bg_active_count(void)
+{
+	int i, n = 0;
+	for (i = 0; i < 16; i++)
+		if (g_bg[i].active)
+			n++;
+	return n;
+}
+
 /* 裁掉 conversation 尾部未应答的 tool_use assistant
  * （fork 复制发生在 tool_result 落库前；openai 对悬空 tool_calls 400） */
 static void ba_trim_trailing_tool_use(const char *conv_path)
@@ -476,6 +630,10 @@ static int ba_run_session(BaRunCtx *ctx)
 			int hdr_count = 0, sse_rc;
 			SseAccumulator *accum;
 
+			/* 循环顶收割：上一轮期间完成的后台任务先注入
+			 * 再构造请求（对齐 bash-agent 的队列回注时点） */
+			ba_drain_background(ctx, &paths, ctx->fmt, 0);
+
 			ba_trim_history(paths.conversation);
 
 			if (store_conv_line_count(paths.conversation, &lines, &line_count) != 0)
@@ -582,7 +740,27 @@ static int ba_run_session(BaRunCtx *ctx)
 				contents = xzalloc(accum->tool_count * sizeof(char *));
 				for (i = 0; i < accum->tool_count; i++) {
 					char *out;
-					if (strcmp(accum->tools[i].name, "SubAgent") == 0) {
+					int handled = 0;
+
+					if (strcmp(accum->tools[i].name, "Bash") == 0) {
+						/* bash-agent agent.c:1075 同款：Bash
+						 * background=true 在 loop 层截获 */
+						JsonParse bjp = json_parse_root(
+							accum->tools[i].input_json.data);
+						char *cmd = NULL;
+						int is_async = 0;
+						if (!bjp.error) {
+							is_async = json_get_bool(bjp.val, "background", false);
+							cmd = json_get_string(bjp.val, "command");
+						}
+						if (is_async) {
+							out = (cmd && cmd[0])
+							      ? ba_spawn_background(cmd)
+							      : xstrdup("Error: no command provided");
+							handled = 1;
+						}
+						free(cmd);
+					} else if (strcmp(accum->tools[i].name, "SubAgent") == 0) {
 						/* bash-agent agent.c:1050 同款：loop 层拦截 SubAgent */
 						JsonParse sjp = json_parse_root(
 							accum->tools[i].input_json.data);
@@ -597,11 +775,14 @@ static int ba_run_session(BaRunCtx *ctx)
 									 sprompt ? sprompt : "",
 									 sdesc ? sdesc : "", sfork);
 						free(sprompt); free(sdesc);
-					} else {
+						handled = 1;
+					}
+
+					if (!handled)
 						out = ba_tool_execute(accum->tools[i].name,
 								      accum->tools[i].input_json.data,
 								      120000);
-					}
+
 					{
 						BaDisplayMsg dm;
 						memset(&dm, 0, sizeof(dm));
@@ -634,6 +815,14 @@ static int ba_run_session(BaRunCtx *ctx)
 			if (tctx.disp.format == BA_FMT_HUMAN)
 				fwrite("\n", 1, 1, stdout);
 			sse_accum_free(accum);
+
+			/* end_turn 但仍有后台任务：阻塞收割并以注入结果
+			 * 继续新轮（bash-agent 非交互 drain → run_loop 同款） */
+			if (ba_bg_active_count() > 0 && turn < max_turns - 1) {
+				ba_drain_background(ctx, &paths, ctx->fmt, 1);
+				sse_accum_init(&tctx.accum);
+				continue;   /* 注入的 [bg-bash] user 消息驱动新回合 */
+			}
 			break;
 		}
 	}
@@ -713,6 +902,62 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 
 	argv += optind;
 	if (!argv[0]) {
+		if (isatty(STDIN_FILENO)) {
+			/* ---- 交互式 REPL（bash-agent cagent 交互模式对齐）----
+			 * 行编辑用 busybox lineedit（read_line_input），
+			 * 能力等价 linenoise：历史/光标/常用快捷键；
+			 * 多行粘贴、剪贴板图片注入延后（linenoise 特性） */
+			char line[8192];
+			BaRunCtx repl;
+
+			fprintf(stderr, "busyagent ready (interactive). "
+					"Type 'quit' or Ctrl-D to exit.\n");
+			memset(&repl, 0, sizeof(repl));
+			repl.home = home;
+			repl.cwd = cwd;
+			repl.session_id = session_id;
+			repl.depth = 0;
+			repl.verbose = verbose;
+			repl.max_turns = max_turns;
+			repl.model = model;
+			repl.provider = provider;
+			repl.api_url = api_url;
+			repl.api_key = api_key;
+			repl.fmt = (strcmp(output_fmt, "json") == 0)
+			           ? BA_FMT_STREAM_JSON : BA_FMT_HUMAN;
+
+			while (1) {
+				int rl = read_line_input(NULL, "busyagent> ",
+							 line, sizeof(line));
+				if (rl <= 0)
+					break;   /* EOF / Ctrl-D */
+				trim(line);
+				if (!line[0])
+					continue;
+				if (!strcmp(line, "quit") || !strcmp(line, "exit"))
+					break;
+				/* 已完成的后台任务先收割展示（交互模式不阻塞：
+				 * bash-agent input-loop 注释同款语义）。
+				 * 首次输入前 repl.paths 未建，run_session
+				 * 循环顶收割点负责首轮；此后每次进入前
+				 * 先展示期间完成项 */
+				if (repl.paths.session_dir)
+					ba_drain_background(&repl, &repl.paths,
+							    repl.fmt, 0);
+				repl.prompt = xstrdup(line);
+				rc = ba_run_session(&repl);
+				free(repl.prompt);
+				session_id = repl.session_id; /* run 后 sid 稳定 */
+			}
+			if (repl.paths.session_dir)
+				ba_drain_background(&repl, &repl.paths,
+						    repl.fmt, 1);
+			free(api_url);
+			free(session_id);
+			free(cwd);
+			free(home);
+			return rc;
+		}
 		/* read prompt from stdin */
 		size_t cap = 4096, len = 0;
 		prompt = xmalloc(cap);
