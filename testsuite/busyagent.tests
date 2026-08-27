@@ -1,0 +1,57 @@
+#!/bin/sh
+# Copyright 2026 by Lloyd Zhou <lloydzhou@qq.com>
+# Licensed under GPLv2, see file LICENSE in this source tree.
+
+. ./testing.sh
+
+# testing "test name" "command(s)" "expected result" "file input" "stdin"
+
+# All cases are offline: error paths, argument handling and the session
+# store layout. Anything needing a live LLM endpoint stays out of the
+# testsuite (see docs/busyagent.md for the applet contract).
+
+# --- no endpoint configured ---------------------------------------------
+testing "busyagent without base URL fails cleanly" \
+       "busyagent hi 2>&1; echo rc=\$?" \
+       "busyagent: no base URL: use -u URL or \$BB_AGENT_BASE_URL\nrc=1\n" \
+       "" ""
+
+# --- usage ---------------------------------------------------------------
+testing "busyagent --help prints usage" \
+       "busyagent --help 2>&1 | grep -m1 '^Usage: busyagent'" \
+       "Usage: busyagent [OPTIONS] [PROMPT]\n" \
+       "" ""
+
+# --- starter tools.json (-i) --------------------------------------------
+rm -rf ba.testhome
+testing "busyagent -i writes a starter tools.json" \
+       "BB_AGENT_HOME=\$PWD/ba.testhome busyagent -i 2>&1 | sed 's|^wrote .*/|wrote |' && grep -c '\"name\"' \$PWD/ba.testhome/tools.json" \
+       "wrote tools.json\n5\n" \
+       "" ""
+
+# --- unusable URL scheme ---------------------------------------------------
+# ftp:// is rejected by the URL parser before any socket is touched.
+testing "busyagent rejects non-http scheme" \
+       "busyagent hi -u ftp://127.0.0.1:9/x -k k -m m 2>&1 | grep -o 'HTTP request failed'" \
+       "HTTP request failed\n" \
+       "" ""
+
+# --- https reaches the connect stage (TLS compiled in) --------------------
+# Port 1 on loopback: refused immediately by xconnect_stream, no retries.
+testing "busyagent https connect failure is reported" \
+       "busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -o \"can't connect to remote host (127.0.0.1)\"" \
+       "can't connect to remote host (127.0.0.1)\n" \
+       "" ""
+
+# --- session store layout ---------------------------------------------------
+# A failed first turn still creates the cwd-bound session directory; the
+# jsonl files appear once a turn actually appends events.
+rm -rf ba.testhome2
+testing "busyagent creates the cwd-bound session directory" \
+       "BB_AGENT_HOME=\$PWD/ba.testhome2 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1; ls -d ba.testhome2/projects/*/ >/dev/null && echo session-dir-ok" \
+       "session-dir-ok\n" \
+       "" ""
+
+rm -rf ba.testhome ba.testhome2
+
+exit $FAILCOUNT
