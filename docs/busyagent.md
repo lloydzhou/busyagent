@@ -1,9 +1,11 @@
 # busyagent — an LLM agent applet for busybox
 
-`busyagent` runs exactly one user turn of an LLM agent loop: build the chat
-request, stream the reply over plain HTTP (SSE), execute the tool calls the
-model asks for with the surrounding busybox applets, feed the results back,
-and repeat until the model finishes.
+`busyagent` runs an LLM agent loop against the surrounding busybox applets:
+it streams the reply over plain HTTP (SSE), executes the tool calls the model
+asks for, feeds the results back, and repeats until the model finishes. Each
+invocation resumes the session bound to the current working directory, so
+conversations continue across runs; without a PROMPT argument (or with a tty
+on stdin) it offers an interactive REPL instead.
 
 The whole thing is a normal busybox applet: enable `CONFIG_BUSYAGENT` and the
 same busybox binary that provides your shell and coreutils also provides the
