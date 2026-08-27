@@ -141,6 +141,9 @@ char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
 {
     StrBuf buf;
 
+    if (ds->format == BA_FMT_NONE)
+        return NULL;
+
     if (ds->format == BA_FMT_STREAM_JSON) {
         sb_init(&buf);
         switch (msg->type) {

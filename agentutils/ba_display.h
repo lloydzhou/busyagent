@@ -33,6 +33,7 @@ typedef enum {
 typedef enum {
     BA_FMT_HUMAN,
     BA_FMT_STREAM_JSON,
+    BA_FMT_NONE,     /* SubAgent 子回合：只写 events.jsonl，不打 stdout */
 } BaDisplayFormat;
 
 /* 对齐 bash-agent DisplayMessage 字段子集 */

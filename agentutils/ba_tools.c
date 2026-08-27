@@ -107,6 +107,11 @@ static int ba_tools_parse(const char *json)
 /* Load tools from $BB_AGENT_HOME/tools.json. The file is the only
  * source: nothing is embedded in the binary. Missing or broken file
  * means "no tools" — plain Q&A still works, requests just omit tools. */
+void ba_tools_set_paths(const SessionPaths *paths)
+{
+	g_paths = paths;
+}
+
 int ba_tools_init(const char *home, const SessionPaths *paths)
 {
 	char *path = NULL;
@@ -839,58 +844,8 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 	}
 
 	if (strcmp(name, "SubAgent") == 0) {
-		/* L3 委托级：自举 —— fork+exec busyagent 自己，配置经环境变量下传。
-		 * 对齐 bash-agent agent_handle_sub_agent 语义：
-		 *   - 子会话 = sub_ 前缀独立目录（-s sub_<id>，区别于主会话）
-		 *   - fork=true 继承父 history/plan（BB_AGENT_FORK_FROM ->
-		 *     store_session_fork，bash-agent 同款复制语义）
-		 *   - 嵌套拒绝：BB_AGENT_DEPTH>=1 时拒绝再次 SubAgent
-		 *   - bash-agent 以 async 队列回注结果（display 线程架构）；单 turn
-		 *     无该通道，本实现同步阻塞收集后作为 tool_result 返回 */
-		char *prompt = json_get_string(jp.val, "prompt");
-		int want_fork = json_get_bool(jp.val, "fork", false);
-		const char *depth_s = getenv("BB_AGENT_DEPTH");
-		char *sub_sid, *sub_argv[6];
-		int sub_argc = 0;
-		int st;
-		if (!prompt || !prompt[0]) {
-			sb_append(&sb, "Error: SubAgent requires 'prompt'");
-			free(prompt);
-			return sb.data;
-		}
-		if (depth_s && atoi(depth_s) >= 1) {
-			sb_append(&sb, "Error: SubAgent nesting is not allowed "
-			               "(a SubAgent cannot launch another SubAgent)");
-			free(prompt);
-			return sb.data;
-		}
-
-		setenv("BB_AGENT_OUTPUT", "text", 1);   /* 子进程输出须为纯文本 */
-		setenv("BB_AGENT_DEPTH", "1", 1);       /* 嵌套拒绝标记 */
-
-		sub_argv[sub_argc++] = (char *)"busyagent";
-		sub_argv[sub_argc++] = (char *)"-s";    /* 子会话固定 sub_ 前缀 id */
-		{
-			char *nid = session_new_id();
-			sub_sid = xasprintf("sub_%s", nid);
-			free(nid);
-			sub_argv[sub_argc++] = sub_sid;
-		}
-		if (want_fork)
-			setenv("BB_AGENT_FORK_FROM",
-			       g_paths && g_paths->session_dir ? g_paths->session_dir : "", 1);
-		else
-			unsetenv("BB_AGENT_FORK_FROM");
-		sub_argv[sub_argc++] = prompt;
-		sub_argv[sub_argc] = NULL;
-
-		st = run_captured("busyagent", sub_argv, &out, &err,
-				  timeout_ms ? timeout_ms : 600000);
-		result_wrap(&sb, st, &out, &err);
-		free(sub_sid);
-		free(prompt);
-		free(out.data);
-		free(err.data);
+		/* 占位：由 turn 循环层截获处理（bash-agent tools.c 同款） */
+		sb_append(&sb, "SubAgent handled by agent layer");
 		return sb.data;
 	}
 

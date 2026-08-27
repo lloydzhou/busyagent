@@ -238,6 +238,414 @@ static int ba_trim_history(const char *conv_path)
 }
 
 int busyagent_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+/* ---- 会话运行上下文（等价 bash-agent 的 Agent 结构体传参方式；
+ * 进程内 SubAgent 与 main 共用同一入口，无全局态、无私有 env 协议） ---- */
+typedef struct {
+	const char *home, *cwd;
+	char *prompt;
+	char *session_id;
+	int depth;              /* bash-agent: sub_agent_depth */
+	int verbose;
+	int max_turns;
+	const char *model, *provider, *api_url, *api_key;
+	BaDisplayFormat fmt;
+	SessionPaths paths;
+} BaRunCtx;
+
+static int ba_run_session(BaRunCtx *ctx);
+/* 裁掉 conversation 尾部未应答的 tool_use assistant
+ * （fork 复制发生在 tool_result 落库前；openai 对悬空 tool_calls 400） */
+static void ba_trim_trailing_tool_use(const char *conv_path)
+{
+	char **lines = NULL;
+	int n = 0, i, cut = 0;
+
+	if (store_conv_line_count(conv_path, &lines, &n) != 0)
+		return;
+	for (i = n - 1; i >= 0; i--) {
+		JsonParse jp = json_parse_root(lines[i]);
+		char *role = jp.error ? NULL : json_get_string(jp.val, "role");
+		int is_assistant = (role && strcmp(role, "assistant") == 0);
+		free(role);
+		if (!is_assistant)
+			break;
+		{
+			JsonVal content = json_get(jp.val, "content");
+			int has_tu = 0;
+			if (content.type == JSON_ARRAY) {
+				int j, jl = json_array_len(content);
+				for (j = 0; j < jl && !has_tu; j++) {
+					JsonVal blk = json_array_get(content, j);
+					char *t = json_get_string(blk, "type");
+					has_tu = (t && strcmp(t, "tool_use") == 0);
+					free(t);
+				}
+			}
+			if (!has_tu)
+				break;          /* 尾部 assistant 无 tool_use：干净 */
+			cut = 1;            /* 悬空 tool_use：删掉这一行 */
+			break;
+		}
+	}
+	if (cut > 0 && n >= cut) {
+		/* 重写文件去掉最后 cut 行（trim_tail 语义是保留尾 N 行，方向相反） */
+		FILE *f = fopen(conv_path, "w");
+		if (f) {
+			for (i = 0; i < n - cut; i++)
+				fprintf(f, "%s\n", lines[i]);
+			fclose(f);
+		}
+	}
+	for (i = 0; i < n; i++)
+		free(lines[i]);
+	free(lines);
+}
+
+static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
+                                 const char *description, int fork_mode)
+{
+	char *raw_id, *sub_session_id;
+	BaRunCtx sub;
+	int rc;
+
+	if (!prompt || !prompt[0])
+		return xstrdup("Error: no prompt provided");
+	if (parent->depth >= 1)
+		return xstrdup("Error: sub-agent recursion limit reached; child agents cannot launch SubAgent");
+
+	raw_id = session_new_id();
+	sub_session_id = xasprintf("sub_%s", raw_id);
+	free(raw_id);
+
+	/* 记录 sub_agent_start 事件（字段照抄 bash-agent） */
+	{
+		StrBuf evt;
+		sb_init(&evt);
+		sb_appendf(&evt, "{\"type\":\"sub_agent_start\",\"session_id\":");
+		sb_append_json_string(&evt, sub_session_id);
+		sb_appendf(&evt, ",\"prompt\":");
+		sb_append_json_string(&evt, prompt);
+		sb_appendf(&evt, ",\"description\":");
+		sb_append_json_string(&evt, description ? description : "");
+		sb_appendf(&evt, ",\"fork\":%s}", fork_mode ? "true" : "false");
+		store_event_append(&parent->paths, evt.data);
+		sb_free(&evt);
+	}
+
+	memset(&sub, 0, sizeof(sub));
+	sub.home = parent->home;
+	sub.cwd = parent->cwd;
+	sub.prompt = (char *)prompt;
+	sub.session_id = sub_session_id;
+	sub.depth = parent->depth + 1;
+	sub.verbose = parent->verbose;         /* diag: temp inherit; bash-agent forces 0 */
+	sub.max_turns = parent->max_turns;
+	sub.model = parent->model;
+	sub.provider = parent->provider;
+	sub.api_url = parent->api_url;
+	sub.api_key = parent->api_key;
+	sub.fmt = BA_FMT_NONE;                 /* 无队列架构下的静默等价 */
+
+	/* fork=true：发起侧立即复制父会话（agent.c:1812 同款）。
+	 * 复制发生在父的 tool_result 落库前，尾部可能挂着未应答的
+	 * tool_use assistant；openai 上游对此 400，须裁到完整交换为止 */
+	if (fork_mode) {
+		SessionPaths sub_paths = store_session_paths_for(parent->home,
+		                                                 parent->cwd,
+		                                                 sub_session_id);
+		store_session_init_sub(&parent->paths, &sub_paths, 1);
+		ba_trim_trailing_tool_use(sub_paths.conversation);
+		store_session_paths_free(&sub_paths);
+	}
+
+	rc = ba_run_session(&sub);
+
+	/* 提取最后一条 assistant 消息的 text（agent.c:1693 同款倒序扫描） */
+	{
+		char **lines = NULL;
+		int line_count = 0, li;
+		char *result_text = NULL;
+
+		store_conv_line_count(sub.paths.conversation, &lines, &line_count);
+		for (li = line_count - 1; li >= 0 && !result_text; li--) {
+			JsonParse jp = json_parse_root(lines[li]);
+			if (jp.error)
+				continue;
+			{
+				char *role = json_get_string(jp.val, "role");
+				if (role && strcmp(role, "assistant") == 0) {
+					JsonVal content = json_get(jp.val, "content");
+					if (content.type == JSON_ARRAY) {
+						int clen = json_array_len(content), j;
+						for (j = clen - 1; j >= 0 && !result_text; j--) {
+							JsonVal block = json_array_get(content, j);
+							char *btype = json_get_string(block, "type");
+							if (btype && strcmp(btype, "text") == 0)
+								result_text = json_get_string(block, "text");
+							free(btype);
+						}
+					}
+				}
+				free(role);
+			}
+		}
+		for (li = 0; li < line_count; li++)
+			free(lines[li]);
+		free(lines);
+
+		/* sub_agent_result 事件（供 replay/stream-json 复现） */
+		{
+			StrBuf evt;
+			sb_init(&evt);
+			sb_appendf(&evt, "{\"type\":\"sub_agent_result\",\"session_id\":");
+			sb_append_json_string(&evt, sub_session_id);
+			sb_appendf(&evt, ",\"status\":\"%s\"", rc == 0 ? "ok" : "failed");
+			sb_append(&evt, ",\"thinking\":\"\"");
+			sb_append(&evt, ",\"text\":");
+			sb_append_json_string(&evt, result_text ? result_text : "");
+			sb_append_char(&evt, '}');
+			store_event_append(&parent->paths, evt.data);
+			sb_free(&evt);
+		}
+		return result_text ? result_text
+		                   : xstrdup(rc == 0 ? "(no text)"
+		                                     : "Error: sub-agent failed");
+	}
+}
+
+/* ---- 会话运行体：等价 bash-agent 的 agent_loop(Agent*, prompt, role) ---- */
+static int ba_run_session(BaRunCtx *ctx)
+{
+	SessionPaths paths;
+	const char *model = ctx->model;
+	const char *provider = ctx->provider;
+	const char *api_url = ctx->api_url;
+	const char *api_key = ctx->api_key;
+	const char *prompt = ctx->prompt;
+	int verbose = ctx->verbose;
+	int max_turns = ctx->max_turns > 0 ? ctx->max_turns : BA_DEFAULT_TURNS;
+	int rc = 0;
+	char *tools_json = NULL;
+	char *sys_full = NULL;
+
+	{
+		int is_new;
+		paths = store_session_paths_for(ctx->home, ctx->cwd, ctx->session_id);
+		is_new = (access(paths.session_dir, F_OK) != 0);
+		if (store_session_init(&paths, is_new) != 0)
+			bb_error_msg_and_die("session init failed: %s", paths.session_dir);
+		ctx->paths = paths;
+		if (verbose)
+			fprintf(stderr, "[verbose] session=%s (%s) home=%s\n",
+				ctx->session_id, is_new ? "new" : "resumed", ctx->home);
+	}
+
+	ba_tools_set_paths(&paths);
+
+	/* record user turn */
+	{
+		StrBuf evt;
+		sb_init(&evt);
+		sb_append(&evt, "{\"type\":\"user_input\",\"content\":");
+		sb_append_json_string(&evt, prompt);
+		sb_append_char(&evt, '}');
+		store_event_append(&paths, evt.data);
+		sb_free(&evt);
+	}
+	if (store_conv_add_user(paths.conversation, prompt) != 0)
+		bb_error_msg_and_die("conversation append failed");
+
+	/* system prompt：对齐 bash-agent 的分块结构（ba_prompt.c） */
+	{
+		BaPromptCtx pctx;
+		int turn;
+		memset(&pctx, 0, sizeof(pctx));
+		pctx.cwd = ctx->cwd;
+		pctx.home = ctx->home;
+		pctx.plan = paths.plan;
+		pctx.plan_draft = paths.plan_draft;
+		sys_full = ba_build_prompt(&pctx);
+		tools_json = ba_tools_json();   /* constant across turns */
+		for (turn = 0; turn < max_turns; turn++) {
+			TurnCtx tctx;
+			char **lines = NULL;
+			int line_count = 0;
+			char *claude_body, *body;
+			const char *headers[8];
+			char auth_header[512];
+			int hdr_count = 0, sse_rc;
+			SseAccumulator *accum;
+
+			ba_trim_history(paths.conversation);
+
+			if (store_conv_line_count(paths.conversation, &lines, &line_count) != 0)
+				bb_error_msg_and_die("conversation read failed");
+
+			claude_body = build_claude_request(model, sys_full, tools_json,
+							   lines, line_count,
+							   BA_MAX_TOKENS, NULL, NULL);
+			body = claude_body;
+			if (strcmp(provider, "openai") == 0) {
+				body = convert_to_openai(claude_body);
+				free(claude_body);
+			} else if (strcmp(provider, "responses") == 0) {
+				body = convert_to_responses(claude_body);
+				free(claude_body);
+			}
+
+			if (verbose && body)
+				fprintf(stderr, "[verbose] request body (%zu bytes): %.200s%s\n",
+					strlen(body), body, strlen(body) > 200 ? "..." : "");
+
+			headers[hdr_count++] = "Content-Type: application/json";
+			headers[hdr_count++] = "User-Agent: busyagent/0.1";
+			if (strcmp(provider, "claude") == 0) {
+				headers[hdr_count++] = "x-app: cli";
+				snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", api_key);
+				headers[hdr_count++] = auth_header;
+				headers[hdr_count++] = "anthropic-version: 2023-06-01";
+			} else {
+				snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
+				headers[hdr_count++] = auth_header;
+			}
+
+			memset(&tctx, 0, sizeof(tctx));
+			tctx.paths = &paths;
+			tctx.verbose = verbose;
+			ba_disp_init(&tctx.disp, ctx->fmt);
+			sse_accum_init(&tctx.accum);
+			accum = &tctx.accum;
+
+			sse_rc = http_post_sse(api_url, headers, hdr_count,
+					       body, strlen(body), provider,
+					       ba_sse_callback, &tctx, NULL);
+			free(body);
+			{
+				int i;
+				for (i = 0; i < line_count; i++) free(lines[i]);
+				free(lines);
+			}
+
+			if (sse_rc != 0 || accum->error) {
+				/* SSE_ERROR 回调已渲染过时不重复（json 流/trace 双份） */
+				if (!accum->error)
+					ba_push_display(&tctx, &(BaDisplayMsg){
+						.type = BA_DM_ERROR, .content = (char *)"HTTP request failed"});
+				ba_push_display(&tctx, &(BaDisplayMsg){
+					.type = BA_DM_STOP, .content = (char *)"error"});
+				sse_accum_free(accum);
+				rc = 1;
+				goto out;
+			}
+
+			ba_flush_turn_events(&tctx);
+
+			if (accum->tool_count > 0 && accum->stop_reason
+			 && (strcmp(accum->stop_reason, "tool_use") == 0
+			  || strcmp(accum->stop_reason, "tool_calls") == 0)) {
+				const char **ids, **contents;
+				int i;
+				/* json 模式下中间轮的 text/thinking/usage 也要进输出流和 trace */
+				ba_flush_turn_events(&tctx);
+				/* record assistant message with tool calls */
+				{
+					const char **tids = xzalloc(accum->tool_count * sizeof(char *));
+					const char **tnames = xzalloc(accum->tool_count * sizeof(char *));
+					const char **tinputs = xzalloc(accum->tool_count * sizeof(char *));
+					for (i = 0; i < accum->tool_count; i++) {
+						tids[i] = accum->tools[i].id;
+						tnames[i] = accum->tools[i].name;
+						tinputs[i] = accum->tools[i].input_json.data;
+						{
+							char *sum = ba_tool_call_summary(
+								accum->tools[i].name,
+								accum->tools[i].input_json.data);
+							BaDisplayMsg dm;
+							memset(&dm, 0, sizeof(dm));
+							dm.type = BA_DM_TOOL_CALL;
+							dm.tool_name = accum->tools[i].name;
+							dm.tool_id = accum->tools[i].id;
+							dm.tool_input = accum->tools[i].input_json.data;
+							dm.content = sum;
+							ba_push_display(&tctx, &dm);
+							free(sum);
+						}
+					}
+					store_conv_add_assistant(paths.conversation,
+								 accum->thinking.len ? accum->thinking.data : NULL,
+								 accum->text.len ? accum->text.data : NULL,
+								 accum->tool_count, tids, tnames, tinputs);
+					free(tids); free(tnames); free(tinputs);
+				}
+				/* execute tools */
+				ids = xzalloc(accum->tool_count * sizeof(char *));
+				contents = xzalloc(accum->tool_count * sizeof(char *));
+				for (i = 0; i < accum->tool_count; i++) {
+					char *out;
+					if (strcmp(accum->tools[i].name, "SubAgent") == 0) {
+						/* bash-agent agent.c:1050 同款：loop 层拦截 SubAgent */
+						JsonParse sjp = json_parse_root(
+							accum->tools[i].input_json.data);
+						char *sprompt = NULL, *sdesc = NULL;
+						int sfork = 0;
+						if (!sjp.error) {
+							sprompt = json_get_string(sjp.val, "prompt");
+							sdesc = json_get_string(sjp.val, "description");
+							sfork = json_get_bool(sjp.val, "fork", false) ? 1 : 0;
+						}
+						out = ba_handle_sub_agent(ctx,
+									 sprompt ? sprompt : "",
+									 sdesc ? sdesc : "", sfork);
+						free(sprompt); free(sdesc);
+					} else {
+						out = ba_tool_execute(accum->tools[i].name,
+								      accum->tools[i].input_json.data,
+								      120000);
+					}
+					{
+						BaDisplayMsg dm;
+						memset(&dm, 0, sizeof(dm));
+						dm.type = BA_DM_TOOL_RESULT;
+						dm.tool_id = accum->tools[i].id;
+						dm.tool_name = accum->tools[i].name;
+						dm.content = out;
+						ba_push_display(&tctx, &dm);
+					}
+					ids[i] = accum->tools[i].id;
+					contents[i] = out;
+				}
+				store_conv_add_tool_results(paths.conversation,
+							    accum->tool_count, ids, contents);
+				for (i = 0; i < accum->tool_count; i++)
+					free((void *)contents[i]);
+				free(ids); free(contents);
+				sse_accum_free(accum);
+				continue;   /* next model turn */
+			}
+
+			/* final assistant message */
+			store_conv_add_assistant(paths.conversation,
+						 accum->thinking.len ? accum->thinking.data : NULL,
+						 accum->text.len ? accum->text.data : NULL,
+						 0, NULL, NULL, NULL);
+			ba_push_display(&tctx, &(BaDisplayMsg){
+				.type = BA_DM_STOP,
+				.content = accum->stop_reason ? accum->stop_reason : "end_turn" });
+			if (tctx.disp.format == BA_FMT_HUMAN)
+				fwrite("\n", 1, 1, stdout);
+			sse_accum_free(accum);
+			break;
+		}
+	}
+
+out:
+	ctx->paths = paths;
+	store_session_paths_free(&paths);
+	free(tools_json);
+	free(sys_full);
+	return rc;
+}
+
 int busyagent_main(int argc UNUSED_PARAM, char **argv)
 {
 	const char *base_url = getenv("BB_AGENT_BASE_URL");
@@ -253,15 +661,12 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	int max_turns = BA_DEFAULT_TURNS, verbose = 0;
 	int opt_new = 0;
 	char *prompt = NULL, *home, *cwd, *session_id = NULL;
-	char *tools_json = NULL;
-	char *sys_full = NULL;
-	SessionPaths paths;
-	char *api_url;
+	char *api_url = NULL;
 	int rc = 0;
 	unsigned opts;
 	const char *o_u = NULL, *o_k = NULL, *o_m = NULL, *o_p = NULL;
 	const char *o_t = NULL, *o_s = NULL, *o_o = NULL;
-	/* bit positions follow the option string "vu:k:m:p:t:s:o:nc" */
+	/* bit positions follow the option string "vu:k:m:p:t:s:o:nci" */
 	enum {
 		OPT_verbose = 1 << 0,
 		OPT_new     = 1 << 8,
@@ -305,12 +710,6 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	if (o_s) session_arg = o_s;
 	if (o_o) output_fmt = o_o;
 	if (max_turns <= 0) max_turns = BA_DEFAULT_TURNS;
-
-	/* 将最终生效配置写回环境：SubAgent 工具 fork+exec 自己时无需再传参 */
-	if (base_url) setenv("BB_AGENT_BASE_URL", base_url, 1);
-	if (api_key) setenv("BB_AGENT_API_KEY", api_key, 1);
-	if (model) setenv("BB_AGENT_MODEL", model, 1);
-	if (provider) setenv("BB_AGENT_PROVIDER", provider, 1);
 
 	argv += optind;
 	if (!argv[0]) {
@@ -363,7 +762,6 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 		free(b_stripped);
 	}
 
-	/* session resolution: --session > --new > default(cwd latest) */
 	{
 		if (home_env && home_env[0]) {
 			home = xstrdup(home_env);
@@ -383,222 +781,35 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 		if (!session_id)
 			session_id = session_new_id();
 	}
+
 	{
-		int is_new;
-		paths = store_session_paths_for(home, cwd, session_id);
-		is_new = (access(paths.session_dir, F_OK) != 0);
-		if (store_session_init(&paths, is_new) != 0) {
-			bb_error_msg_and_die("session init failed: %s", paths.session_dir);
-		}
-		if (verbose)
-			fprintf(stderr, "[verbose] session=%s (%s) home=%s\n",
-				session_id, is_new ? "new" : "resumed", home);
+		signal(SIGPIPE, SIG_IGN);   /* cagent.c 同款：HTTP/pipe 写入半关闭时不致死于默认行为 */
+
+	BaRunCtx root;
+
+		memset(&root, 0, sizeof(root));
+		root.home = home;
+		root.cwd = cwd;
+		root.prompt = prompt;
+		root.session_id = session_id;
+		root.depth = 0;                 /* bash-agent: agent->sub_agent_depth */
+		root.verbose = verbose;
+		root.max_turns = max_turns;
+		root.model = model;
+		root.provider = provider;
+		root.api_url = api_url;
+		root.api_key = api_key;
+		root.fmt = (strcmp(output_fmt, "json") == 0)
+		           ? BA_FMT_STREAM_JSON : BA_FMT_HUMAN;
+
+		rc = ba_run_session(&root);
 	}
 
-	setenv("BB_AGENT_SESSION", session_id, 1);
-
-	/* SubAgent fork=true 继承：把父会话 history/plan 复制进子会话
-	 * （对齐 bash-agent store_session_init_sub(fork=1) 的复制语义，
-	 *  store_session_fork 为移植的同一实现） */
-	if (getenv("BB_AGENT_FORK_FROM") && getenv("BB_AGENT_FORK_FROM")[0]) {
-		const char *ff = getenv("BB_AGENT_FORK_FROM");
-		SessionPaths parent_paths = store_session_paths_for(home, cwd, ff);
-		store_session_fork(&parent_paths, &paths);
-		store_session_paths_free(&parent_paths);
-		unsetenv("BB_AGENT_FORK_FROM");
-		if (verbose)
-			fprintf(stderr, "[verbose] forked history/plan from session %s\n", ff);
-	}
-
-	ba_tools_init(home, &paths);
-
-	/* record user turn */
-	{
-		StrBuf evt;
-		sb_init(&evt);
-		sb_append(&evt, "{\"type\":\"user_input\",\"content\":");
-		sb_append_json_string(&evt, prompt);
-		sb_append_char(&evt, '}');
-		store_event_append(&paths, evt.data);
-		sb_free(&evt);
-	}
-	if (store_conv_add_user(paths.conversation, prompt) != 0)
-		bb_error_msg_and_die("conversation append failed");
-
-	/* system prompt：对齐 bash-agent 的分块结构（ba_prompt.c） */
-	{
-		BaPromptCtx pctx;
-		int turn;
-		memset(&pctx, 0, sizeof(pctx));
-		pctx.cwd = cwd;
-		pctx.home = home;
-		pctx.plan = paths.plan;
-		pctx.plan_draft = paths.plan_draft;
-		sys_full = ba_build_prompt(&pctx);
-		tools_json = ba_tools_json();   /* constant across turns */
-		for (turn = 0; turn < max_turns; turn++) {
-			TurnCtx tctx;
-			char **lines = NULL;
-			int line_count = 0;
-			char *claude_body, *body;
-			const char *headers[8];
-			char auth_header[512];
-			int hdr_count = 0, sse_rc;
-			SseAccumulator *accum;
-
-			ba_trim_history(paths.conversation);
-
-			if (store_conv_line_count(paths.conversation, &lines, &line_count) != 0)
-				bb_error_msg_and_die("conversation read failed");
-
-			claude_body = build_claude_request(model, sys_full, tools_json,
-							   lines, line_count,
-							   BA_MAX_TOKENS, NULL, NULL);
-			body = claude_body;
-			if (strcmp(provider, "openai") == 0) {
-				body = convert_to_openai(claude_body);
-				free(claude_body);
-			} else if (strcmp(provider, "responses") == 0) {
-				body = convert_to_responses(claude_body);
-				free(claude_body);
-			}
-
-			if (verbose && body)
-				fprintf(stderr, "[verbose] request body (%zu bytes): %.200s%s\n",
-					strlen(body), body, strlen(body) > 200 ? "..." : "");
-
-			headers[hdr_count++] = "Content-Type: application/json";
-			headers[hdr_count++] = "User-Agent: busyagent/0.1";
-			if (strcmp(provider, "claude") == 0) {
-				headers[hdr_count++] = "x-app: cli";
-				snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", api_key);
-				headers[hdr_count++] = auth_header;
-				headers[hdr_count++] = "anthropic-version: 2023-06-01";
-			} else {
-				snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
-				headers[hdr_count++] = auth_header;
-			}
-
-			memset(&tctx, 0, sizeof(tctx));
-			tctx.paths = &paths;
-			tctx.verbose = verbose;
-			ba_disp_init(&tctx.disp,
-				     (strcmp(output_fmt, "json") == 0) ? BA_FMT_STREAM_JSON
-				                                       : BA_FMT_HUMAN);
-			sse_accum_init(&tctx.accum);
-			accum = &tctx.accum;
-
-			sse_rc = http_post_sse(api_url, headers, hdr_count,
-					       body, strlen(body), provider,
-					       ba_sse_callback, &tctx, NULL);
-			free(body);
-			{
-				int i;
-				for (i = 0; i < line_count; i++) free(lines[i]);
-				free(lines);
-			}
-
-			if (sse_rc != 0 || accum->error) {
-				/* SSE_ERROR 回调已渲染过时不重复（json 流/trace 双份） */
-				if (!accum->error)
-					ba_push_display(&tctx, &(BaDisplayMsg){
-						.type = BA_DM_ERROR, .content = (char *)"HTTP request failed"});
-				ba_push_display(&tctx, &(BaDisplayMsg){
-					.type = BA_DM_STOP, .content = (char *)"error"});
-				sse_accum_free(accum);
-				rc = 1;
-				goto out;
-			}
-
-			ba_flush_turn_events(&tctx);
-
-			if (accum->tool_count > 0 && accum->stop_reason
-			 && (strcmp(accum->stop_reason, "tool_use") == 0
-			  || strcmp(accum->stop_reason, "tool_calls") == 0)) {
-				const char **ids, **contents;
-				int i;
-				/* json 模式下中间轮的 text/thinking/usage 也要进输出流和 trace */
-				ba_flush_turn_events(&tctx);
-				/* record assistant message with tool calls */
-				{
-					const char **tids = xzalloc(accum->tool_count * sizeof(char *));
-					const char **tnames = xzalloc(accum->tool_count * sizeof(char *));
-					const char **tinputs = xzalloc(accum->tool_count * sizeof(char *));
-					for (i = 0; i < accum->tool_count; i++) {
-						tids[i] = accum->tools[i].id;
-						tnames[i] = accum->tools[i].name;
-						tinputs[i] = accum->tools[i].input_json.data;
-{
-							char *sum = ba_tool_call_summary(
-								accum->tools[i].name,
-								accum->tools[i].input_json.data);
-							BaDisplayMsg dm;
-							memset(&dm, 0, sizeof(dm));
-							dm.type = BA_DM_TOOL_CALL;
-							dm.tool_name = accum->tools[i].name;
-							dm.tool_id = accum->tools[i].id;
-							dm.tool_input = accum->tools[i].input_json.data;
-							dm.content = sum;
-							ba_push_display(&tctx, &dm);
-							free(sum);
-						}
-					}
-					store_conv_add_assistant(paths.conversation,
-								 accum->thinking.len ? accum->thinking.data : NULL,
-								 accum->text.len ? accum->text.data : NULL,
-								 accum->tool_count, tids, tnames, tinputs);
-					free(tids); free(tnames); free(tinputs);
-				}
-				/* execute tools */
-				ids = xzalloc(accum->tool_count * sizeof(char *));
-				contents = xzalloc(accum->tool_count * sizeof(char *));
-				for (i = 0; i < accum->tool_count; i++) {
-					char *out = ba_tool_execute(accum->tools[i].name,
-								    accum->tools[i].input_json.data,
-								    120000);
-					{
-					BaDisplayMsg dm;
-					memset(&dm, 0, sizeof(dm));
-					dm.type = BA_DM_TOOL_RESULT;
-					dm.tool_id = accum->tools[i].id;
-					dm.tool_name = accum->tools[i].name;
-					dm.content = out;
-					ba_push_display(&tctx, &dm);
-				}
-					ids[i] = accum->tools[i].id;
-					contents[i] = out;
-				}
-				store_conv_add_tool_results(paths.conversation,
-							    accum->tool_count, ids, contents);
-				for (i = 0; i < accum->tool_count; i++)
-					free((void *)contents[i]);
-				free(ids); free(contents);
-				sse_accum_free(accum);
-				continue;   /* next model turn */
-			}
-
-			/* final assistant message */
-			store_conv_add_assistant(paths.conversation,
-						 accum->thinking.len ? accum->thinking.data : NULL,
-						 accum->text.len ? accum->text.data : NULL,
-						 0, NULL, NULL, NULL);
-			ba_push_display(&tctx, &(BaDisplayMsg){
-				.type = BA_DM_STOP,
-				.content = accum->stop_reason ? accum->stop_reason : "end_turn" });
-			if (tctx.disp.format == BA_FMT_HUMAN)
-				fwrite("\n", 1, 1, stdout);
-			sse_accum_free(accum);
-			break;
-		}
-	}
-
-out:
-	store_session_paths_free(&paths);
-	free(tools_json);
+	free(api_url);
 	free(session_id);
 	free(cwd);
 	free(home);
-	free(api_url);
 	free(prompt);
 	return rc;
 }
+

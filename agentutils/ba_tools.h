@@ -21,6 +21,9 @@ int ba_tools_init(const char *home, const SessionPaths *paths);
 
 void ba_tools_free(void);
 
+/* Re-point the built-in state tools (Plan*) at another session. */
+void ba_tools_set_paths(const SessionPaths *paths);
+
 /* Tools array sent to the LLM: builtin schemas + dynamic zone with
  * "exec" mappings stripped (they are internal). Caller frees. */
 char *ba_tools_json(void);
