@@ -49,8 +49,9 @@ RUN case "$TARGETARCH" in \
     grep -q '^CONFIG_BUSYAGENT=y' .config && \
     make ARCH="$ARCH" -j"$(nproc)"
 
-# minimal rootfs: binary + every applet link + /etc basics, normalized mtimes
-RUN mkdir -p out-rootfs/bin out-rootfs/etc out-rootfs/root; \
+# minimal rootfs: binary + every applet link + /etc basics, normalized mtimes.
+# /root/.busyagent is the sessions/history mount point (declared VOLUME below).
+RUN mkdir -p out-rootfs/bin out-rootfs/etc out-rootfs/root/.busyagent; \
     cp busybox out-rootfs/bin/; \
     printf 'root:x:0:0:root:/root:/bin/sh\n' > out-rootfs/etc/passwd; \
     printf 'root:x:0:\n' > out-rootfs/etc/group; \
@@ -58,4 +59,9 @@ RUN mkdir -p out-rootfs/bin out-rootfs/etc out-rootfs/root; \
 
 FROM scratch
 COPY --from=build /src/out-rootfs/ /
+
+ENV BB_AGENT_HOME=/root/.busyagent
+VOLUME ["/root/.busyagent"]
+WORKDIR /root
+
 CMD ["sh"]
