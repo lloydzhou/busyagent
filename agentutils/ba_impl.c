@@ -1264,7 +1264,6 @@ static void ba_send_request(tls_state_t *tls, int fd, const BaUrl *u, const char
  * owns it and free()s it with the socket. No certificate validation. */
 static tls_state_t *ba_tls_connect(const char *host, int port)
 {
-	static int note_shown;
 	len_and_sockaddr *lsa;
 	int fd;
 	tls_state_t *tls;
@@ -1280,10 +1279,6 @@ static tls_state_t *ba_tls_connect(const char *host, int port)
 	tls = new_tls_state();
 	tls->ifd = tls->ofd = fd;
 	tls_handshake(tls, host);
-	if (!note_shown) {
-		bb_simple_error_msg("note: TLS certificate validation not implemented");
-		note_shown = 1;
-	}
 	return tls;
 }
 #endif
