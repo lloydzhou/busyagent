@@ -46,7 +46,10 @@ static void ds_update_last_char(BaDisplay *ds, const char *text) {
 
 /* linenoiseWrite 的非交互等价（busyagent 无 raw-mode 终端） */
 static void lw_write(const char *s, size_t n) {
+    /* bash-agent 的 linenoiseWrite 为即时输出；流式 delta 不能滞留在
+     * stdout 缓冲（tty 全缓冲/管道场景会整体延迟到退出才可见） */
     fwrite(s, 1, n, stdout);
+    fflush(stdout);
 }
 
 #include <stdarg.h>

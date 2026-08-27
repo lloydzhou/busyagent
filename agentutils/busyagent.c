@@ -901,6 +901,57 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	if (max_turns <= 0) max_turns = BA_DEFAULT_TURNS;
 
 	argv += optind;
+	if (!base_url || !base_url[0])
+		bb_error_msg_and_die("no base URL: use -u URL or $BB_AGENT_BASE_URL");
+	if (!api_key || !api_key[0])
+		bb_error_msg_and_die("no API key: use -k KEY or $BB_AGENT_API_KEY");
+	if (!model || !model[0])
+		bb_error_msg_and_die("no model: use -m MODEL");
+	if (strcmp(provider, "claude") != 0 && strcmp(provider, "openai") != 0
+	 && strcmp(provider, "responses") != 0)
+		bb_error_msg_and_die("bad provider '%s' (claude|openai|responses)", provider);
+
+	/* api url */
+	{
+		size_t bl = strlen(base_url);
+		char *b_stripped = NULL;
+		const char *b = base_url;
+		if (bl && base_url[bl-1] == '/') {
+			b_stripped = xstrndup(base_url, bl - 1);
+			b = b_stripped;
+		}
+		if (strcmp(provider, "claude") == 0)
+			api_url = xasprintf("%s/messages", b);
+		else if (strcmp(provider, "responses") == 0)
+			api_url = xasprintf("%s/responses", b);
+		else
+			api_url = xasprintf("%s/chat/completions", b);
+		free(b_stripped);
+	}
+
+	{
+		if (home_env && home_env[0]) {
+			home = xstrdup(home_env);
+		} else {
+			/* 持久会话记忆需要持久位置：$HOME/.busyagent */
+			const char *h = getenv("HOME");
+			home = (h && h[0]) ? xasprintf("%s/.busyagent", h) : xstrdup("/tmp/busyagent");
+		}
+	}
+	cwd = xrealloc_getcwd_or_warn(NULL);
+	if (session_arg && session_arg[0]) {
+		session_id = xstrdup(session_arg);
+	} else if (opt_new) {
+		session_id = session_new_id();
+	} else {
+		session_id = store_session_resolve_continue(home, cwd);
+		if (!session_id)
+			session_id = session_new_id();
+	}
+
+	{
+		signal(SIGPIPE, SIG_IGN);   /* cagent.c 同款：HTTP/pipe 写入半关闭时不致死于默认行为 */
+	}
 	if (!argv[0]) {
 		if (isatty(STDIN_FILENO)) {
 			/* ---- 交互式 REPL（bash-agent cagent 交互模式对齐）----
@@ -979,76 +1030,25 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 		prompt = xstrdup(argv[0]);
 	}
 
-	if (!base_url || !base_url[0])
-		bb_error_msg_and_die("no base URL: use -u URL or $BB_AGENT_BASE_URL");
-	if (!api_key || !api_key[0])
-		bb_error_msg_and_die("no API key: use -k KEY or $BB_AGENT_API_KEY");
-	if (!model || !model[0])
-		bb_error_msg_and_die("no model: use -m MODEL");
-	if (strcmp(provider, "claude") != 0 && strcmp(provider, "openai") != 0
-	 && strcmp(provider, "responses") != 0)
-		bb_error_msg_and_die("bad provider '%s' (claude|openai|responses)", provider);
-
-	/* api url */
-	{
-		size_t bl = strlen(base_url);
-		char *b_stripped = NULL;
-		const char *b = base_url;
-		if (bl && base_url[bl-1] == '/') {
-			b_stripped = xstrndup(base_url, bl - 1);
-			b = b_stripped;
-		}
-		if (strcmp(provider, "claude") == 0)
-			api_url = xasprintf("%s/messages", b);
-		else if (strcmp(provider, "responses") == 0)
-			api_url = xasprintf("%s/responses", b);
-		else
-			api_url = xasprintf("%s/chat/completions", b);
-		free(b_stripped);
-	}
-
-	{
-		if (home_env && home_env[0]) {
-			home = xstrdup(home_env);
-		} else {
-			/* 持久会话记忆需要持久位置：$HOME/.busyagent */
-			const char *h = getenv("HOME");
-			home = (h && h[0]) ? xasprintf("%s/.busyagent", h) : xstrdup("/tmp/busyagent");
-		}
-	}
-	cwd = xrealloc_getcwd_or_warn(NULL);
-	if (session_arg && session_arg[0]) {
-		session_id = xstrdup(session_arg);
-	} else if (opt_new) {
-		session_id = session_new_id();
-	} else {
-		session_id = store_session_resolve_continue(home, cwd);
-		if (!session_id)
-			session_id = session_new_id();
-	}
-
-	{
-		signal(SIGPIPE, SIG_IGN);   /* cagent.c 同款：HTTP/pipe 写入半关闭时不致死于默认行为 */
 
 	BaRunCtx root;
 
-		memset(&root, 0, sizeof(root));
-		root.home = home;
-		root.cwd = cwd;
-		root.prompt = prompt;
-		root.session_id = session_id;
-		root.depth = 0;                 /* bash-agent: agent->sub_agent_depth */
-		root.verbose = verbose;
-		root.max_turns = max_turns;
-		root.model = model;
-		root.provider = provider;
-		root.api_url = api_url;
-		root.api_key = api_key;
-		root.fmt = (strcmp(output_fmt, "json") == 0)
-		           ? BA_FMT_STREAM_JSON : BA_FMT_HUMAN;
+	memset(&root, 0, sizeof(root));
+	root.home = home;
+	root.cwd = cwd;
+	root.prompt = prompt;
+	root.session_id = session_id;
+	root.depth = 0;                 /* bash-agent: agent->sub_agent_depth */
+	root.verbose = verbose;
+	root.max_turns = max_turns;
+	root.model = model;
+	root.provider = provider;
+	root.api_url = api_url;
+	root.api_key = api_key;
+	root.fmt = (strcmp(output_fmt, "json") == 0)
+	           ? BA_FMT_STREAM_JSON : BA_FMT_HUMAN;
 
-		rc = ba_run_session(&root);
-	}
+	rc = ba_run_session(&root);
 
 	free(api_url);
 	free(session_id);
