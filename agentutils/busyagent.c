@@ -23,7 +23,7 @@
 //config:	$BB_AGENT_HOME and restored automatically per working directory.
 //config:
 //applet:IF_BUSYAGENT(APPLET(busyagent, BB_DIR_USR_BIN, BB_SUID_DROP))
-//kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_json.o ba_util.o ba_prompt.o
+//kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_json.o ba_util.o ba_prompt.o ba_display.o
 //kbuild:lib-$(CONFIG_BUSYAGENT) += ba_store.o ba_transport.o bb_http.o ba_tools.o
 
 //usage:#define busyagent_trivial_usage
@@ -53,6 +53,7 @@
 #include "ba_transport.h"
 #include "ba_store.h"
 #include "ba_prompt.h"
+#include "ba_display.h"
 #include "ba_tools.h"
 
 #define BA_MAX_TOKENS     16384
@@ -63,8 +64,8 @@
 
 typedef struct {
 	SseAccumulator accum;
+	BaDisplay disp;
 	const SessionPaths *paths;
-	int output_json;
 	int verbose;
 } TurnCtx;
 
@@ -78,171 +79,119 @@ static void ba_emit_json_str(StrBuf *sb, const char *key, const char *val)
 
 /* Render one logical event to stdout (text or stream-json) and to the
  * session trace (events.jsonl). Shapes follow bash-agent display.c. */
-static void ba_render(TurnCtx *t, const char *json_frag)
+/* display_msg_to_event：与 bash-agent 逐字一致的事件序列化 */
+static char *ba_display_to_event(const BaDisplayMsg *m)
 {
-	StrBuf line;
-	const char *type = NULL;
+	StrBuf buf;
+	sb_init(&buf);
+	switch (m->type) {
+	case BA_DM_TEXT:
+		sb_append(&buf, "{\"type\":\"text\",\"content\":");
+		sb_append_json_string(&buf, m->content ? m->content : "");
+		sb_append_char(&buf, '}');
+		break;
+	case BA_DM_THINKING:
+		sb_append(&buf, "{\"type\":\"thinking\",\"content\":");
+		sb_append_json_string(&buf, m->content ? m->content : "");
+		sb_append_char(&buf, '}');
+		break;
+	case BA_DM_TOOL_CALL:
+		sb_append(&buf, "{\"type\":\"tool_call\",\"name\":");
+		sb_append_json_string(&buf, m->tool_name ? m->tool_name : "");
+		sb_append(&buf, ",\"id\":");
+		sb_append_json_string(&buf, m->tool_id ? m->tool_id : "");
+		sb_append(&buf, ",\"input\":");
+		if (m->tool_input) sb_append(&buf, m->tool_input); else sb_append(&buf, "{}");
+		sb_append_char(&buf, '}');
+		break;
+	case BA_DM_TOOL_RESULT:
+		sb_append(&buf, "{\"type\":\"tool_result\",\"tool_use_id\":");
+		sb_append_json_string(&buf, m->tool_id ? m->tool_id : "");
+		sb_append(&buf, ",\"name\":");
+		sb_append_json_string(&buf, m->tool_name ? m->tool_name : "");
+		sb_append(&buf, ",\"content\":");
+		sb_append_json_string(&buf, m->content ? m->content : "");
+		sb_append_char(&buf, '}');
+		break;
+	case BA_DM_USAGE:
+		sb_appendf(&buf,
+			"{\"type\":\"usage\",\"input_tokens\":%d,\"output_tokens\":%d,"
+			"\"cache_read_input_tokens\":%d,\"cache_creation_input_tokens\":%d,"
+			"\"kind\":\"agent\"}",
+			m->in_tokens, m->out_tokens,
+			m->cache_read_tokens, m->cache_creation_tokens);
+		break;
+	case BA_DM_STOP:
+		sb_append(&buf, "{\"type\":\"stop\",\"reason\":");
+		sb_append_json_string(&buf, m->content ? m->content : "");
+		sb_append_char(&buf, '}');
+		break;
+	case BA_DM_ERROR:
+		sb_append(&buf, "{\"type\":\"error\",\"message\":");
+		sb_append_json_string(&buf, m->content ? m->content : "");
+		sb_append_char(&buf, '}');
+		break;
+	default:
+		sb_free(&buf);
+		return NULL;
+	}
+	return buf.data;
+}
 
-	JsonParse jp = json_parse_root(json_frag);
-	if (!jp.error)
-		type = json_get_string(jp.val, "type");
+/* push_display_event 同步版：写 events.jsonl + 按 format 渲染 */
+static void ba_push_display(TurnCtx *t, const BaDisplayMsg *m)
+{
+	char *evt = ba_display_to_event(m);
+	if (evt) {
+		store_event_append(t->paths, evt);
+		free(evt);
+	}
+	ba_display_push(&t->disp, m);
+}
 
-	sb_init(&line);
-	sb_append(&line, json_frag);
-	sb_append_char(&line, '\n');
-
-	if (t->output_json) {
-		fwrite(line.data, 1, line.len, stdout);
-		fflush(stdout);
-	} else {
-		/* human rendering（复用上面的 jp） */
-		if (!jp.error && type) {
-			if (strcmp(type, "text") == 0) {
-				char *c = json_get_string(jp.val, "content");
-				if (c) { fwrite(c, 1, strlen(c), stdout); fflush(stdout); free(c); }
-			} else if (strcmp(type, "thinking") == 0 && t->verbose) {
-				char *c = json_get_string(jp.val, "content");
-				if (c) { fprintf(stderr, "[think] %s\n", c); free(c); }
-			} else if (strcmp(type, "tool_call") == 0) {
-				char *n = json_get_string(jp.val, "name");
-				fprintf(stderr, "[tool] %s\n", n ? n : "?");
-				free(n);
-			} else if (strcmp(type, "tool_result") == 0 && t->verbose) {
-				char *c = json_get_string(jp.val, "content");
-				if (c) { fprintf(stderr, "[tool out] %.400s%s\n", c, strlen(c) > 400 ? "..." : ""); free(c); }
-			} else if (strcmp(type, "usage") == 0 && t->verbose) {
-				fprintf(stderr, "[usage] in=%d out=%d\n",
-					json_get_int(jp.val, "input_tokens"),
-					json_get_int(jp.val, "output_tokens"));
-			} else if (strcmp(type, "error") == 0) {
-				char *c = json_get_string(jp.val, "message");
-				fprintf(stderr, "error: %s\n", c ? c : "?");
-				free(c);
-			}
+/* 工具轮结束后的聚合补推：json 模式整块 text/thinking + usage */
+static void ba_flush_turn_events(TurnCtx *t)
+{
+	if (t->disp.format == BA_FMT_STREAM_JSON) {
+		BaDisplayMsg dm;
+		memset(&dm, 0, sizeof(dm));
+		if (t->accum.thinking.len > 0) {
+			dm.type = BA_DM_THINKING;
+			dm.content = t->accum.thinking.data;
+			ba_push_display(t, &dm);
+		}
+		memset(&dm, 0, sizeof(dm));
+		if (t->accum.text.len > 0) {
+			dm.type = BA_DM_TEXT;
+			dm.content = t->accum.text.data;
+			ba_push_display(t, &dm);
 		}
 	}
-	store_event_append(t->paths, line.data);
-	sb_free(&line);
+	if (t->accum.in_tokens || t->accum.out_tokens)
+		ba_push_display(t, &(BaDisplayMsg){ .type = BA_DM_USAGE,
+			.in_tokens = t->accum.in_tokens,
+			.out_tokens = t->accum.out_tokens,
+			.cache_read_tokens = t->accum.cache_read_tokens,
+			.cache_creation_tokens = t->accum.cache_creation_tokens });
 }
 
-static void ba_render_text(TurnCtx *t, const char *content)
-{
-	StrBuf sb;
-	sb_init(&sb);
-	sb_append(&sb, "{\"type\":\"text\",\"content\":");
-	sb_append_json_string(&sb, content);
-	sb_append_char(&sb, '}');
-	ba_render(t, sb.data);
-	sb_free(&sb);
-}
-
-static void ba_render_thinking(TurnCtx *t, const char *content)
-{
-	StrBuf sb;
-	sb_init(&sb);
-	sb_append(&sb, "{\"type\":\"thinking\",\"content\":");
-	sb_append_json_string(&sb, content);
-	sb_append_char(&sb, '}');
-	ba_render(t, sb.data);
-	sb_free(&sb);
-}
-
-static void ba_render_tool_call(TurnCtx *t, const char *id, const char *name,
-				const char *input_json)
-{
-	StrBuf sb;
-	sb_init(&sb);
-	sb_append(&sb, "{\"type\":\"tool_call\",\"name\":");
-	sb_append_json_string(&sb, name ? name : "");
-	ba_emit_json_str(&sb, "id", id);
-	sb_append(&sb, ",\"input\":");
-	sb_append(&sb, (input_json && input_json[0]) ? input_json : "{}");
-	sb_append_char(&sb, '}');
-	ba_render(t, sb.data);
-	sb_free(&sb);
-}
-
-static void ba_render_tool_result(TurnCtx *t, const char *id, const char *name,
-				  const char *content)
-{
-	StrBuf sb;
-	sb_init(&sb);
-	sb_append(&sb, "{\"type\":\"tool_result\",\"tool_use_id\":");
-	sb_append_json_string(&sb, id ? id : "");
-	ba_emit_json_str(&sb, "name", name);
-	sb_append(&sb, ",\"content\":");
-	sb_append_json_string(&sb, content ? content : "");
-	sb_append_char(&sb, '}');
-	ba_render(t, sb.data);
-	sb_free(&sb);
-}
-
-static void ba_render_usage(TurnCtx *t, int in, int out, int cr, int cc)
-{
-	StrBuf sb;
-	sb_init(&sb);
-	sb_appendf(&sb, "{\"type\":\"usage\",\"input_tokens\":%d,\"output_tokens\":%d,"
-		   "\"cache_read_input_tokens\":%d,\"cache_creation_input_tokens\":%d,"
-		   "\"kind\":\"agent\"}", in, out, cr, cc);
-	ba_render(t, sb.data);
-	sb_free(&sb);
-}
-
-static void ba_render_stop(TurnCtx *t, const char *reason)
-{
-	StrBuf sb;
-	sb_init(&sb);
-	sb_append(&sb, "{\"type\":\"stop\",\"reason\":");
-	sb_append_json_string(&sb, reason ? reason : "");
-	sb_append_char(&sb, '}');
-	ba_render(t, sb.data);
-	sb_free(&sb);
-}
-
-static void ba_render_error(TurnCtx *t, const char *msg)
-{
-	StrBuf sb;
-	sb_init(&sb);
-	sb_append(&sb, "{\"type\":\"error\",\"message\":");
-	sb_append_json_string(&sb, msg ? msg : "");
-	sb_append_char(&sb, '}');
-	ba_render(t, sb.data);
-	sb_free(&sb);
-}
-
-/* SSE callback: render + accumulate. */
+/* SSE 回调：对齐 bash-agent stream_display_callback —— 事件即时推送 */
 static void ba_sse_callback(void *ctx, const SseEvent *evt)
 {
 	TurnCtx *t = (TurnCtx *)ctx;
+	BaDisplayMsg dm;
 
-	switch (evt->type) {
-	case SSE_TEXT:
-		if (!t->output_json) {
-			fwrite(evt->content, 1, strlen(evt->content), stdout);
-			fflush(stdout);
-		}
-		break;
-	case SSE_ERROR:
-		ba_render_error(t, evt->content);
-		break;
-	default:
-		break;
+	memset(&dm, 0, sizeof(dm));
+	if (evt->type == SSE_TEXT) {
+		dm.type = BA_DM_TEXT;
+		dm.content = (char *)evt->content;
+		ba_push_display(t, &dm);
+	} else if (evt->type == SSE_ERROR) {
+		dm.type = BA_DM_ERROR;
+		dm.content = (char *)(evt->content ? evt->content : "unknown error");
+		ba_push_display(t, &dm);
 	}
 	sse_accum_callback(&t->accum, evt);
-}
-
-/* Flush accumulated turn output as trace events (text arrives streaming in
- * human mode; in json mode we emit one text event per accumulated reply to
- * keep the event stream small). */
-static void ba_flush_turn_events(TurnCtx *t)
-{
-	if (t->accum.thinking.len > 0)
-		ba_render_thinking(t, t->accum.thinking.data);
-	if (t->accum.text.len > 0 && t->output_json)
-		ba_render_text(t, t->accum.text.data);
-	if (t->accum.in_tokens || t->accum.out_tokens)
-		ba_render_usage(t, t->accum.in_tokens, t->accum.out_tokens,
-				t->accum.cache_read_tokens, t->accum.cache_creation_tokens);
 }
 
 /* ---- context trimming: drop oldest complete exchanges from request
@@ -446,7 +395,21 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 				session_id, is_new ? "new" : "resumed", home);
 	}
 
-	/* 提示（如缺失/损坏）由 ba_tools_init 内部给出：缺表即纯 chat 降级 */
+	setenv("BB_AGENT_SESSION", session_id, 1);
+
+	/* SubAgent fork=true 继承：把父会话 history/plan 复制进子会话
+	 * （对齐 bash-agent store_session_init_sub(fork=1) 的复制语义，
+	 *  store_session_fork 为移植的同一实现） */
+	if (getenv("BB_AGENT_FORK_FROM") && getenv("BB_AGENT_FORK_FROM")[0]) {
+		const char *ff = getenv("BB_AGENT_FORK_FROM");
+		SessionPaths parent_paths = store_session_paths_for(home, cwd, ff);
+		store_session_fork(&parent_paths, &paths);
+		store_session_paths_free(&parent_paths);
+		unsetenv("BB_AGENT_FORK_FROM");
+		if (verbose)
+			fprintf(stderr, "[verbose] forked history/plan from session %s\n", ff);
+	}
+
 	ba_tools_init(home, &paths);
 
 	/* record user turn */
@@ -518,8 +481,10 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 
 			memset(&tctx, 0, sizeof(tctx));
 			tctx.paths = &paths;
-			tctx.output_json = (strcmp(output_fmt, "json") == 0);
 			tctx.verbose = verbose;
+			ba_disp_init(&tctx.disp,
+				     (strcmp(output_fmt, "json") == 0) ? BA_FMT_STREAM_JSON
+				                                       : BA_FMT_HUMAN);
 			sse_accum_init(&tctx.accum);
 			accum = &tctx.accum;
 
@@ -536,8 +501,10 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			if (sse_rc != 0 || accum->error) {
 				/* SSE_ERROR 回调已渲染过时不重复（json 流/trace 双份） */
 				if (!accum->error)
-					ba_render_error(&tctx, "HTTP request failed");
-				ba_render_stop(&tctx, "error");
+					ba_push_display(&tctx, &(BaDisplayMsg){
+						.type = BA_DM_ERROR, .content = (char *)"HTTP request failed"});
+				ba_push_display(&tctx, &(BaDisplayMsg){
+					.type = BA_DM_STOP, .content = (char *)"error"});
 				sse_accum_free(accum);
 				rc = 1;
 				goto out;
@@ -561,9 +528,20 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 						tids[i] = accum->tools[i].id;
 						tnames[i] = accum->tools[i].name;
 						tinputs[i] = accum->tools[i].input_json.data;
-						ba_render_tool_call(&tctx, accum->tools[i].id,
-								    accum->tools[i].name,
-								    accum->tools[i].input_json.data);
+{
+							char *sum = ba_tool_call_summary(
+								accum->tools[i].name,
+								accum->tools[i].input_json.data);
+							BaDisplayMsg dm;
+							memset(&dm, 0, sizeof(dm));
+							dm.type = BA_DM_TOOL_CALL;
+							dm.tool_name = accum->tools[i].name;
+							dm.tool_id = accum->tools[i].id;
+							dm.tool_input = accum->tools[i].input_json.data;
+							dm.content = sum;
+							ba_push_display(&tctx, &dm);
+							free(sum);
+						}
 					}
 					store_conv_add_assistant(paths.conversation,
 								 accum->thinking.len ? accum->thinking.data : NULL,
@@ -578,8 +556,15 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 					char *out = ba_tool_execute(accum->tools[i].name,
 								    accum->tools[i].input_json.data,
 								    120000);
-					ba_render_tool_result(&tctx, accum->tools[i].id,
-							      accum->tools[i].name, out);
+					{
+					BaDisplayMsg dm;
+					memset(&dm, 0, sizeof(dm));
+					dm.type = BA_DM_TOOL_RESULT;
+					dm.tool_id = accum->tools[i].id;
+					dm.tool_name = accum->tools[i].name;
+					dm.content = out;
+					ba_push_display(&tctx, &dm);
+				}
 					ids[i] = accum->tools[i].id;
 					contents[i] = out;
 				}
@@ -597,8 +582,10 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 						 accum->thinking.len ? accum->thinking.data : NULL,
 						 accum->text.len ? accum->text.data : NULL,
 						 0, NULL, NULL, NULL);
-			ba_render_stop(&tctx, accum->stop_reason ? accum->stop_reason : "end_turn");
-			if (!tctx.output_json)
+			ba_push_display(&tctx, &(BaDisplayMsg){
+				.type = BA_DM_STOP,
+				.content = accum->stop_reason ? accum->stop_reason : "end_turn" });
+			if (tctx.disp.format == BA_FMT_HUMAN)
 				fwrite("\n", 1, 1, stdout);
 			sse_accum_free(accum);
 			break;
