@@ -1233,6 +1233,11 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			if (repl.paths.session_dir)
 				ba_drain_background(&repl, &repl.paths,
 						    repl.fmt, 1);
+			/* 退出提示（cagent.c:399-400 同款：Goodbye + resume 提示） */
+			fprintf(stderr, "\x1b[36mGoodbye!\x1b[0m\n");
+			fprintf(stderr,
+				"\x1b[90mResume with: --session %s  or  --continue\x1b[0m\n",
+				session_id ? session_id : "?");
 			free_line_input_t(li);
 			free(hist_path);
 			free(api_url);

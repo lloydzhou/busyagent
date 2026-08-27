@@ -63,10 +63,17 @@ try:
     ok_prompt3 = read_until([r"\x1b\[32m> \x1b\[0m"], 20)
 
     send("quit")
-    for _ in range(30):          # up to ~9s graceful exit
-        time.sleep(0.3)
-        if p.poll() is not None:
-            break
+    # drain until child exits so stderr farewell lines (Goodbye/Resume) land in buf
+    while p.poll() is None and time.time() < time.time() + 20:
+        r, _, _ = select.select([master], [], [], 0.4)
+        if master in r:
+            try:
+                d = os.read(master, 65536)
+            except OSError:
+                break
+            if not d:
+                break
+            buf += d
     alive = p.poll() is None
     print("exited on quit:", not alive)
     sys.exit(0 if (ok_prompt and ok_ack and ok_prompt2 and ok_recall
