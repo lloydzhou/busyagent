@@ -3,28 +3,34 @@
 #
 #   docker build -t lloydzhou/busyagent .
 #
-# Config policy (single source of truth):
-#   busybox.config  <- the ONLY configuration input, committed to the repo
-#                      and read via KCONFIG_CONFIG. It already pins:
-#                        CONFIG_STATIC=y                   (scratch-ready)
-#                        LAST_SUPPORTED_WCHAR=1114111      (CJK input echo)
-#                        UNICODE_WIDE_WCHARS=y             (CJK 2-column width)
-#                        # CONFIG_TC is not set            (alpine headers)
-#   The RUN below only *asserts* these invariants so a config regression
-#   fails the build instead of silently producing a degraded binary.
+# Config policy: self-contained in this file. No committed .config.
+#   make defconfig (kconfig defaults) then pin exactly four things:
+#     CONFIG_STATIC=y                 zero-dependency binary for scratch
+#     LAST_SUPPORTED_WCHAR=1114111    full CJK codepoint tables (input echo)
+#     UNICODE_WIDE_WCHARS=y           CJK measured at 2 columns
+#     CONFIG_BUSYAGENT=y              pulls our applet + its selects
 #
 FROM alpine:3.23 AS build
 RUN apk add --no-cache gcc make musl-dev linux-headers findutils
 WORKDIR /src
 COPY . .
 
-ENV KCONFIG_CONFIG=busybox.config
-
-RUN yes "" | make oldconfig >/dev/null && \
-    grep -q '^CONFIG_STATIC=y' busybox.config && \
-    grep -q '^CONFIG_LAST_SUPPORTED_WCHAR=1114111$' busybox.config && \
-    grep -q '^CONFIG_UNICODE_WIDE_WCHARS=y' busybox.config && \
-    grep -q '^# CONFIG_TC is not set$' busybox.config && \
+RUN make defconfig >/dev/null && \
+    sed -i -e '/^CONFIG_STATIC=/d' -e '/^# CONFIG_STATIC is not set/d' .config && \
+    echo 'CONFIG_STATIC=y' >> .config && \
+    sed -i -e '/^CONFIG_LAST_SUPPORTED_WCHAR=/d' -e '/^# CONFIG_LAST_SUPPORTED_WCHAR is not set/d' .config && \
+    echo 'CONFIG_LAST_SUPPORTED_WCHAR=1114111' >> .config && \
+    sed -i -e '/^CONFIG_UNICODE_WIDE_WCHARS=/d' -e '/^# CONFIG_UNICODE_WIDE_WCHARS is not set/d' .config && \
+    echo 'CONFIG_UNICODE_WIDE_WCHARS=y' >> .config && \
+    sed -i -e '/^CONFIG_TC=/d' -e '/^# CONFIG_TC is not set/d' .config && \
+    echo '# CONFIG_TC is not set' >> .config && \
+    grep -v '^CONFIG_BUSYAGENT=' .config > .t && mv .t .config && \
+    echo 'CONFIG_BUSYAGENT=y' >> .config && \
+    yes "" | make oldconfig >/dev/null && \
+    grep -q '^CONFIG_STATIC=y' .config && \
+    grep -q '^CONFIG_LAST_SUPPORTED_WCHAR=1114111$' .config && \
+    grep -q '^CONFIG_UNICODE_WIDE_WCHARS=y' .config && \
+    grep -q '^CONFIG_BUSYAGENT=y' .config && \
     make -j"$(nproc)"
 
 # minimal rootfs: binary + every applet link + /etc basics, normalized mtimes
