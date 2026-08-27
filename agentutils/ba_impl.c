@@ -856,10 +856,13 @@ void json_obj_iter_cleanup(JsonObjectIter *it) {
 #define BA_MAX_HEADER         (64 * 1024)
 #define BA_MAX_RETRIES        2
 #define BA_RETRY_MAX_TIME_MS  20000
+#define BA_TLS_RECHDR_LEN     5     /* TLS record header (networking/tls.c) */
+#define BA_TLS_APPDATA        23    /* RECORD_TYPE_APPLICATION_DATA */
 
 typedef struct {
 	char host[256];
 	int port;
+	int is_https;
 	char path[1024];
 } BaUrl;
 
@@ -869,9 +872,14 @@ static int ba_parse_url(const char *url, BaUrl *u)
 	const char *p, *slash;
 
 	memset(u, 0, sizeof(*u));
-	if (strncmp(url, "http://", 7) != 0)
+	if (strncmp(url, "https://", 8) == 0) {
+		u->is_https = 1;
+		p = url + 8;
+	} else if (strncmp(url, "http://", 7) == 0) {
+		p = url + 7;
+	} else {
 		return -1;
-	p = url + 7;
+	}
 	slash = strchr(p, '/');
 	if (!slash) {
 		snprintf(u->host, sizeof(u->host), "%s", p);
@@ -889,7 +897,7 @@ static int ba_parse_url(const char *url, BaUrl *u)
 		u->port = atoi(colon + 1);
 		*colon = '\0';
 	} else {
-		u->port = 80;
+		u->port = u->is_https ? 443 : 80;
 	}
 	if (!u->host[0] || u->port <= 0)
 		return -1;
@@ -943,6 +951,26 @@ static int ba_connect(const char *host, int port)
 	return fd;
 }
 
+static int send_all(int fd, const char *buf, size_t len);
+static int send_all_conn(tls_state_t *tls, int fd, const char *buf, size_t len)
+{
+#if ENABLE_TLS
+	if (tls) {
+		while (len) {
+			size_t chunk = len > 8192 ? 8192 : len;
+			memcpy(tls_get_outbuf(tls, chunk), buf, chunk);
+			tls_xwrite(tls, chunk);
+			buf += chunk;
+			len -= chunk;
+		}
+		return 0;
+	}
+#else
+	(void)tls;
+#endif
+	return send_all(fd, buf, len);
+}
+
 static int send_all(int fd, const char *buf, size_t len)
 {
 	size_t off = 0;
@@ -966,6 +994,10 @@ typedef struct {
 	long chunk_left;          /* for chunked mode */
 	int chunk_state;          /* 0=hex line, 1=data, 2=data CRLF, 3=done */
 	int eof;
+	tls_state_t *tls;
+	char tls_plain[8192];
+	int tls_plain_len;
+	int tls_plain_pos;
 	char hdr[BA_MAX_HEADER];
 	size_t hdr_len;
 	int status;
@@ -982,7 +1014,41 @@ static int ba_read(BaResp *r, char *buf, size_t bufsz)
 
 	pfd.fd = r->fd;
 	pfd.events = POLLIN;
-	for (;;) {
+	#if ENABLE_TLS
+	if (r->tls) {
+		struct pollfd pfd;
+		pfd.fd = r->tls->ifd;
+		pfd.events = POLLIN;
+		if (safe_poll(&pfd, 1, BA_READ_TIMEOUT_MS) <= 0)
+			return -1;
+
+		while (r->tls_plain_len == 0) {
+			int tn = tls_xread_record(r->tls, "application data");
+			if (tn < 1)
+				return 0;   /* TLS EOF */
+			if (r->tls->inbuf[0] != BA_TLS_APPDATA)
+				return -1;
+			if (tn > (int)sizeof(r->tls_plain))
+				tn = (int)sizeof(r->tls_plain);
+			memcpy(r->tls_plain, r->tls->inbuf + BA_TLS_RECHDR_LEN, tn);
+			r->tls_plain_len = tn;
+			r->tls_plain_pos = 0;
+		}
+		{
+			int give = r->tls_plain_len - r->tls_plain_pos;
+			if (give > bufsz)
+				give = bufsz;
+			memcpy(buf, r->tls_plain + r->tls_plain_pos, give);
+			r->tls_plain_pos += give;
+			if (r->tls_plain_pos >= r->tls_plain_len) {
+				r->tls_plain_len = 0;
+				r->tls_plain_pos = 0;
+			}
+			return give;
+		}
+	}
+#endif
+for (;;) {
 		if (safe_poll(&pfd, 1, BA_READ_TIMEOUT_MS) < 0) {
 			if (errno == EINTR)
 				continue;
@@ -1162,7 +1228,7 @@ static int ba_body_read(BaResp *r, char *out, size_t outsz)
 	}
 }
 
-static void ba_send_request(int fd, const BaUrl *u, const char **headers,
+static void ba_send_request(tls_state_t *tls, int fd, const BaUrl *u, const char **headers,
 			    int header_count, const char *body, size_t body_len)
 {
 	char first[512];
@@ -1182,15 +1248,45 @@ static void ba_send_request(int fd, const BaUrl *u, const char **headers,
 			"Content-Length: %lu\r\n"
 			"Connection: close\r\n",
 			u->path, u->host, (unsigned long)body_len);
-	send_all(fd, first, strlen(first));
+	send_all_conn(tls, fd, first, strlen(first));
 	for (i = 0; i < header_count; i++) {
-		send_all(fd, headers[i], strlen(headers[i]));
-		send_all(fd, "\r\n", 2);
+		send_all_conn(tls, fd, headers[i], strlen(headers[i]));
+		send_all_conn(tls, fd, "\r\n", 2);
 	}
-	send_all(fd, "\r\n", 2);
-	send_all(fd, body, body_len);
+	send_all_conn(tls, fd, "\r\n", 2);
+	send_all_conn(tls, fd, body, body_len);
 }
 
+
+#if ENABLE_TLS
+/* https:// support: in-tree TLS state machine (networking/tls.c), the same
+ * code ssl_client and wget use. Returns a handshaked session; the caller
+ * owns it and free()s it with the socket. No certificate validation. */
+static tls_state_t *ba_tls_connect(const char *host, int port)
+{
+	static int note_shown;
+	len_and_sockaddr *lsa;
+	int fd;
+	tls_state_t *tls;
+
+	lsa = host2sockaddr(host, port);
+	if (!lsa)
+		return NULL;
+	/* xconnect_stream() creates the socket, connects and RETURNS the fd
+	 * (libbb semantics) - keep its return value */
+	fd = xconnect_stream(lsa);
+	free(lsa);
+
+	tls = new_tls_state();
+	tls->ifd = tls->ofd = fd;
+	tls_handshake(tls, host);
+	if (!note_shown) {
+		bb_simple_error_msg("note: TLS certificate validation not implemented");
+		note_shown = 1;
+	}
+	return tls;
+}
+#endif
 
 /* Streaming POST with SSE pump. Mirrors the old curl semantics:
  * up to 2 retries, 1s delay, 20s total retry window, retry on 5xx. */
@@ -1211,17 +1307,33 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 	for (attempt = 0; attempt <= BA_MAX_RETRIES; attempt++) {
 		StreamCtx sctx;
 		BaResp r;
-		int fd = ba_connect(u.host, u.port);
+		int fd;
+		tls_state_t *tls = NULL;
 		int io_err = 0, http_code = 0;
 
-		if (fd < 0) {
-			io_err = 1;
-			goto attempt_done;
+#if ENABLE_TLS
+		if (u.is_https) {
+			tls = ba_tls_connect(u.host, u.port);
+			if (!tls) {
+				io_err = 1;
+				goto attempt_done;
+			}
+			fd = tls->ifd;
+		} else
+#endif
+		{
+			fd = ba_connect(u.host, u.port);
+			if (fd < 0) {
+				io_err = 1;
+				goto attempt_done;
+			}
 		}
 		memset(&r, 0, sizeof(r));
 		r.fd = fd;
-		ba_send_request(fd, &u, headers, header_count, body, body_len);
-		if (ba_read_header(&r) != 0) {
+		r.tls = tls;
+		(void)tls;
+		ba_send_request(tls, fd, &u, headers, header_count, body, body_len);
+			if (ba_read_header(&r) != 0) {
 			io_err = 1;
 			close(fd);
 			goto attempt_done;
@@ -1276,7 +1388,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 		if (attempt >= BA_MAX_RETRIES)
 			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
 		(void)0;
-		if ((unsigned)(monotonic_ms() - start_ms) >= BA_RETRY_MAX_TIME_MS)
+			if ((unsigned)(monotonic_ms() - start_ms) >= BA_RETRY_MAX_TIME_MS)
 			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
 		{
 			SseEvent retry_evt;

@@ -16,6 +16,7 @@
 //config:	default y
 //config:	select FEATURE_PREFER_APPLETS
 //config:	select FEATURE_EDITING
+//config:	select TLS
 //config:	help
 //config:	Run exactly one user turn of an LLM agent loop: build a chat
 //config:	request, stream the reply over plain HTTP (SSE), execute any

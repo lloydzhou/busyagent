@@ -994,6 +994,10 @@ static inline tls_state_t *new_tls_state(void)
 	tls_state_t *tls = xzalloc(sizeof(*tls));
 	return tls;
 }
+int FAST_FUNC tls_xread_record(tls_state_t *tls, const char *expected);
+void FAST_FUNC tls_xwrite(tls_state_t *tls, int len);
+void *FAST_FUNC tls_get_outbuf(tls_state_t *tls, int len);
+int FAST_FUNC tls_has_buffered_record(tls_state_t *tls);
 void FAST_FUNC tls_handshake(tls_state_t *tls, const char *sni);
 void FAST_FUNC tls_handshake_as_server(tls_state_t *tls,
 	const char *pem_filename);
