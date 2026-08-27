@@ -1,22 +1,36 @@
+/*
+ * ba_tools.h - tool table & execution for busyagent
+ *
+ * Copyright (C) 2026 by Lloyd Zhou <lloydzhou@qq.com>
+ *
+ * Licensed under GPLv2, see file LICENSE in this source tree.
+ */
 #ifndef BA_TOOLS_H
 #define BA_TOOLS_H
 
 #include <stddef.h>
+#include "ba_store.h"
 
-/* 初始化工具表：$BB_AGENT_HOME/tools.json 不存在时用内嵌默认版生成，
- * 之后每次读取该文件；解析失败回退内嵌版（stderr 警告）。
- * 返回工具数量，0 表示不可用。 */
+/* Initialize the tool system:
+ *   - the 11 builtin tools are always present (compiled in);
+ *   - $BB_AGENT_HOME/tools.json (dynamic zone) is loaded on top; a
+ *     missing/broken file only loses the dynamic sugar, never the
+ *     builtins. Dynamic names may not shadow builtins.
+ * paths is used by state tools (Plan*) for session placement. */
 int ba_tools_init(const char *home, const SessionPaths *paths);
 
 void ba_tools_free(void);
 
-/* 导出工具表模板（-i）。0 成功；-1 已存在；-2 写失败。 */
-int ba_tools_write_template(const char *path);
-
-/* 当前生效的 tools 数组 JSON 文本（与执行表同源），调用方 free */
+/* Tools array sent to the LLM: builtin schemas + dynamic zone with
+ * "exec" mappings stripped (they are internal). Caller frees. */
 char *ba_tools_json(void);
 
-/* 按表执行一次工具调用。返回 malloc 的输出文本，永不返回 NULL。 */
+/* Execute one tool call by name. Returns malloc'd output text, never
+ * NULL. Routing order: builtin reserved names -> dynamic exec mapping. */
 char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms);
+
+/* Export a starter tools.json template to path (busyagent -i).
+ * Creates parent dirs; refuses to overwrite. 0 ok / -1 exists / -2 fail. */
+int ba_tools_write_template(const char *path);
 
 #endif /* BA_TOOLS_H */

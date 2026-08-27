@@ -23,7 +23,7 @@
 //config:	$BB_AGENT_HOME and restored automatically per working directory.
 //config:
 //applet:IF_BUSYAGENT(APPLET(busyagent, BB_DIR_USR_BIN, BB_SUID_DROP))
-//kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_json.o ba_util.o
+//kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_json.o ba_util.o ba_prompt.o
 //kbuild:lib-$(CONFIG_BUSYAGENT) += ba_store.o ba_transport.o bb_http.o ba_tools.o
 
 //usage:#define busyagent_trivial_usage
@@ -46,10 +46,13 @@
 
 #include "libbb.h"
 #include <unistd.h>
+#include <sys/utsname.h>
+#include <dirent.h>
 #include "ba_util.h"
 #include "ba_json.h"
 #include "ba_transport.h"
 #include "ba_store.h"
+#include "ba_prompt.h"
 #include "ba_tools.h"
 
 #define BA_MAX_TOKENS     16384
@@ -302,6 +305,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	int opt_new = 0;
 	char *prompt = NULL, *home, *cwd, *session_id = NULL;
 	char *tools_json = NULL;
+	char *sys_full = NULL;
 	SessionPaths paths;
 	char *api_url;
 	int rc = 0;
@@ -458,13 +462,16 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	if (store_conv_add_user(paths.conversation, prompt) != 0)
 		bb_error_msg_and_die("conversation append failed");
 
-	/* minimal system prompt (phase 1) */
+	/* system prompt：对齐 bash-agent 的分块结构（ba_prompt.c） */
 	{
-		const char *sys_min =
-			"You are busyagent, a minimal agent running as a busybox applet.\n"
-			"Answer concisely. Use tools when needed to inspect files or run commands.";
-
+		BaPromptCtx pctx;
 		int turn;
+		memset(&pctx, 0, sizeof(pctx));
+		pctx.cwd = cwd;
+		pctx.home = home;
+		pctx.plan = paths.plan;
+		pctx.plan_draft = paths.plan_draft;
+		sys_full = ba_build_prompt(&pctx);
 		tools_json = ba_tools_json();   /* constant across turns */
 		for (turn = 0; turn < max_turns; turn++) {
 			TurnCtx tctx;
@@ -481,7 +488,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			if (store_conv_line_count(paths.conversation, &lines, &line_count) != 0)
 				bb_error_msg_and_die("conversation read failed");
 
-			claude_body = build_claude_request(model, sys_min, tools_json,
+			claude_body = build_claude_request(model, sys_full, tools_json,
 							   lines, line_count,
 							   BA_MAX_TOKENS, NULL, NULL);
 			body = claude_body;

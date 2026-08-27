@@ -16,39 +16,44 @@ model stops, append the turn's events to the session trace, exit.
 | `ba_{json,util,protocol,store,transport}.[ch]` | pure-C modules ported from [bash-agent](https://github.com/lloydzhou/bash-agent), curl paths removed |
 | `tools.json` | **source of the embedded default tool table** — see below |
 
-## tools.json lifecycle (read this before "why is there a json in the repo")
+## tools.json lifecycle (dynamic zone only — nothing embedded)
 
-`tools.json` in this directory is *not* read at runtime. It is the
-maintainer-editable source of the default table, converted at build
-time into `ba_tools_embed.h` (C array) and linked into the binary:
+`agentutils/tools.json` no longer exists in this repo and nothing is
+embedded in the binary. The **only** runtime source is
+`$BB_AGENT_HOME/tools.json`:
 
-```
-agentutils/tools.json --(build-time generator)--> ba_tools_embed.h --> busybox
-                                                                              |
-                                                  first run / broken file     | seed + fallback
-                                                                              v
-                                                     $BB_AGENT_HOME/tools.json   <- runtime truth
-                                                                    (user-editable; delete to re-seed)
-```
+- `busyagent -i [PATH]` exports a starter table (ls/head/tail/wc/stat),
+  creating parent dirs, refusing to overwrite;
+- dynamic entries are appended to the 11 builtins (builtin names may
+  not be shadowed; skipped with a warning);
+- a missing or broken file just means "dynamic zone empty" — the 11
+  builtins keep the agent fully capable.
 
-Rationale: a bare busybox binary must work with zero external files
-(busybox philosophy), so the default must be embedded somewhere; a JSON
-source file is just the maintainable form of that embedding.
+## Tools: 11 builtins + a dynamic sugar zone
 
-## Tool layers (four-level model)
+Builtin tools are compiled in and cannot be shadowed by tools.json.
+The boundary is deliberate: a builtin is either a meta-operation on the
+agent's own state space, the execution anchor, or a content transfer
+that needs C logic. Names deliberately match mainstream-agent training
+vocabulary (Read/Write/Edit/Bash/Glob/Grep/TodoWrite/PlanConfirm/
+PlanClear/Skill/SubAgent); the Bash description names the busybox sh
+base honestly.
 
-| Layer | Tools | Mechanism |
+| Group | Builtins | Mechanism |
 |---|---|---|
-| L0 primitive | cat, head, tail, ls, grep, find | exec mapping → one fork + `run_nofork_applet()` (or exec) |
-| L1 program | sh (was "Bash") | exec mapping → sh -c: pipelines/loops/any applet; with FEATURE_PREFER_APPLETS the shell dispatches applets in-process |
-| L2 knowledge | Skill | **builtin reserved name** (no `exec` field): reads `$BB_AGENT_HOME/skills/<name>/SKILL.md`, full text returned as tool_result — in-context learning, no prompt surgery |
-| L3 delegation | SubAgent | **builtin reserved name**: self-bootstrapping — fork+exec `busyagent --new <prompt>` with config passed via `BB_AGENT_*` env; child output captured as tool_result |
+| content | Read (offset/limit, cat -n), Write, Edit (exact-once) | pure C |
+| execution | Bash | sh -c on busybox sh; background=true detaches to a task log |
+| index/delegate | Glob (find -name), Grep (grep -nHr --include) | busybox applets |
+| state | TodoWrite | checklist as tool_result; conversation history IS the state |
+| state | PlanConfirm / PlanClear | plan.draft -> plan.md; current plan injected into system prompt |
+| knowledge | Skill | SKILL.md loaded from cwd/skills > ~/.agents/skills > $BB_AGENT_HOME/skills |
+| delegate | SubAgent | self-bootstrapping fork+exec `busyagent --new`, env-passed config |
 
-tools.json entries route by shape: entries with `exec` run through the
-applet/argv-template path (the user-customizable zone: exposure
-cutting, parameter shaping); entries whose name matches a builtin
-reserved name are handled natively by the turn loop. The default
-template ships all nine.
+Dynamic zone ($BB_AGENT_HOME/tools.json via `busyagent -i`) carries
+world-operation primitives only (default sample: ls/head/tail/wc/stat).
+Names may not shadow builtins (skipped with warning). Deleting the file
+removes nothing essential: every dynamic entry is expressible through
+Bash.
 
 Each tool entry carries an `exec` mapping that never reaches the LLM
 (stripped by `ba_tools_json()`):

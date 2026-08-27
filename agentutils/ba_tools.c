@@ -28,6 +28,7 @@
 #include "ba_json.h"
 #include "ba_transport.h"
 #include "ba_store.h"
+#include "ba_prompt.h"
 #include "ba_tools.h"
 #include "ba_builtin_schemas.h"
 
@@ -479,19 +480,72 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 
 	if (strcmp(name, "Bash") == 0) {
 		char *cmd = json_get_string(jp.val, "command");
-		char *sh_argv[4];
-		int tmo = json_get_int(jp.val, "timeout_ms");
+		int background = json_get_bool(jp.val, "background", false);
+		int tmo_sec = json_get_int(jp.val, "timeout");
+		int tmo_ms = json_get_int(jp.val, "timeout_ms");
+
 		if (!cmd || !cmd[0]) {
 			sb_append(&sb, "Error: Bash requires 'command'");
 			free(cmd);
 			return sb.data;
 		}
-		sh_argv[0] = (char *)"sh";
-		sh_argv[1] = (char *)"-c";
-		sh_argv[2] = cmd;
-		sh_argv[3] = NULL;
-		status = run_captured("sh", sh_argv, &out, &err, tmo > 0 ? tmo : timeout_ms);
-		result_wrap(&sb, status, &out, &err);
+
+		if (background) {
+			/* nohup 式脱离：双 fork 免僵尸，输出写日志文件，
+			 * 返回 task_id 与日志路径供后续 Read/cat 查看 */
+			static unsigned bg_seq = 0;
+			const char *bh = getenv("BB_AGENT_HOME");
+			char tid[40], *logpath, *logdir;
+			pid_t p1 = fork();
+
+			if (p1 < 0) {
+				sb_append(&sb, "Error: failed to start background command");
+				free(cmd);
+				return sb.data;
+			}
+			if (p1 == 0) {
+				pid_t p2 = fork();   /* 双 fork：孙进程由 init 收养 */
+				if (p2 == 0) {
+					snprintf(tid, sizeof(tid), "task_%u_%d",
+					         (unsigned)time(NULL), ++bg_seq);
+					logpath = xasprintf("%s/tasks/%s.log", bh, tid);
+					close(0);
+					xmove_fd(xopen("/dev/null", O_RDONLY), STDIN_FILENO);
+					xmove_fd(xopen3(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644), STDOUT_FILENO);
+					xmove_fd(dup(STDOUT_FILENO), STDERR_FILENO);
+					execl(bb_busybox_exec_path, "sh", "sh", "-c", cmd, (char *)NULL);
+					_exit(127);
+				}
+				_exit(0);   /* 中间子进程立即退出，父进程 waitpid 回收 */
+			}
+			waitpid(p1, &status, 0);
+
+			logdir = xasprintf("%s/tasks", bh);
+			bb_make_directory(logdir, 0755, FILEUTILS_RECUR);
+			sb_appendf(&sb,
+			           "Started in background. Read its output later with "
+			           "Read(path=\"%s\"). Log file: %s.log",
+			           logpath, tid);
+			free(logpath); free(logdir);
+			free(cmd);
+			return sb.data;
+		}
+
+		{
+			char *sh_argv[4];
+			int tmo = tmo_ms;
+			if (!tmo && tmo_sec > 0)
+				tmo = tmo_sec * 1000;   /* bash-agent 秒制参数兼容 */
+			if (!tmo)
+				tmo = timeout_ms;
+
+			sh_argv[0] = (char *)"sh";
+			sh_argv[1] = (char *)"-c";
+			sh_argv[2] = cmd;
+			sh_argv[3] = NULL;
+			status = run_captured("sh", sh_argv, &out, &err, tmo);
+			result_wrap(&sb, status, &out, &err);
+		}
 		free(cmd);
 		free(out.data);
 		free(err.data);
@@ -644,18 +698,23 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 	if (strcmp(name, "Grep") == 0) {
 		char *pattern = json_get_string(jp.val, "pattern");
 		char *gpath = json_get_string(jp.val, "path");
+		char *glob_f = json_get_string(jp.val, "glob");
 		int ctx = json_get_int(jp.val, "context");
 		char ctxs[16];
-		char *ctx_dup = NULL;
-		char *gv[9];
+		char *ctx_dup = NULL, *inc_dup = NULL;
+		char *gv[12];
 		int gi = 0;
 
 		if (!pattern || !pattern[0]) {
 			sb_append(&sb, "Error: Grep requires 'pattern'");
-			free(pattern); free(gpath);
+			free(pattern); free(gpath); free(glob_f);
 			return sb.data;
 		}
 		gv[gi++] = (char *)"grep";
+		if (glob_f && glob_f[0]) {
+			inc_dup = xasprintf("--include=%s", glob_f);
+			gv[gi++] = inc_dup;
+		}
 		if (ctx > 0) {
 			snprintf(ctxs, sizeof(ctxs), "-%d", ctx);
 			ctx_dup = xstrdup(ctxs);
@@ -724,44 +783,34 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 	}
 
 	if (strcmp(name, "Skill") == 0) {
-		/* L2 知识级：按路径优先级搜索技能包，全文作为 tool_result 回喂。
-		 * 搜索序（先命中先用，通用 agent 目录，不绑定特定工具）：
-		 *   1. $CWD/skills/<name>/SKILL.md           项目级
-		 *   2. $HOME/.agents/skills/<name>/SKILL.md  用户级
-		 *   3. $BB_AGENT_HOME/skills/<name>/SKILL.md busyagent 自有 */
+		/* L2 知识级：经 ba_load_skill 统一搜索
+		 * cwd/skills > ~/.agents/skills > $BB_AGENT_HOME/skills，
+		 * 支持 ${BA_AGENT_SKILL_DIR} 占位符替换 */
 		char *skill = json_get_string(jp.val, "name");
-		char *cwd = xrealloc_getcwd_or_warn(NULL);
-		const char *home = getenv("HOME");
+		const char *agents_home = getenv("HOME");
 		const char *bag_home = getenv("BB_AGENT_HOME");
-		char *data = NULL, *found = NULL;
-		char *cands[3];
-		int i, n = 0;
+		char *cwd = xrealloc_getcwd_or_warn(NULL);
+		char *content;
 
 		if (!skill || !skill[0]) {
 			sb_append(&sb, "Error: Skill requires 'name'");
 			free(skill); free(cwd);
 			return sb.data;
 		}
-		if (cwd) cands[n++] = xasprintf("%s/skills/%s/SKILL.md", cwd, skill);
-		if (home && home[0]) cands[n++] = xasprintf("%s/.agents/skills/%s/SKILL.md", home, skill);
-		cands[n++] = xasprintf("%s/skills/%s/SKILL.md",
-				       (bag_home && bag_home[0]) ? bag_home : "/tmp/busyagent", skill);
-
-		for (i = 0; i < n && !data; i++) {
-			data = read_file_all(cands[i]);
-			if (data) found = cands[i];
-		}
-		if (data && data[0]) {
-			sb_appendf(&sb, "Skill: %s (from %s)\n\n", skill, found);
-			sb_append(&sb, data);
-		} else {
-			sb_appendf(&sb, "Error: skill '%s' not found "
-				     "(searched cwd/skills, ~/.agents/skills, $BB_AGENT_HOME/skills)", skill);
-		}
-		for (i = 0; i < n; i++) free(cands[i]);
-		free(data);
-		free(skill);
+		content = ba_load_skill(skill, cwd,
+					(agents_home && agents_home[0]) ? agents_home : NULL,
+					bag_home ? bag_home : "/tmp/busyagent",
+					NULL);
 		free(cwd);
+		if (!content) {
+			sb_appendf(&sb, "Error: skill '%s' not found "
+				     "(searched $CWD/skills, ~/.agents/skills, $BB_AGENT_HOME/skills)", skill);
+			free(skill);
+			return sb.data;
+		}
+		sb_append(&sb, content);
+		free(content);
+		free(skill);
 		return sb.data;
 	}
 
