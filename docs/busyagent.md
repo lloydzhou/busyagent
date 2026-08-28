@@ -105,6 +105,21 @@ model as errors.
   public LLM API) on a trusted LAN, or accept the risk on networks you
   control.
 
+## CJK input in the interactive REPL
+
+Correct CJK echo/backspace/column handling in the lineedit REPL requires
+two upstream busybox options that are **not** busyagent's to flip:
+
+```
+CONFIG_LAST_SUPPORTED_WCHAR=196607
+CONFIG_UNICODE_WIDE_WCHARS=y
+```
+
+busyagent keeps the upstream defaults (767 / off) untouched; enable these
+in your build config when you need the CJK REPL (the reference packaging
+does). Without them, multibyte input beyond the supported range is
+substituted with `?` by standard busybox behavior.
+
 ## Known limitations
 
 - The built-in TLS path does not authenticate the server (see above); it
