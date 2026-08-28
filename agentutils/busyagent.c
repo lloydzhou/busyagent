@@ -12,7 +12,7 @@
  * Licensed under GPLv2, see file LICENSE in this source tree.
  */
 //config:config BUSYAGENT
-//config:	bool "busyagent"
+//config:	bool "busyagent (223 kb)"
 //config:	default y
 //config:	select FEATURE_PREFER_APPLETS
 //config:	select FEATURE_EDITING
@@ -743,6 +743,13 @@ static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
 	}
 }
 
+static volatile sig_atomic_t g_interrupted;
+
+static void ba_sigint_handler(int sig UNUSED_PARAM)
+{
+	g_interrupted = 1;
+}
+
 /* ---- 会话运行体：等价 bash-agent 的 agent_loop(Agent*, prompt, role) ---- */
 static int ba_run_session(BaRunCtx *ctx)
 {
@@ -853,9 +860,11 @@ static int ba_run_session(BaRunCtx *ctx)
 			sse_accum_init(&tctx.accum);
 			accum = &tctx.accum;
 
+			g_interrupted = 0;
 			sse_rc = http_post_sse(api_url, headers, hdr_count,
 					       body, strlen(body), provider,
-					       ba_sse_callback, &tctx, NULL);
+					       ba_sse_callback, &tctx,
+					       (volatile int *)&g_interrupted);
 			free(body);
 			{
 				int i;
@@ -863,6 +872,8 @@ static int ba_run_session(BaRunCtx *ctx)
 				free(lines);
 			}
 
+			if (g_interrupted)
+				sse_rc = 0;   /* cancelled: not an error, stop quietly */
 			if (sse_rc != 0 || accum->error) {
 				/* SSE_ERROR 回调已渲染过时不重复（json 流/trace 双份） */
 				if (!accum->error)
@@ -982,6 +993,21 @@ static int ba_run_session(BaRunCtx *ctx)
 				sse_accum_free(accum);
 				continue;   /* next model turn */
 			}
+
+			/* per-turn stats persistence: counts and token totals
+			 * (the aggregation bash-agent does in agent_loop) */
+			store_stats_set_int_file(paths.stats, "current_turn_count",
+				store_stats_get_int_file(paths.stats, "current_turn_count") + 1);
+			store_stats_set_int_file(paths.stats, "agent_request_count",
+				store_stats_get_int_file(paths.stats, "agent_request_count") + 1);
+			store_stats_set_int_file(paths.stats, "total_input_tokens",
+				store_stats_get_int_file(paths.stats, "total_input_tokens") + accum->in_tokens);
+			store_stats_set_int_file(paths.stats, "total_output_tokens",
+				store_stats_get_int_file(paths.stats, "total_output_tokens") + accum->out_tokens);
+			store_stats_set_int_file(paths.stats, "total_cache_read_tokens",
+				store_stats_get_int_file(paths.stats, "total_cache_read_tokens") + accum->cache_read_tokens);
+			store_stats_set_int_file(paths.stats, "total_cache_creation_tokens",
+				store_stats_get_int_file(paths.stats, "total_cache_creation_tokens") + accum->cache_creation_tokens);
 
 			/* final assistant message */
 			store_conv_add_assistant(paths.conversation,
@@ -1136,7 +1162,8 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	}
 
 	{
-		signal(SIGPIPE, SIG_IGN);   /* cagent.c 同款：HTTP/pipe 写入半关闭时不致死于默认行为 */
+		signal(SIGPIPE, SIG_IGN);   /* as in cagent.c: survive half-closed writes */
+		signal(SIGINT, ba_sigint_handler);   /* Ctrl+C interrupts the running turn */
 	}
 	if (!argv[0]) {
 		if (isatty(STDIN_FILENO)) {

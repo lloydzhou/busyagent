@@ -8,6 +8,10 @@
  */
 #include "busyagent.h"
 #include "ba_builtin_schemas.h"
+/* everything below leans on libbb (xmalloc_read, full_write,
+ * bb_make_directory, lineedit, ...) - include it once up front */
+#include "libbb.h"
+#include "busybox.h"
 
 /* ==== ba_util.c ==== */
 #include <stdio.h>
@@ -220,24 +224,8 @@ char *util_path_join(const char *a, const char *b) {
 }
 
 int util_mkdirs(const char *path, int mode) {
-    char *tmp = util_strdup(path);
-    if (!tmp) return -1;
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
-                free(tmp);
-                return -1;
-            }
-            *p = '/';
-        }
-    }
-    if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
-        free(tmp);
-        return -1;
-    }
-    free(tmp);
-    return 0;
+	/* bb_make_directory: recursive mkdir, 0 on success (EEXIST ok) */
+	return bb_make_directory((char *)path, mode, FILEUTILS_RECUR);
 }
 
 const char *util_home_dir(void) {
@@ -846,7 +834,6 @@ void json_obj_iter_cleanup(JsonObjectIter *it) {
  *
  * Licensed under GPLv2, see file LICENSE in this source tree.
  */
-#include "libbb.h"
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -973,17 +960,7 @@ static int send_all_conn(tls_state_t *tls, int fd, const char *buf, size_t len)
 
 static int send_all(int fd, const char *buf, size_t len)
 {
-	size_t off = 0;
-	while (off < len) {
-		ssize_t n = send(fd, buf + off, len - off, 0);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		off += n;
-	}
-	return 0;
+	return full_write(fd, buf, len) == (ssize_t)len ? 0 : -1;
 }
 
 typedef struct {
@@ -2027,6 +2004,19 @@ int store_stats_get_file_int(const char *path, const char *key) {
 /* 设置 stats 文件中的整数字段。
  * 读取已有字段；缺失/无效字段按 0 处理；写回标准 stats JSON。
  * 这样旧版本缺字段时，下一次正常写入会自然补齐，不做历史回算。 */
+int store_stats_get_int_file(const char *path, const char *key)
+{
+	char *txt = store_stats_read(path);
+	JsonParse jp;
+	int v = 0;
+	if (!txt) return 0;
+	jp = json_parse_root(txt);
+	if (!jp.error)
+		v = store_stats_get_int(jp.val, key);
+	free(txt);
+	return v;
+}
+
 void store_stats_set_int_file(const char *path, const char *key, int value) {
     int current_turn_count = 0, agent_request_count = 0;
     int compact_request_count = 0, sub_agent_request_count = 0;
@@ -2187,7 +2177,6 @@ int store_plan_clear(const SessionPaths *p) {
  *
  * Licensed under GPLv2, see file LICENSE in this source tree.
  */
-#include "libbb.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -2437,7 +2426,24 @@ char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
             if (ds->prev_was_thinking && ds->last_char[0] != '\n')
                 lw_write("\n", 1);
             ds->prev_was_thinking = 0;
-            lw_printf("%s\n", msg->content);
+            /* bash-agent display.c:222-236 - Edit prints in full; Read and
+             * Write show only the first line (whole files stay out of the
+             * terminal) */
+            if (msg->tool_name && strcmp(msg->tool_name, "Edit") == 0) {
+                lw_printf("%s\n", msg->content);
+            } else if (msg->tool_name
+                    && (strcmp(msg->tool_name, "Read") == 0
+                     || strcmp(msg->tool_name, "Write") == 0)) {
+                const char *nl = strchr(msg->content, '\n');
+                if (nl) {
+                    lw_write(msg->content, (size_t)(nl - msg->content));
+                    lw_write("\n", 1);
+                } else {
+                    lw_printf("%s\n", msg->content);
+                }
+            } else {
+                lw_printf("%s\n", msg->content);
+            }
             ds->last_char[0] = '\n';
         }
         break;
@@ -3770,7 +3776,6 @@ char *convert_to_responses(const char *claude_body) {
  *
  * Licensed under GPLv2, see file LICENSE in this source tree.
  */
-#include "libbb.h"
 #include <dirent.h>
 #include <sys/utsname.h>
 
@@ -4228,7 +4233,6 @@ char *ba_build_prompt(const BaPromptCtx *ctx) {
  *
  * Licensed under GPLv2, see file LICENSE in this source tree.
  */
-#include "libbb.h"
 #include "busybox.h"   /* for APPLET_IS_NOFORK */
 #include <signal.h>
 #include <sys/wait.h>
@@ -4253,18 +4257,11 @@ static const SessionPaths *g_paths;   /* 内置状态工具（Plan*）的会话�
 
 static char *read_file_all(const char *path)
 {
-	long sz;
-	char *buf;
 	int fd = open(path, O_RDONLY);
+	char *buf;
 	if (fd < 0)
 		return NULL;
-	sz = xlseek(fd, 0, SEEK_END);
-	xlseek(fd, 0, SEEK_SET);
-	buf = xzalloc(sz + 1);
-	sz = full_read(fd, buf, sz);
-	if (sz < 0)
-		sz = 0;
-	buf[sz] = '\0';
+	buf = xmalloc_read(fd, NULL);   /* libbb: allocates and NUL-terminates */
 	close(fd);
 	return buf;
 }

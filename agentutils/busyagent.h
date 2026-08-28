@@ -322,6 +322,7 @@ void store_stats_set_int(JsonVal obj, const char *key, int value);
 /* 简易文件级操作：直接读写 stats 文件中的整数字段 */
 int store_stats_get_file_int(const char *path, const char *key);
 void store_stats_set_int_file(const char *path, const char *key, int value);
+int store_stats_get_int_file(const char *path, const char *key);
 
 void store_event_set_stream_json(int enabled);
 int store_event_stream_json_enabled(void);
