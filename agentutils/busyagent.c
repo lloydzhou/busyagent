@@ -181,6 +181,10 @@ static void ba_sse_callback(void *ctx, const SseEvent *evt)
 		dm.type = BA_DM_TEXT;
 		dm.content = (char *)evt->content;
 		ba_push_display(t, &dm);
+	} else if (evt->type == SSE_THINKING) {
+		dm.type = BA_DM_THINKING;
+		dm.content = (char *)evt->content;
+		ba_push_display(t, &dm);
 	} else if (evt->type == SSE_ERROR) {
 		dm.type = BA_DM_ERROR;
 		dm.content = (char *)(evt->content ? evt->content : "unknown error");

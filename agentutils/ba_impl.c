@@ -1328,7 +1328,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 		r.tls = tls;
 		(void)tls;
 		ba_send_request(tls, fd, &u, headers, header_count, body, body_len);
-			if (ba_read_header(&r) != 0) {
+		if (ba_read_header(&r) != 0) {
 			io_err = 1;
 			close(fd);
 			goto attempt_done;
@@ -2598,7 +2598,9 @@ static void parse_openai_sse_event(StreamCtx *sctx, const char *data, size_t dat
     if (jp.error) return;
 
     char *obj_type = json_get_string(jp.val, "object");
-    if (!obj_type || strcmp(obj_type, "chat.completion.chunk") != 0) {
+    /* strict only when the field is present: several OpenAI-compatible
+     * gateways omit "object" on stream chunks */
+    if (obj_type && strcmp(obj_type, "chat.completion.chunk") != 0) {
         FREE_PTR(obj_type);
         return;
     }
