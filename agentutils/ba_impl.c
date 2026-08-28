@@ -387,6 +387,10 @@ static JsonParse parse_string(const char *src, size_t *pos) {
     while (src[*pos] && src[*pos] != '"') {
         if (src[*pos] == '\\') {
             (*pos)++; /* skip escaped char */
+            if (!src[*pos])
+                return make_err("unterminated escape sequence");
+            /* NB: without this check the second ++ below walks past the
+             * NUL terminator and the loop keeps reading out of bounds */
         }
         (*pos)++;
     }
@@ -845,6 +849,16 @@ void json_obj_iter_cleanup(JsonObjectIter *it) {
 #define BA_RETRY_MAX_TIME_MS  20000
 #define BA_TLS_RECHDR_LEN     5     /* TLS record header (networking/tls.c) */
 #define BA_TLS_APPDATA        23    /* RECORD_TYPE_APPLICATION_DATA */
+/* RFC 5246: a TLSPlaintext fragment carries at most 2^14 bytes, and the
+ * record layer may add up to 2^10 of compression overhead + cipher block
+ * padding. 18 KiB covers every legal decrypted application-data record:
+ * records larger than this are refused, never silently truncated. */
+#define BA_TLS_PLAIN_MAX      (18 * 1024)
+/* chunked transfer: sane upper bound for a single chunk size line value */
+#define BA_MAX_CHUNK_SIZE     (16 * 1024 * 1024)
+/* ba_read() polls in short slices so the cancelled flag is checked
+ * promptly instead of blocking for the full idle timeout */
+#define BA_POLL_SLICE_MS      250
 
 typedef struct {
 	char host[256];
@@ -969,10 +983,10 @@ typedef struct {
 	long content_length;      /* -1 if unknown */
 	long body_left;           /* for content_length mode */
 	long chunk_left;          /* for chunked mode */
-	int chunk_state;          /* 0=hex line, 1=data, 2=data CRLF, 3=done */
+	int chunk_state;          /* 0=size line, 1=data, 2=data CRLF, 3=trailers, 4=done */
 	int eof;
 	tls_state_t *tls;
-	char tls_plain[8192];
+	char tls_plain[BA_TLS_PLAIN_MAX];
 	int tls_plain_len;
 	int tls_plain_pos;
 	char hdr[BA_MAX_HEADER];
@@ -981,39 +995,63 @@ typedef struct {
 	int got_header;
 	char pending[4096];
 	size_t pending_len;
+	volatile int *cancelled;  /* checked between poll slices */
 } BaResp;
 
-/* Read more bytes into buf, honoring idle timeout. Returns n>0, 0 on EOF, -1 on error/timeout. */
+/* Read more bytes into buf, honoring idle timeout and the cancelled flag.
+ * Returns n>0, 0 on EOF, -1 on error/timeout/cancel. */
 static int ba_read(BaResp *r, char *buf, size_t bufsz)
 {
-	struct pollfd pfd;
-	int n;
+	int64_t deadline = (int64_t)monotonic_ms() + BA_READ_TIMEOUT_MS;
+	int fd;
 
-	pfd.fd = r->fd;
-	pfd.events = POLLIN;
-	#if ENABLE_TLS
-	if (r->tls) {
+#if ENABLE_TLS
+	if (r->tls)
+		fd = r->tls->ifd;
+	else
+#endif
+		fd = r->fd;
+
+	for (;;) {
 		struct pollfd pfd;
-		pfd.fd = r->tls->ifd;
-		pfd.events = POLLIN;
-		if (safe_poll(&pfd, 1, BA_READ_TIMEOUT_MS) <= 0)
-			return -1;
+		int pr;
 
+		if (r->cancelled && *(r->cancelled))
+			return -1;
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+		pr = safe_poll(&pfd, 1, BA_POLL_SLICE_MS);
+		if (pr > 0)
+			break;
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		/* poll slice timed out: re-check cancel/total-idle deadlines */
+		if ((int64_t)monotonic_ms() > deadline)
+			return -1;
+	}
+
+#if ENABLE_TLS
+	if (r->tls) {
 		while (r->tls_plain_len == 0) {
 			int tn = tls_xread_record(r->tls, "application data");
 			if (tn < 1)
 				return 0;   /* TLS EOF */
 			if (r->tls->inbuf[0] != BA_TLS_APPDATA)
 				return -1;
+			/* never truncate: a record beyond the protocol maximum
+			 * means the peer (or a MITM) misbehaves - fail loudly */
 			if (tn > (int)sizeof(r->tls_plain))
-				tn = (int)sizeof(r->tls_plain);
+				return -1;
 			memcpy(r->tls_plain, r->tls->inbuf + BA_TLS_RECHDR_LEN, tn);
 			r->tls_plain_len = tn;
 			r->tls_plain_pos = 0;
 		}
 		{
 			int give = r->tls_plain_len - r->tls_plain_pos;
-			if (give > bufsz)
+			if (give > (int)bufsz)
 				give = bufsz;
 			memcpy(buf, r->tls_plain + r->tls_plain_pos, give);
 			r->tls_plain_pos += give;
@@ -1025,25 +1063,16 @@ static int ba_read(BaResp *r, char *buf, size_t bufsz)
 		}
 	}
 #endif
-for (;;) {
-		if (safe_poll(&pfd, 1, BA_READ_TIMEOUT_MS) < 0) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR)))
-			return -1;   /* timeout */
-		break;
+	{
+		int n = safe_read(fd, buf, bufsz);
+		return n;   /* 0 = EOF */
 	}
-	n = safe_read(r->fd, buf, bufsz);
-	return n;   /* 0 = EOF */
 }
 
 /* Read and parse the response header. Returns 0 on success. */
 static int ba_read_header(BaResp *r)
 {
-	char *p, *end, *save;
-	size_t idx;
+	char *p, *end;
 
 	while (r->hdr_len < BA_MAX_HEADER - 1) {
 		char *hit;
@@ -1095,16 +1124,28 @@ static int ba_read_header(BaResp *r)
 	r->content_length = -1;
 	r->got_header = 1;
 
-	for (idx = 0, save = NULL; ; idx++, save = NULL) {
-		char *line = strtok_r(idx == 0 ? r->hdr : NULL, "\r\n", &save);
-		if (!line)
-			break;
-		str_tolower(line);   /* libbb in-place lowercase */
-		if (strncmp(line, "transfer-encoding:", 18) == 0
-		 && strstr(line, "chunked"))
-			r->chunked = 1;
-		else if (strncmp(line, "content-length:", 15) == 0)
-			r->content_length = atol(line + 15);
+	/* NB: keep one strtok_r state across the whole header - re-initialising
+	 * it per iteration made every call restart from the status line, so
+	 * Transfer-Encoding/Content-Length were never seen */
+	{
+		char *save = NULL;
+		char *line = strtok_r(r->hdr, "\r\n", &save);
+		while (line) {
+			str_tolower(line);   /* libbb in-place lowercase */
+			if (strncmp(line, "transfer-encoding:", 18) == 0
+			 && strstr(line, "chunked"))
+				r->chunked = 1;
+			else if (strncmp(line, "content-length:", 15) == 0) {
+				const char *v = line + 15;
+				while (*v == ' ' || *v == '\t')
+					v++;
+				/* digits only: junk or a negative value must not
+				 * drive body_left below zero */
+				if (*v >= '0' && *v <= '9')
+					r->content_length = atol(v);
+			}
+			line = strtok_r(NULL, "\r\n", &save);
+		}
 	}
 	if (r->chunked) {
 		r->chunk_state = 0;
@@ -1115,21 +1156,52 @@ static int ba_read_header(BaResp *r)
 	return 0;
 }
 
-/* Decode next piece of body into out (already de-chunked).
- * Returns n>0 data, 0 end of body, -1 error. */
-static int ba_body_read(BaResp *r, char *out, size_t outsz)
+/* Raw byte source for body decoding: bytes the header read already
+ * consumed come first, then the socket/TLS stream. Returns n>0, 0 EOF,
+ * -1 error/timeout/cancel. */
+static int resp_raw_read(BaResp *r, char *out, size_t outsz)
 {
 	if (r->pending_len > 0) {
 		size_t n = r->pending_len < outsz ? r->pending_len : outsz;
 		memcpy(out, r->pending, n);
 		r->pending_len -= n;
 		memmove(r->pending, r->pending + n, r->pending_len);
-		return n;
+		return (int)n;
 	}
-
 	if (r->eof)
 		return 0;
+	return ba_read(r, out, outsz);
+}
 
+/* strict hex chunk-size: digits only (no sign), bounded, no overflow.
+ * Accepts 0: the zero chunk is legal - it starts the trailer section. */
+static int parse_chunk_size_hex(const char *s, long *out)
+{
+	unsigned long v = 0;
+
+	if (!*s)
+		return -1;
+	for (; *s; s++) {
+		int d;
+		if (*s >= '0' && *s <= '9')      d = *s - '0';
+		else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
+		else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
+		else
+			return -1;   /* sign, space or extension junk */
+		if (v > (ULONG_MAX >> 4))
+			return -1;
+		v = (v << 4) | (unsigned long)d;
+	}
+	if (v > (unsigned long)BA_MAX_CHUNK_SIZE)
+		return -1;
+	*out = (long)v;
+	return 0;
+}
+
+/* Decode next piece of body into out (already de-chunked).
+ * Returns n>0 data, 0 end of body, -1 error. */
+static int ba_body_read(BaResp *r, char *out, size_t outsz)
+{
 	if (!r->chunked) {
 		int n;
 		size_t want = outsz;
@@ -1137,13 +1209,16 @@ static int ba_body_read(BaResp *r, char *out, size_t outsz)
 			if (r->body_left <= 0)
 				return 0;
 			if (want > (size_t)r->body_left)
-				want = r->body_left;
+				want = (size_t)r->body_left;
 		}
-		n = ba_read(r, out, want);
+		n = resp_raw_read(r, out, want);
 		if (n < 0)
 			return -1;
 		if (n == 0) {
 			r->eof = 1;
+			/* a fixed-length body cut short is an error, not EOF */
+			if (r->content_length >= 0 && r->body_left > 0)
+				return -1;
 			return 0;
 		}
 		if (r->content_length >= 0)
@@ -1151,12 +1226,21 @@ static int ba_body_read(BaResp *r, char *out, size_t outsz)
 		return n;
 	}
 
-	/* chunked: state machine over a small scratch window */
+	/* chunked: 0=size line, 1=chunk data, 2=CRLF after chunk data,
+	 * 3=trailer section after the zero chunk, 4=done.  The data-CRLF
+	 * and the trailer section are distinct states: collapsing them
+	 * (the old code) ended the body after the FIRST chunk. */
 	for (;;) {
-		if (r->chunk_state == 3)
+		char line[130];
+		size_t ln = 0;
+
+		if (r->chunk_state == 4)
 			return 0;   /* done */
 		if (r->chunk_state == 1) {
-			int n = ba_read(r, out, r->chunk_left < (long)outsz ? r->chunk_left : outsz);
+			int n;
+			size_t want = r->chunk_left < (long)outsz
+			            ? (size_t)r->chunk_left : outsz;
+			n = resp_raw_read(r, out, want);
 			if (n < 0)
 				return -1;
 			if (n == 0)
@@ -1166,41 +1250,48 @@ static int ba_body_read(BaResp *r, char *out, size_t outsz)
 				r->chunk_state = 2;
 			return n;
 		}
-		if (r->chunk_state == 0 || r->chunk_state == 2) {
-			/* read a line: hex size or trailing CRLF / trailer */
-			char line[128];
-			size_t ln = 0;
-			int c;
-			for (;;) {
-				char ch;
-				c = ba_read(r, &ch, 1);
-				if (c <= 0)
-					return -1;
-				if (ch == '\n')
-					break;
-				if (ln < sizeof(line) - 1 && ch != '\r')
-					line[ln++] = ch;
+		/* read one header line (size line, data CRLF or trailer) */
+		for (;;) {
+			char ch;
+			int c = resp_raw_read(r, &ch, 1);
+			if (c <= 0)
+				return -1;
+			if (ch == '\n')
+				break;
+			if (ch == '\r')
+				continue;   /* part of CRLF */
+			if (ln >= sizeof(line) - 1)
+				return -1;   /* size/trailer line too long */
+			line[ln++] = ch;
+		}
+		line[ln] = '\0';
+		if (r->chunk_state == 2) {
+			if (ln != 0)
+				return -1;   /* missing CRLF after chunk data */
+			r->chunk_state = 0;
+			continue;   /* next chunk size */
+		}
+		if (r->chunk_state == 3) {
+			if (ln == 0) {
+				r->chunk_state = 4;   /* end of trailer section */
+				return 0;
 			}
-			line[ln] = '\0';
-			if (r->chunk_state == 2) {
-				if (ln == 0)
-					r->chunk_state = 3;   /* final CRLF after last chunk */
-				/* else: trailer header line, keep consuming */
+			continue;   /* trailer field: keep consuming */
+		}
+		/* state 0: "HEX[;ext]" size line */
+		{
+			char *semi = strchr(line, ';');
+			long v;
+			if (semi)
+				*semi = '\0';
+			if (parse_chunk_size_hex(line, &v) != 0)
+				return -1;
+			if (v == 0) {
+				r->chunk_state = 3;   /* zero chunk: trailers follow */
 				continue;
 			}
-			/* state 0: hex size (possibly with ;ext) */
-			{
-				char *semi = strchr(line, ';');
-				if (semi)
-					*semi = '\0';
-			}
-			r->chunk_left = strtol(line, NULL, 16);
-			if (r->chunk_left == 0) {
-				r->chunk_state = 2;   /* last chunk; consume trailers + CRLF */
-				continue;
-			}
+			r->chunk_left = v;
 			r->chunk_state = 1;
-			continue;
 		}
 	}
 }
@@ -1238,7 +1329,14 @@ static void ba_send_request(tls_state_t *tls, int fd, const BaUrl *u, const char
 #if ENABLE_TLS
 /* https:// support: in-tree TLS state machine (networking/tls.c), the same
  * code ssl_client and wget use. Returns a handshaked session; the caller
- * owns it and free()s it with the socket. No certificate validation. */
+ * owns it and free()s it with the socket.
+ *
+ * SECURITY: the in-tree TLS client performs NO certificate-chain, validity,
+ * hostname, handshake-signature or Finished verification, and record MAC/tag
+ * checking is not implemented either (networking/tls.c upstream comments).
+ * A machine-in-the-middle can therefore finish a handshake with any
+ * self-signed certificate and read/inject traffic, including API keys.
+ * http_post_sse() prints a one-time warning so the trade-off is explicit. */
 static tls_state_t *ba_tls_connect(const char *host, int port)
 {
 	len_and_sockaddr *lsa;
@@ -1260,6 +1358,40 @@ static tls_state_t *ba_tls_connect(const char *host, int port)
 }
 #endif
 
+/* release the per-request TLS state (inbuf/outbuf/hsd allocations);
+ * the socket itself stays owned by the caller.  Compiled regardless of
+ * ENABLE_TLS so the pump can call it unconditionally (no-op there). */
+static void ba_tls_dispose(tls_state_t *tls)
+{
+	if (!tls)
+		return;
+#if ENABLE_TLS
+	free(tls->inbuf);
+	free(tls->outbuf);
+	free(tls->hsd);
+#endif
+	free(tls);
+}
+
+/* The in-tree TLS client (networking/tls.c) authenticates neither the peer
+ * nor the records: no certificate-chain, validity or hostname validation, no
+ * handshake-signature/Finished verification and no MAC/tag checking. HTTPS
+ * therefore works out of the box, but a machine in the middle controlling
+ * the network can impersonate the endpoint. We make that trade-off explicit:
+ * the connection is allowed, with a one-time warning on stderr. Point -u at
+ * a TLS-terminating gateway or a trusted network for API credentials. */
+static void ba_tls_notice(void)
+{
+	static int warned;
+
+	if (!warned) {
+		warned = 1;
+		bb_error_msg("WARNING: https: the built-in TLS client does not verify"
+			     " server certificates or hostnames - use a trusted network"
+			     " or a TLS-terminating gateway for API credentials.");
+	}
+}
+
 /* Streaming POST with SSE pump. Mirrors the old curl semantics:
  * up to 2 retries, 1s delay, 20s total retry window, retry on 5xx. */
 int http_post_sse(const char *url, const char **headers, int header_count,
@@ -1276,10 +1408,17 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 	if (ba_parse_url(url, &u) != 0)
 		return -1;
 
+	/* https:// works out of the box; the authentication trade-off of the
+	 * in-tree TLS client (see ba_tls_notice) is announced on stderr once.
+	 * This also covers the ENABLE_TLS=0 build, where an https URL would
+	 * otherwise fall through to a plaintext connect. */
+	if (u.is_https)
+		ba_tls_notice();
+
 	for (attempt = 0; attempt <= BA_MAX_RETRIES; attempt++) {
 		StreamCtx sctx;
 		BaResp r;
-		int fd;
+		int fd = -1;
 		tls_state_t *tls = NULL;
 		int io_err = 0, http_code = 0;
 
@@ -1303,11 +1442,14 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 		memset(&r, 0, sizeof(r));
 		r.fd = fd;
 		r.tls = tls;
+		r.cancelled = cancelled;
 		(void)tls;
 		ba_send_request(tls, fd, &u, headers, header_count, body, body_len);
 		if (ba_read_header(&r) != 0) {
 			io_err = 1;
 			close(fd);
+			ba_tls_dispose(tls);
+			tls = NULL;
 			goto attempt_done;
 		}
 		http_code = r.status;
@@ -1325,6 +1467,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 				/* cancelled */
 				sse_stream_free(&sctx);
 				close(fd);
+				ba_tls_dispose(tls);
 				{
 					SseEvent st;
 					memset(&st, 0, sizeof(st));
@@ -1336,6 +1479,8 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 			}
 		}
 		close(fd);
+		ba_tls_dispose(tls);
+		tls = NULL;
 
 		if (!io_err && http_code < 500) {
 			/* non-SSE JSON error bodies etc. */
@@ -1349,6 +1494,8 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 		/* 5xx or io error: fall through to retry logic */
 
 	attempt_done:
+		ba_tls_dispose(tls);
+		tls = NULL;
 		if (cancelled && *cancelled) {
 			SseEvent st;
 			memset(&st, 0, sizeof(st));
@@ -1368,7 +1515,15 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 			retry_evt.type = SSE_RETRY;
 			callback(ctx, &retry_evt);
 		}
-		sleep(1);
+		/* interruptible backoff: keep checking the cancelled flag so a
+		 * Ctrl-C during the wait does not wait out the full second */
+		{
+			int slept = 0;
+			while (slept < 1000 && !(cancelled && *cancelled)) {
+				usleep(50 * 1000);
+				slept += 50;
+			}
+		}
 	}
 	return -1;
 }
@@ -1457,7 +1612,7 @@ SessionPaths store_session_paths_for(const char *home, const char *cwd, const ch
     StrBuf buf;
     sb_init(&buf);
 
-    /* base_dir = $BB_AGENT_HOME/projects/<key> */
+    /* base_dir = $BA_HOME/projects/<key> */
     sb_appendf(&buf, "%s/projects/%s", home, key);
     p.base_dir = util_strdup(buf.data);
 
@@ -3768,7 +3923,7 @@ char *convert_to_responses(const char *claude_body) {
  * tags and section text are kept identical; adaptations are limited to:
  *   - agent identity string: bash-agent -> busyagent
  *   - skill dirs: .claude/skills dropped, replaced by generic agent dirs
- *     (cwd/skills, ~/.agents/skills, $BB_AGENT_HOME/skills)
+ *     (cwd/skills, ~/.agents/skills, $BA_HOME/skills)
  *   - Bash background / SubAgent sync guidance lines match busyagent's
  *     actual single-turn semantics
  *
@@ -4215,7 +4370,7 @@ char *ba_build_prompt(const BaPromptCtx *ctx) {
 /*
  * ba_tools - table-driven tool execution for busyagent
  *
- * Tool definitions live in $BB_AGENT_HOME/tools.json — the only source,
+ * Tool definitions live in $BA_HOME/tools.json — the only source,
  * never embedded in the binary. A sample lives at scripts/tools.example.json.
  * Each
  * tool carries an "exec" mapping: {"applet": "grep", "argv": ["-nH", "-e",
@@ -4266,11 +4421,15 @@ static char *read_file_all(const char *path)
 	return buf;
 }
 
-/* Parse one tools JSON text into the global table. Returns 0 on success. */
+/* Parse one tools JSON text into the global table. Returns 0 on success.
+ * Every entry must carry a non-empty name and a well-formed exec mapping
+ * (exec.applet: non-empty string, exec.argv: array of strings) - malformed
+ * entries are rejected here instead of crashing later at execution time
+ * (a non-string argv template would dereference NULL in expand_token). */
 static int ba_tools_parse(const char *json)
 {
 	JsonParse jp = json_parse_root(json);
-	JsonVal arr, item;
+	JsonVal arr;
 	int n, i;
 
 	if (jp.error)
@@ -4281,34 +4440,68 @@ static int ba_tools_parse(const char *json)
 		return -1;
 
 	g_tools = xzalloc(n * sizeof(BaTool));
-	g_tool_count = n;
+	g_tool_count = 0;
 
 	for (i = 0; i < n; i++) {
-		JsonVal exec, argv_val;
-		int an, j;
+		JsonVal item, exec, argv_val, fnv;
+		BaTool *t = &g_tools[g_tool_count];
+		int an, j, bad = 0;
 
 		item = json_array_get(arr, i);
-		{
-			JsonVal fnv = json_get(item, "function");
-			g_tools[i].name = (fnv.type != JSON_NULL)
-					? json_get_string(fnv, "name")
-					: json_get_string(item, "name");
-		}
+		fnv = json_get(item, "function");
+		t->name = (fnv.type != JSON_NULL)
+			? json_get_string(fnv, "name")
+			: json_get_string(item, "name");
 		exec = json_get(item, "exec");
-		g_tools[i].applet = json_get_string(exec, "applet");
 		argv_val = json_get(exec, "argv");
-		an = json_array_len(argv_val);
-		if (an > 0) {
-			g_tools[i].argv_tpl = xzalloc(an * sizeof(char *));
-			g_tools[i].argv_count = an;
-			for (j = 0; j < an; j++)
-				g_tools[i].argv_tpl[j] = json_string_val(json_array_get(argv_val, j));
+		if (exec.type == JSON_OBJECT)
+			t->applet = json_get_string(exec, "applet");
+		an = (argv_val.type == JSON_ARRAY) ? json_array_len(argv_val) : 0;
+
+		if (!t->name || !t->name[0]) {
+			bb_error_msg("tools.json: entry %d: missing tool name, skipped", i);
+			bad = 1;
+		} else if (exec.type != JSON_OBJECT
+		 || !t->applet || !t->applet[0]) {
+			bb_error_msg("tools.json: entry '%s': exec.applet missing, skipped", t->name);
+			bad = 1;
 		}
+		if (!bad && an > 0) {
+			t->argv_tpl = xzalloc(an * sizeof(char *));
+			t->argv_count = an;
+			for (j = 0; j < an; j++) {
+				JsonVal av = json_array_get(argv_val, j);
+				if (av.type != JSON_STRING) {
+					bb_error_msg("tools.json: entry '%s': exec.argv[%d]"
+						     " is not a string, skipped", t->name, j);
+					bad = 1;
+					break;
+				}
+				t->argv_tpl[j] = json_string_val(av);
+			}
+		}
+		if (bad) {
+			free(t->name);
+			free(t->applet);
+			if (t->argv_tpl) {
+				for (j = 0; j < t->argv_count; j++)
+					free(t->argv_tpl[j]);
+				free(t->argv_tpl);
+			}
+			memset(t, 0, sizeof(*t));
+			continue;
+		}
+		g_tool_count++;
+	}
+	if (g_tool_count == 0) {
+		free(g_tools);
+		g_tools = NULL;
+		return -1;
 	}
 	return 0;
 }
 
-/* Load tools from $BB_AGENT_HOME/tools.json. The file is the only
+/* Load tools from $BA_HOME/tools.json. The file is the only
  * source: nothing is embedded in the binary. Missing or broken file
  * means "no tools" — plain Q&A still works, requests just omit tools. */
 void ba_tools_set_paths(const SessionPaths *paths)
@@ -4370,6 +4563,46 @@ static char *val_span_dup(const char *src, JsonVal v)
     return s;
 }
 
+/* Append one dynamic tool entry to the LLM-visible tools array.
+ * The internal "exec" mapping (applet + argv template) is host-side only:
+ * the request is rebuilt from the public fields so the model can neither
+ * see nor influence how the tool dispatches. */
+static void tools_json_append_entry(StrBuf *sb, const char *src, JsonVal item)
+{
+    JsonVal fnv = json_get(item, "function");
+    int is_fn = (fnv.type != JSON_NULL);
+    JsonVal body = is_fn ? fnv : item;
+    JsonVal namev = json_get(body, "name");
+    JsonVal descv = json_get(body, "description");
+    JsonVal schemav = json_get(body, is_fn ? "parameters" : "input_schema");
+    char *span;
+
+    if (namev.type != JSON_STRING)
+        return;   /* caller already reported unnamed entries */
+
+    sb_append(sb, ",\n  ");
+    if (is_fn)
+        sb_append(sb, "{\"type\":\"function\",\"function\":{\"name\":");
+    else
+        sb_append(sb, "{\"name\":");
+    span = val_span_dup(src, namev);   /* includes the quotes */
+    sb_append(sb, span);
+    free(span);
+    if (descv.type == JSON_STRING) {
+        sb_append(sb, ",\"description\":");
+        span = val_span_dup(src, descv);
+        sb_append(sb, span);
+        free(span);
+    }
+    if (schemav.type == JSON_OBJECT) {
+        sb_append(sb, is_fn ? ",\"parameters\":" : ",\"input_schema\":");
+        span = val_span_dup(src, schemav);
+        sb_append(sb, span);
+        free(span);
+    }
+    sb_append(sb, is_fn ? "}}" : "}");
+}
+
 /* The tools array as the LLM sees it (exec stripped).
  * NULL when no table: the caller omits tools from the request. */
 /* LLM-visible tools = 11 builtins + dynamic zone (exec stripped).
@@ -4407,15 +4640,8 @@ char *ba_tools_json(void)
                 free(nm);
                 continue;
             }
-            {
-                /* OpenAI function shape: append the entry verbatim so
-                 * descriptions/parameters survive byte-for-byte */
-                char *span = val_span_dup(src, item);
-                sb_append(&sb, ",\n  ");
-                sb_append(&sb, span);
-                free(span);
-                free(nm);
-            }
+            tools_json_append_entry(&sb, src, item);
+            free(nm);
         }
         sb_append(&sb, "]\n");
     }
@@ -4450,7 +4676,11 @@ int ba_tools_write_template(const char *path)
 		const char *b = ba_builtin_schemas;
 		size_t bl = strlen(b);
 		/* strip the trailing "]" of the builtin array, then close with a
-		 * worked custom entry so the file is one valid JSON array */
+		 * worked custom entry so the file is one valid JSON array. The
+		 * entry MUST carry an exec mapping (applet + argv template) -
+		 * without it the tool would be offered to the model but fail
+		 * at execution time. $name placeholders expand from the model's
+		 * input JSON at call time. */
 		static const char tail[] =
 			",\n"
 			"  {\n"
@@ -4458,8 +4688,12 @@ int ba_tools_write_template(const char *path)
 			"    \"description\": \"Example custom entry - edit or remove.\",\n"
 			"    \"input_schema\": {\n"
 			"      \"type\": \"object\",\n"
-			"      \"properties\": { \"cmd\": { \"type\": \"string\" } },\n"
-			"      \"required\": [\"cmd\"]\n"
+			"      \"properties\": { \"pattern\": { \"type\": \"string\" } },\n"
+			"      \"required\": [\"pattern\"]\n"
+			"    },\n"
+			"    \"exec\": {\n"
+			"      \"applet\": \"grep\",\n"
+			"      \"argv\": [\"-rl\", \"-e\", \"$pattern\", \".\"]\n"
 			"    }\n"
 			"  }]\n";
 		if (bl < 2 || full_write(fd, b, bl - 2) < 0
@@ -4673,59 +4907,22 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 		}
 
 		if (background) {
-			/* Mirrors async_bash_thread_fn: mkstemp captures stdout/stderr,
-			 * setpgid isolates the group, returns task_id immediately.
-			 * Difference: bash-agent re-injects via msgqueue;
-			 * single-turn has no such channel, the model Reads the file later. */
-			char tmp_template[] = "/tmp/ba_async_bash_XXXXXX";
-			int tmpfd = mkstemp(tmp_template);
-			pid_t pid;
-			char tid[80], resp[512];
-
-			if (tmpfd < 0) {
-				sb_append(&sb, "Error: failed to create temp file for background command");
+			/* One registered implementation only (ba_background_spawn in
+			 * busyagent.c): task gets a task_id + hard deadline, its log
+			 * is RLIMIT_FSIZE-capped, and ba_drain_background reaps it
+			 * and injects the result. The previous second, unregistered
+			 * double-fork variant here leaked processes, temp files and
+			 * could never report completion. */
+			if (!cmd[0]) {
+				sb_append(&sb, "Error: no command provided");
 				free(cmd);
 				return sb.data;
 			}
-
-			snprintf(tid, sizeof(tid), "task_%u_%d",
-			         (unsigned)time(NULL), (int)getpid());
-			pid = fork();
-			if (pid < 0) {
-				sb_append(&sb, "Error: failed to fork background command");
-				close(tmpfd);
-				free(cmd);
-				return sb.data;
+			{
+				char *resp = ba_background_spawn(cmd);
+				sb_append(&sb, resp);
+				free(resp);
 			}
-			if (pid == 0) {
-				/* double fork: init adopts the grandchild */
-				pid_t pid2 = fork();
-				if (pid2 == 0) {
-					setpgid(0, 0);
-					{
-						int devnull = open("/dev/null", O_RDONLY);
-						if (devnull >= 0) {
-							dup2(devnull, STDIN_FILENO);
-							close(devnull);
-						}
-						dup2(tmpfd, STDOUT_FILENO);
-						dup2(tmpfd, STDERR_FILENO);
-						close(tmpfd);
-						execl(bb_busybox_exec_path, "sh", "-c", cmd, (char *)NULL);
-						_exit(127);
-					}
-				}
-				_exit(0);   /* the middle generation exits */
-			}
-			setpgid(pid, pid);
-			close(tmpfd);
-			while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
-				continue;   /* reap only the middle child */
-
-			snprintf(resp, sizeof(resp),
-			         "Async task started: task_id=%s. Output file (read it with "
-			         "Read when needed): %s", tid, tmp_template);
-			sb_append(&sb, resp);
 			free(cmd);
 			return sb.data;
 		}
@@ -4881,6 +5078,13 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 			free(pattern); free(gpath);
 			return sb.data;
 		}
+		/* path becomes find(1)'s positional root argument: a leading '-'
+		 * would be parsed as an option/action (e.g. "-delete", "-exec") */
+		if (gpath && gpath[0] == '-') {
+			sb_append(&sb, "Error: Glob 'path' must not start with '-'");
+			free(pattern); free(gpath);
+			return sb.data;
+		}
 		gv[gi++] = (char *)"find";
 		gv[gi++] = (gpath && gpath[0]) ? gpath : (char *)".";
 		gv[gi++] = (char *)"-name";
@@ -4906,6 +5110,13 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 
 		if (!pattern || !pattern[0]) {
 			sb_append(&sb, "Error: Grep requires 'pattern'");
+			free(pattern); free(gpath); free(glob_f);
+			return sb.data;
+		}
+		/* same option-injection guard as Glob: path is grep's positional
+		 * search root and would otherwise be read as an option */
+		if (gpath && gpath[0] == '-') {
+			sb_append(&sb, "Error: Grep 'path' must not start with '-'");
 			free(pattern); free(gpath); free(glob_f);
 			return sb.data;
 		}
@@ -4990,11 +5201,11 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 
 	if (strcmp(name, "Skill") == 0) {
 		/* L2 knowledge level: unified search via ba_load_skill
-		 * cwd/skills > ~/.agents/skills > $BB_AGENT_HOME/skills，
+		 * cwd/skills > ~/.agents/skills > $BA_HOME/skills，
 		 * supports ${BA_AGENT_SKILL_DIR} substitution */
 		char *skill = json_get_string(jp.val, "name");
 		const char *agents_home = getenv("HOME");
-		const char *bag_home = getenv("BB_AGENT_HOME");
+		const char *bag_home = getenv("BA_HOME");
 		char *cwd = xrealloc_getcwd_or_warn(NULL);
 		char *content;
 
@@ -5010,7 +5221,7 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 		free(cwd);
 		if (!content) {
 			sb_appendf(&sb, "Error: skill '%s' not found "
-				     "(searched $CWD/skills, ~/.agents/skills, $BB_AGENT_HOME/skills)", skill);
+				     "(searched $CWD/skills, ~/.agents/skills, $BA_HOME/skills)", skill);
 			free(skill);
 			return sb.data;
 		}

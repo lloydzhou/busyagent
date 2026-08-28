@@ -19,7 +19,7 @@
 
 testing "busyagent without base URL fails cleanly" \
 	'busyagent hi 2>&1; echo rc=$?' \
-	"busyagent: no base URL: use -u URL or \$BB_AGENT_BASE_URL\nrc=1\n" \
+	"busyagent: no base URL: use -u URL or \$BA_BASE_URL\nrc=1\n" \
 	"" ""
 
 testing "busyagent rejects unknown provider" \
@@ -29,7 +29,7 @@ testing "busyagent rejects unknown provider" \
 
 testing "busyagent without api key fails" \
 	'busyagent hi -u http://127.0.0.1:9/x -m m 2>&1; echo rc=$?' \
-	"busyagent: no API key: use -k KEY or \$BB_AGENT_API_KEY\nrc=1\n" \
+	"busyagent: no API key: use -k KEY or \$BA_API_KEY\nrc=1\n" \
 	"" ""
 
 testing "busyagent without model fails" \
@@ -48,22 +48,39 @@ testing "busyagent --help prints usage" \
 
 rm -rf ba.testhome
 testing "busyagent -i writes a starter tools.json" \
-	'BB_AGENT_HOME=$PWD/ba.testhome busyagent -i 2>&1 | sed "s|^wrote .*/|wrote |" && test $(grep -c "\"input_schema\"" $PWD/ba.testhome/tools.json) -eq 12 && echo twelve-ok' \
+	'BA_HOME=$PWD/ba.testhome busyagent -i 2>&1 | sed "s|^wrote .*/|wrote |" && test $(grep -c "\"input_schema\"" $PWD/ba.testhome/tools.json) -eq 12 && echo twelve-ok' \
 	"wrote tools.json\ntwelve-ok\n" \
 	"" ""
 
 testing "busyagent -i export lists the core tools" \
-	'rm -rf ba.tl; BB_AGENT_HOME=$PWD/ba.tl busyagent -i >/dev/null 2>&1; for t in Bash Read Grep SubAgent; do grep -m1 -o "\"$t\"" ba.tl/tools.json || echo MISSING-$t; done' \
+	'rm -rf ba.tl; BA_HOME=$PWD/ba.tl busyagent -i >/dev/null 2>&1; for t in Bash Read Grep SubAgent; do grep -m1 -o "\"$t\"" ba.tl/tools.json || echo MISSING-$t; done' \
 	"\"Bash\"\n\"Read\"\n\"Grep\"\n\"SubAgent\"\n" \
 	"" ""
 
 testing "busyagent -i refuses to overwrite" \
-	'rm -rf ba.tw; BB_AGENT_HOME=$PWD/ba.tw busyagent -i >/dev/null 2>&1; BB_AGENT_HOME=$PWD/ba.tw busyagent -i 2>&1 | sed "s|.*/tools.json|tools.json|"' \
+	'rm -rf ba.tw; BA_HOME=$PWD/ba.tw busyagent -i >/dev/null 2>&1; BA_HOME=$PWD/ba.tw busyagent -i 2>&1 | sed "s|.*/tools.json|tools.json|"' \
 	"tools.json already exists (delete it first to re-export)\n" \
 	"" ""
 
+# the exported example must be executable: it carries an exec mapping
+testing "busyagent -i export includes an exec mapping" \
+	'rm -rf ba.tx; BA_HOME=$PWD/ba.tx busyagent -i >/dev/null 2>&1; test $(grep -c "\"exec\"" $PWD/ba.tx/tools.json) -ge 1 && test $(grep -c "\"applet\"" $PWD/ba.tx/tools.json) -ge 1 && echo exec-ok' \
+	"exec-ok\n" \
+	"" ""
+
+# entries whose exec mapping is malformed are skipped, not crash fodder
+testing "tools.json entry without exec mapping is skipped" \
+	'rm -rf ba.tj; mkdir -p ba.tj; printf "[{\"name\": \"Broken\", \"description\": \"no exec\"}]" > ba.tj/tools.json; BA_HOME=$PWD/ba.tj busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -c "exec.applet missing"' \
+	"1\n" \
+	"" ""
+
+testing "tools.json entry with non-string argv is skipped" \
+	'rm -rf ba.tk; mkdir -p ba.tk; printf "[{\"name\": \"Bad\", \"description\": \"x\", \"exec\": {\"applet\": \"echo\", \"argv\": [1, 2]}}]" > ba.tk/tools.json; BA_HOME=$PWD/ba.tk busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -c "not a string"' \
+	"1\n" \
+	"" ""
+
 testing "busyagent -i PATH writes a custom location" \
-	'BB_AGENT_HOME=$PWD/ba.testhome busyagent -i $PWD/ba.testhome/custom.json 2>&1 | sed "s|^wrote .*/|wrote |" && test -s $PWD/ba.testhome/custom.json && echo custom-ok' \
+	'BA_HOME=$PWD/ba.testhome busyagent -i $PWD/ba.testhome/custom.json 2>&1 | sed "s|^wrote .*/|wrote |" && test -s $PWD/ba.testhome/custom.json && echo custom-ok' \
 	"wrote custom.json\ncustom-ok\n" \
 	"" ""
 
@@ -81,8 +98,15 @@ testing "busyagent rejects schemeless URL" \
 	"HTTP request failed\n" \
 	"" ""
 
-# port 1 on loopback: refused immediately by xconnect, no retries burned;
-# proves the https branch is compiled in and reaches the connect stage.
+# https works out of the box; the unauthenticated-TLS caveat is announced
+# on stderr before any connection is attempted.
+testing "busyagent https warns about unverified certificates" \
+	'busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -o "does not verify server certificates"' \
+	"does not verify server certificates\n" \
+	"" ""
+
+# port 1 on loopback: refused immediately by xconnect after the warning,
+# no retries burned; proves the https branch reaches the connect stage.
 testing "busyagent https connect failure is reported" \
 	'busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -o "can.t connect to remote host (127.0.0.1)"' \
 	"can't connect to remote host (127.0.0.1)\n" \
@@ -106,12 +130,12 @@ testing "busyagent accepts a multi-line piped prompt" \
 # a dynamic entry with a large description must grow the body; broken
 # JSON must fall back to builtins (same size as baseline).
 testing "dynamic tools.json is loaded into the request" \
-	'rm -rf ba.th; mkdir -p ba.th; printf "[{\"name\": \"MyProbe\", \"description\": \"%s\", \"input_schema\": {\"type\": \"object\", \"properties\": {}}}]" "$(head -c 600 /dev/zero | tr "\\0" x)" > ba.th/tools.json; B1=$(BB_AGENT_HOME=$PWD/ba.th busyagent -n q1 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); rm ba.th/tools.json; B2=$(BB_AGENT_HOME=$PWD/ba.th busyagent -n q2 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$B1" -gt $((B2 + 500)) && echo dynamic-effective' \
+	'rm -rf ba.th; mkdir -p ba.th; printf "[{\"name\": \"MyProbe\", \"description\": \"%s\", \"input_schema\": {\"type\": \"object\", \"properties\": {}}, \"exec\": {\"applet\": \"echo\", \"argv\": [\"hi\"]}}]" "$(head -c 600 /dev/zero | tr "\\0" x)" > ba.th/tools.json; B1=$(BA_HOME=$PWD/ba.th busyagent -n q1 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); rm ba.th/tools.json; B2=$(BA_HOME=$PWD/ba.th busyagent -n q2 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$B1" -gt $((B2 + 500)) && echo dynamic-effective' \
 	"dynamic-effective\n" \
 	"" ""
 
 testing "broken tools.json falls back to builtins" \
-	'printf "not json at all" > ba.th/tools.json; BB_AGENT_HOME=$PWD/ba.th busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -c "tools.json parse failed"' \
+	'printf "not json at all" > ba.th/tools.json; BA_HOME=$PWD/ba.th busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -c "tools.json parse failed"' \
 	"1\n" \
 	"" ""
 
@@ -119,25 +143,33 @@ testing "broken tools.json falls back to builtins" \
 # the body-size observation point again: -e high must grow the request
 # (thinking + output_config / reasoning_effort), bad levels rejected.
 testing "thinking effort reaches the request" \
-	'rm -rf ba.ef; E1=$(BB_AGENT_HOME=$PWD/ba.ef busyagent -n q1 -e high -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); E2=$(BB_AGENT_HOME=$PWD/ba.ef busyagent -n q2 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$E1" -gt $((E2 + 15)) && echo effort-in-request' \
+	'rm -rf ba.ef; E1=$(BA_HOME=$PWD/ba.ef busyagent -n q1 -e high -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); E2=$(BA_HOME=$PWD/ba.ef busyagent -n q2 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$E1" -gt $((E2 + 15)) && echo effort-in-request' \
 	"effort-in-request\n" \
 	"" ""
 
 testing "bad effort level is rejected" \
 	'busyagent hi -e turbo -u http://127.0.0.1:9/x -k k -m m 2>&1; echo rc=$?' \
-	"busyagent: bad effort 'turbo' (low|medium|high)\nrc=1\n" \
+	"busyagent: bad effort 'turbo' (minimal|low|medium|high|xhigh|max)\nrc=1\n" \
+	"" ""
+
+# an extended level must pass through to the request verbatim: the body
+# for -e xhigh is exactly one byte longer than for -e high (same request
+# otherwise), whatever the backend eventually does with it
+testing "extended effort level passes through verbatim" \
+	'rm -rf ba.ex; XH=$(BB_AGENT_HOME=$PWD/ba.ex busyagent -n x1 -e xhigh -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); HI=$(BB_AGENT_HOME=$PWD/ba.ex busyagent -n x2 -e high -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$XH" -eq $((HI + 1)) && echo effort-passthrough' \
+	"effort-passthrough\n" \
 	"" ""
 
 # === session semantics (offline, observed via -v) ===================
 
 rm -rf ba.h1
 testing "first call in a fresh home starts a new session" \
-	'BB_AGENT_HOME=$PWD/ba.h1 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "(new)"' \
+	'BA_HOME=$PWD/ba.h1 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "(new)"' \
 	"(new)\n" \
 	"" ""
 
 testing "second call in the same cwd resumes it" \
-	'BB_AGENT_HOME=$PWD/ba.h1 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "(resumed)"' \
+	'BA_HOME=$PWD/ba.h1 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "(resumed)"' \
 	"(resumed)\n" \
 	"" ""
 
@@ -147,17 +179,17 @@ testing "default resolution creates exactly one session directory" \
 	"" ""
 
 testing "-n forces a fresh session each call" \
-	'BB_AGENT_HOME=$PWD/ba.h1 busyagent -n first -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; BB_AGENT_HOME=$PWD/ba.h1 busyagent -n second -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; ls -d ba.h1/projects/*/*/ | wc -l' \
+	'BA_HOME=$PWD/ba.h1 busyagent -n first -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; BA_HOME=$PWD/ba.h1 busyagent -n second -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; ls -d ba.h1/projects/*/*/ | wc -l' \
 	"3\n" \
 	"" ""
 
 testing "--session pins the directory name" \
-	'BB_AGENT_HOME=$PWD/ba.h2 busyagent -s mysession hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; test -d ba.h2/projects/*/mysession && echo pinned-ok' \
+	'BA_HOME=$PWD/ba.h2 busyagent -s mysession hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; test -d ba.h2/projects/*/mysession && echo pinned-ok' \
 	"pinned-ok\n" \
 	"" ""
 
 testing "sessions are bound to the working directory" \
-	'mkdir -p ba.proj1 ba.proj2; (cd ba.proj1 && BB_AGENT_HOME=$OLDPWD/ba.h3 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true); (cd ba.proj2 && BB_AGENT_HOME=$OLDPWD/ba.h3 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true); ls ba.h3/projects/ | wc -l' \
+	'mkdir -p ba.proj1 ba.proj2; (cd ba.proj1 && BA_HOME=$OLDPWD/ba.h3 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true); (cd ba.proj2 && BA_HOME=$OLDPWD/ba.h3 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true); ls ba.h3/projects/ | wc -l' \
 	"2\n" \
 	"" ""
 
@@ -167,6 +199,6 @@ testing "every turn records a user_input event" \
 	"4\n" \
 	"" ""
 
-rm -rf ba.testhome ba.tl ba.tw ba.th ba.ef ba.h1 ba.h2 ba.h3 ba.proj1 ba.proj2
+rm -rf ba.testhome ba.tl ba.tw ba.tx ba.tj ba.tk ba.th ba.ef ba.h1 ba.h2 ba.h3 ba.proj1 ba.proj2
 
 exit $FAILCOUNT

@@ -296,7 +296,7 @@ config SUBST_WCHAR
 config LAST_SUPPORTED_WCHAR
 	int "Range of supported Unicode characters"
 	depends on UNICODE_SUPPORT
-	default 767
+	default 196607
 	help
 	Any character with Unicode value bigger than this is assumed
 	to be non-printable on output device. Many applets replace
@@ -333,7 +333,7 @@ config UNICODE_COMBINING_WCHARS
 
 config UNICODE_WIDE_WCHARS
 	bool "Allow wide Unicode characters on output"
-	default n
+	default y
 	depends on UNICODE_SUPPORT
 	help
 	With this option off, any Unicode char with width > 1

@@ -20,7 +20,7 @@ model stops, append the turn's events to the session trace, exit.
 
 `agentutils/tools.json` no longer exists in this repo and nothing is
 embedded in the binary. The **only** runtime source is
-`$BB_AGENT_HOME/tools.json`:
+`$BA_HOME/tools.json`:
 
 - `busyagent -i [PATH]` exports a starter table (ls/head/tail/wc/stat),
   creating parent dirs, refusing to overwrite;
@@ -46,10 +46,10 @@ base honestly.
 | index/delegate | Glob (find -name), Grep (grep -nHr --include) | busybox applets |
 | state | TodoWrite | checklist as tool_result; conversation history IS the state |
 | state | PlanConfirm / PlanClear | plan.draft -> plan.md; current plan injected into system prompt |
-| knowledge | Skill | SKILL.md loaded from cwd/skills > ~/.agents/skills > $BB_AGENT_HOME/skills |
+| knowledge | Skill | SKILL.md loaded from cwd/skills > ~/.agents/skills > $BA_HOME/skills |
 | delegate | SubAgent | self-bootstrapping fork+exec `busyagent --new`, env-passed config |
 
-Dynamic zone ($BB_AGENT_HOME/tools.json via `busyagent -i`) carries
+Dynamic zone ($BA_HOME/tools.json via `busyagent -i`) carries
 world-operation primitives only (default sample: ls/head/tail/wc/stat).
 Names may not shadow builtins (skipped with warning). Deleting the file
 removes nothing essential: every dynamic entry is expressible through

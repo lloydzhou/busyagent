@@ -22,7 +22,7 @@
 //config:	request, stream the reply over plain HTTP (SSE), execute any
 //config:	tool calls with busybox applets, feed results back until the
 //config:	model finishes, then exit. Session history is stored under
-//config:	$BB_AGENT_HOME and restored automatically per working directory.
+//config:	$BA_HOME and restored automatically per working directory.
 //applet:IF_BUSYAGENT(APPLET(busyagent, BB_DIR_USR_BIN, BB_SUID_DROP))
 //kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_impl.o
 
@@ -30,24 +30,25 @@
 //usage:       "[OPTIONS] [PROMPT]"
 //usage:#define busyagent_full_usage "\n\n"
 //usage:       "Run one user turn of an LLM agent loop\n"
-//usage:     "\n	-u URL	Base URL (default $BB_AGENT_BASE_URL)"
-//usage:     "\n	-k KEY	API key (default $BB_AGENT_API_KEY)"
+//usage:     "\n	-u URL	Base URL (default $BA_BASE_URL)"
+//usage:     "\n	-k KEY	API key (default $BA_API_KEY)"
 //usage:     "\n	-m MODEL	Model name"
 //usage:     "\n	-p PROVIDER	claude | openai | responses (default openai)"
 //usage:     "\n	-t N	Max model turns (default 8)"
-//usage:     "\n	-e LVL	Thinking effort: low|medium|high (default off, $BB_AGENT_EFFORT)"
+//usage:     "\n	-e LVL	Thinking effort: minimal|low|medium|high|xhigh|max (default off, $BA_EFFORT)"
 //usage:     "\n	-s ID	Resume exactly this session"
 //usage:     "\n	-n	Force a new session"
 //usage:     "\n	-c	Resume latest session for this cwd (the default)"
 //usage:     "\n	-o FMT	Output: text | json (default text)"
 //usage:     "\n	-v	Verbose request info on stderr"
-//usage:     "\n	-i [PATH]	Write a starter tools.json (default $BB_AGENT_HOME/tools.json) and exit"
+//usage:     "\n	-i [PATH]	Write a starter tools.json (default $BA_HOME/tools.json) and exit"
 //usage:     "\n	PROMPT	Reads stdin when no PROMPT is given"
 //usage:
 
 #include "libbb.h"
 #include <unistd.h>
 #include <sys/utsname.h>
+#include <sys/resource.h>   /* setrlimit: background log cap */
 #include <dirent.h>
 #include "busyagent.h"
 
@@ -241,18 +242,27 @@ int busyagent_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
  * in-process SubAgent and main share one entry, no globals) ---- */
 /* ---- background bash: spawn/reap registry
  * async_bash_thread_fn semantics: mkstemp captures output, on completion
- * push exit_code + output proactively) ---- */
+ * push exit_code + output proactively.
+ * Safety rails (the previous implementation had none): every task carries
+ * a hard wall-clock deadline (killed by process group, reported as exit
+ * 124), the child's log file is capped with RLIMIT_FSIZE so a runaway task
+ * cannot fill /tmp, and ba_drain_background never blocks forever. ---- */
+#define BA_BG_MAX 16
+#define BA_BG_TIMEOUT_MS  (60LL * 60 * 1000)   /* hard cap per task: 1 hour */
+#define BA_BG_LOG_MAX     (512 * 1024)         /* RLIMIT_FSIZE for the log */
+#define BA_BG_DRAIN_MS    (5LL * 60 * 1000)    /* blocking drain cap */
+
 typedef struct {
 	char task_id[80];
 	pid_t pid;
 	char tmpfile[40];
 	int active;
+	int64_t deadline_ms;    /* monotonic_ms() wall at which we SIGKILL */
 } BaBgTask;
 
-#define BA_BG_MAX 16
 static BaBgTask g_bg[BA_BG_MAX];
 
-static char *ba_spawn_background(const char *cmd)
+char *ba_background_spawn(const char *cmd)
 {
 	int i;
 	for (i = 0; i < BA_BG_MAX; i++)
@@ -288,20 +298,52 @@ static char *ba_spawn_background(const char *cmd)
 			xopen("/dev/null", O_RDONLY);
 			xmove_fd(tmpfd, STDOUT_FILENO);
 			xmove_fd(dup(STDOUT_FILENO), STDERR_FILENO);
+			/* cap the log: beyond BA_BG_LOG_MAX write() fails with
+			 * EFBIG (SIGXFSZ ignored) instead of filling the disk */
+			{
+				struct rlimit rl;
+				rl.rlim_cur = BA_BG_LOG_MAX;
+				rl.rlim_max = BA_BG_LOG_MAX;
+				setrlimit(RLIMIT_FSIZE, &rl);
+				signal(SIGXFSZ, SIG_IGN);
+			}
 			execl(bb_busybox_exec_path, "sh", "-c", cmd, (char *)NULL);
 			_exit(127);
 		}
 		setpgid(pid, pid);
 		close(tmpfd);           /* parent does not waitpid; the reaper pulls */
 		pid = t->pid = pid;
+		t->deadline_ms = (int64_t)monotonic_ms() + BA_BG_TIMEOUT_MS;
 		t->active = 1;
 	}
 
 	{
 		StrBuf r;
 		sb_init(&r);
-		sb_appendf(&r, "Async task started: task_id=%s", g_bg[i].task_id);
+		sb_appendf(&r, "Async task started: task_id=%s"
+			   " (output file, read it with Read if needed: %s;",
+			   g_bg[i].task_id, g_bg[i].tmpfile);
+		sb_appendf(&r, " hard timeout %ld s)",
+			   (long)(BA_BG_TIMEOUT_MS / 1000));
 		return r.data;
+	}
+}
+
+/* kill every live background task (process group) and remove the log
+ * files: called on process exit so nothing is left behind */
+void ba_background_cleanup_all(void)
+{
+	int i;
+	for (i = 0; i < BA_BG_MAX; i++) {
+		if (!g_bg[i].active)
+			continue;
+		kill(-g_bg[i].pid, SIGKILL);
+		kill(g_bg[i].pid, SIGKILL);
+		while (waitpid(g_bg[i].pid, NULL, 0) < 0 && errno == EINTR)
+			continue;
+		if (g_bg[i].tmpfile[0])
+			unlink(g_bg[i].tmpfile);
+		g_bg[i].active = 0;
 	}
 }
 
@@ -525,35 +567,70 @@ static void ba_handle_async_result(const BaDisplay *disp,
 	}
 }
 
-/* drain finished tasks: block=1 waits (same as the bash-agent
- * non-interactive drain loop, agent.c:1513) */
+/* drain finished tasks. block=1 waits, but never forever: per-task
+ * deadlines are enforced (SIGKILL to the process group, exit code 124)
+ * and the whole blocking pass is capped at BA_BG_DRAIN_MS */
 static void ba_drain_background(BaRunCtx *ctx, SessionPaths *paths,
                                 BaDisplayFormat fmt, int block)
 {
 	(void)ctx;
-	for (;;) {
-		int reaped = 0;
-		int i;
-		for (i = 0; i < 16; i++) {
-			if (!g_bg[i].active)
-				continue;
-			{
+	{
+		int64_t block_deadline = block
+			? (int64_t)monotonic_ms() + BA_BG_DRAIN_MS : 0;
+		for (;;) {
+			int reaped = 0;
+			int i;
+			for (i = 0; i < BA_BG_MAX; i++) {
 				int st = 0;
-				pid_t r = waitpid(g_bg[i].pid, &st, block ? 0 : WNOHANG);
+				pid_t r;
+				if (!g_bg[i].active)
+					continue;
+				/* enforce the per-task hard deadline */
+				if ((int64_t)monotonic_ms() > g_bg[i].deadline_ms) {
+					kill(-g_bg[i].pid, SIGKILL);
+					kill(g_bg[i].pid, SIGKILL);
+				}
+				r = waitpid(g_bg[i].pid, &st, WNOHANG);
 				if (r == g_bg[i].pid) {
 					int code = WIFEXITED(st) ? WEXITSTATUS(st)
 					         : (WIFSIGNALED(st) ? 128 + WTERMSIG(st) : 1);
 					char *out = NULL;
 					FILE *f2 = fopen(g_bg[i].tmpfile, "r");
-					long fsz;
+					long fsz = 0;
 					BaDisplay dtmp;
 					if (f2) {
+						size_t nread;
+						size_t rd;
 						fseek(f2, 0, SEEK_END);
 						fsz = ftell(f2);
 						fseek(f2, 0, SEEK_SET);
-						out = xmalloc(fsz + 1);
-						out[fread(out, 1, fsz, f2)] = '\0';
+						/* never read more than the log cap back
+						 * into memory */
+						rd = fsz > (long)BA_BG_LOG_MAX
+						   ? BA_BG_LOG_MAX : (size_t)fsz;
+						out = xmalloc(rd + 1);
+						nread = fread(out, 1, rd, f2);
+						out[nread] = '\0';
 						fclose(f2);
+						if (fsz > (long)BA_BG_LOG_MAX) {
+							/* RLIMIT_FSIZE usually keeps the
+							 * file at the cap; if it is still
+							 * larger, say so */
+							char *nb = xrealloc(out, nread + 96);
+							out = nb;
+							nread += snprintf(out + nread, 96,
+								"\n[output truncated: %ld bytes total]",
+								fsz);
+						}
+					}
+					if (code == 124 && out) {
+						/* killed on our deadline */
+						size_t len = strlen(out);
+						char *nb = xrealloc(out, len + 96);
+						out = nb;
+						snprintf(out + len, 96,
+							"\n[background task killed: exceeded %ld s hard timeout]",
+							(long)(BA_BG_TIMEOUT_MS / 1000));
 					}
 					remove(g_bg[i].tmpfile);
 					memset(&dtmp, 0, sizeof(dtmp));
@@ -566,17 +643,25 @@ static void ba_drain_background(BaRunCtx *ctx, SessionPaths *paths,
 					reaped = 1;
 				}
 			}
+			if (!reaped) {
+				if (!block)
+					break;
+				if ((int64_t)monotonic_ms() > block_deadline)
+					break;   /* stop waiting: leftover tasks stay
+						  * registered for later rounds or
+						  * ba_background_cleanup_all() */
+				usleep(100 * 1000);
+				continue;
+			}
+			block = 0;   /* afterwards only reap what is ready */
 		}
-		if (!reaped)
-			break;
-		block = 0;   /* afterwards only reap what is ready */
 	}
 }
 
 static int ba_bg_active_count(void)
 {
 	int i, n = 0;
-	for (i = 0; i < 16; i++)
+	for (i = 0; i < BA_BG_MAX; i++)
 		if (g_bg[i].active)
 			n++;
 	return n;
@@ -888,6 +973,23 @@ static int ba_run_session(BaRunCtx *ctx)
 
 			ba_flush_turn_events(&tctx);
 
+			/* transport-level truncation guard: a stream that ended
+			 * (clean EOF or idle timeout) without the provider's
+			 * protocol stop event must not be treated as a complete
+			 * answer - text would be saved as if final and tool
+			 * calls could be silently dropped */
+			if (!accum->stopped && !g_interrupted) {
+				ba_push_display(&tctx, &(BaDisplayMsg){
+					.type = BA_DM_ERROR,
+					.content = (char *)"Stream ended without a protocol stop"
+						" event (connection truncated)"});
+				ba_push_display(&tctx, &(BaDisplayMsg){
+					.type = BA_DM_STOP, .content = (char *)"error"});
+				sse_accum_free(accum);
+				rc = 1;
+				goto out;
+			}
+
 			if (accum->tool_count > 0 && accum->stop_reason
 			 && (strcmp(accum->stop_reason, "tool_use") == 0
 			  || strcmp(accum->stop_reason, "tool_calls") == 0)) {
@@ -944,8 +1046,10 @@ static int ba_run_session(BaRunCtx *ctx)
 							cmd = json_get_string(bjp.val, "command");
 						}
 						if (is_async) {
+							/* registry-backed spawn: deadline,
+							 * log cap, reaped by ba_drain_background */
 							out = (cmd && cmd[0])
-							      ? ba_spawn_background(cmd)
+							      ? ba_background_spawn(cmd)
 							      : xstrdup("Error: no command provided");
 							handled = 1;
 						}
@@ -1043,13 +1147,13 @@ out:
 
 int busyagent_main(int argc UNUSED_PARAM, char **argv)
 {
-	const char *base_url = getenv("BB_AGENT_BASE_URL");
-	const char *api_key  = getenv("BB_AGENT_API_KEY");
-	const char *home_env = getenv("BB_AGENT_HOME");
-	const char *model_env = getenv("BB_AGENT_MODEL");
-	const char *provider_env = getenv("BB_AGENT_PROVIDER");
-	const char *output_env = getenv("BB_AGENT_OUTPUT");
-	const char *effort_env = getenv("BB_AGENT_EFFORT");
+	const char *base_url = getenv("BA_BASE_URL");
+	const char *api_key  = getenv("BA_API_KEY");
+	const char *home_env = getenv("BA_HOME");
+	const char *model_env = getenv("BA_MODEL");
+	const char *provider_env = getenv("BA_PROVIDER");
+	const char *output_env = getenv("BA_OUTPUT");
+	const char *effort_env = getenv("BA_EFFORT");
 	const char *model = (model_env && model_env[0]) ? model_env : NULL;
 	const char *provider = (provider_env && provider_env[0]) ? provider_env : "openai";
 	const char *session_arg = NULL;
@@ -1085,7 +1189,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 		char *def = NULL;
 		int trc;
 		if (!dst || !dst[0]) {
-			const char *h = getenv("BB_AGENT_HOME");
+			const char *h = getenv("BA_HOME");
 			def = xasprintf("%s/tools.json", (h && h[0]) ? h : "/tmp/busyagent");
 			dst = def;
 		}
@@ -1107,16 +1211,17 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	if (o_s) session_arg = o_s;
 	if (o_o) output_fmt = o_o;
 	if (o_e) effort = o_e;
-	if (effort && strcmp(effort, "low") != 0 && strcmp(effort, "medium") != 0
-	 && strcmp(effort, "high") != 0)
-		bb_error_msg_and_die("bad effort '%s' (low|medium|high)", effort);
+	if (effort && strcmp(effort, "minimal") != 0 && strcmp(effort, "low") != 0
+	 && strcmp(effort, "medium") != 0 && strcmp(effort, "high") != 0
+	 && strcmp(effort, "xhigh") != 0 && strcmp(effort, "max") != 0)
+		bb_error_msg_and_die("bad effort '%s' (minimal|low|medium|high|xhigh|max)", effort);
 	if (max_turns <= 0) max_turns = BA_DEFAULT_TURNS;
 
 	argv += optind;
 	if (!base_url || !base_url[0])
-		bb_error_msg_and_die("no base URL: use -u URL or $BB_AGENT_BASE_URL");
+		bb_error_msg_and_die("no base URL: use -u URL or $BA_BASE_URL");
 	if (!api_key || !api_key[0])
-		bb_error_msg_and_die("no API key: use -k KEY or $BB_AGENT_API_KEY");
+		bb_error_msg_and_die("no API key: use -k KEY or $BA_API_KEY");
 	if (!model || !model[0])
 		bb_error_msg_and_die("no model: use -m MODEL");
 	if (strcmp(provider, "claude") != 0 && strcmp(provider, "openai") != 0
@@ -1275,6 +1380,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			fprintf(stderr,
 				"\x1b[90mResume with: --session %s  or  --continue\x1b[0m\n",
 				session_id ? session_id : "?");
+			ba_background_cleanup_all();
 			free_line_input_t(li);
 			free(hist_path);
 			free(api_url);
@@ -1324,6 +1430,9 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	           ? BA_FMT_STREAM_JSON : BA_FMT_HUMAN;
 
 	rc = ba_run_session(&root);
+
+	/* no stray background processes or /tmp logs survive the applet */
+	ba_background_cleanup_all();
 
 	free(api_url);
 	free(session_id);

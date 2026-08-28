@@ -593,7 +593,7 @@ char *convert_to_responses(const char *claude_body);
 /* prompt build context (the Agent field subset) */
 typedef struct {
     const char *cwd;        /* working directory */
-    const char *home;       /* $BB_AGENT_HOME root */
+    const char *home;       /* $BA_HOME root */
     const char *plan;       /* PLAN_FILE path */
     const char *plan_draft; /* PLAN_DRAFT_FILE path */
 } BaPromptCtx;
@@ -603,8 +603,8 @@ char *ba_build_prompt(const BaPromptCtx *ctx);
 
 /* load a skill's content; malloc'd string or NULL.
  * Search order matches the system prompt skill-index:
- *   $CWD/skills > ~/.agents/skills > $BB_AGENT_HOME/skills
- * agents_home is $HOME (may be NULL); bag_home is $BB_AGENT_HOME.
+ *   $CWD/skills > ~/.agents/skills > $BA_HOME/skills
+ * agents_home is $HOME (may be NULL); bag_home is $BA_HOME.
  * out_skill_dir receives the hit directory (optional). */
 char *ba_load_skill(const char *skill_name, const char *cwd,
                     const char *agents_home, const char *bag_home,
@@ -627,7 +627,7 @@ char *ba_load_skill(const char *skill_name, const char *cwd,
 
 /* Initialize the tool system:
  *   - the 11 builtin tools are always present (compiled in);
- *   - $BB_AGENT_HOME/tools.json (dynamic zone) is loaded on top; a
+ *   - $BA_HOME/tools.json (dynamic zone) is loaded on top; a
  *     missing/broken file only loses the dynamic sugar, never the
  *     builtins. Dynamic names may not shadow builtins.
  * paths is used by state tools (Plan*) for session placement. */
@@ -637,6 +637,14 @@ void ba_tools_free(void);
 
 /* Re-point the built-in state tools (Plan*) at another session. */
 void ba_tools_set_paths(const SessionPaths *paths);
+
+/* Background Bash: register the task (hard deadline + RLIMIT_FSIZE log cap)
+ * and return a malloc'd acknowledgement/error message for the model. */
+char *ba_background_spawn(const char *cmd);
+
+/* Kill every live background task and unlink its log file. Call once on
+ * process exit so no processes or temp files are left behind. */
+void ba_background_cleanup_all(void);
 
 /* Tools array sent to the LLM: builtin schemas + dynamic zone with
  * "exec" mappings stripped (they are internal). Caller frees. */
