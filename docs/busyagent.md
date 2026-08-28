@@ -52,6 +52,23 @@ The model may call any of the applets exposed in the bundled tool set
   copies the parent conversation first; nested SubAgent calls are rejected
 - read-only-root friendly: the session store is append-only jsonl
 
+## Dynamic tool table
+
+An optional `$BB_AGENT_HOME/tools.json` extends the built-in tool set at
+runtime:
+
+```
+busyagent -i            # export the starter table (builtins + one example)
+$EDITOR $BB_AGENT_HOME/tools.json
+busyagent ...           # entries join the request verbatim
+```
+
+Entries use the same schema shape as the export (`name`, `description`,
+`input_schema`). Names shadowing a builtin (Bash/Read/.../SubAgent) are
+skipped — builtins always win. A broken file falls back to builtins with
+a note on stderr. Unknown tool names reach the executor and are reported
+back to the model as errors.
+
 ## Known limitations
 
 - HTTP only for now; TLS via busybox's built-in `tls.c` is planned. Point
