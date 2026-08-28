@@ -35,6 +35,7 @@
 //usage:     "\n	-m MODEL	Model name"
 //usage:     "\n	-p PROVIDER	claude | openai | responses (default openai)"
 //usage:     "\n	-t N	Max model turns (default 8)"
+//usage:     "\n	-e LVL	Thinking effort: low|medium|high (default off, $BB_AGENT_EFFORT)"
 //usage:     "\n	-s ID	Resume exactly this session"
 //usage:     "\n	-n	Force a new session"
 //usage:     "\n	-c	Resume latest session for this cwd (the default)"
@@ -308,6 +309,7 @@ typedef struct {
 	int verbose;
 	int max_turns;
 	const char *model, *provider, *api_url, *api_key;
+	const char *effort;      /* NULL = thinking off */
 	BaDisplayFormat fmt;
 	SessionPaths paths;
 } BaRunCtx;
@@ -667,6 +669,7 @@ static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
 	sub.provider = parent->provider;
 	sub.api_url = parent->api_url;
 	sub.api_key = parent->api_key;
+	sub.effort = parent->effort;
 	sub.fmt = BA_FMT_NONE;                 /* 无队列架构下的静默等价 */
 
 	/* fork=true：发起侧立即复制父会话（agent.c:1812 同款）。
@@ -811,7 +814,9 @@ static int ba_run_session(BaRunCtx *ctx)
 
 			claude_body = build_claude_request(model, sys_full, tools_json,
 							   lines, line_count,
-							   BA_MAX_TOKENS, NULL, NULL);
+							   BA_MAX_TOKENS,
+							   ctx->effort ? "enabled" : NULL,
+							   ctx->effort);
 			body = claude_body;
 			if (strcmp(provider, "openai") == 0) {
 				body = convert_to_openai(claude_body);
@@ -1014,10 +1019,12 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	const char *model_env = getenv("BB_AGENT_MODEL");
 	const char *provider_env = getenv("BB_AGENT_PROVIDER");
 	const char *output_env = getenv("BB_AGENT_OUTPUT");
+	const char *effort_env = getenv("BB_AGENT_EFFORT");
 	const char *model = (model_env && model_env[0]) ? model_env : NULL;
 	const char *provider = (provider_env && provider_env[0]) ? provider_env : "openai";
 	const char *session_arg = NULL;
 	const char *output_fmt = (output_env && output_env[0]) ? output_env : "text";
+	const char *effort = (effort_env && effort_env[0]) ? effort_env : NULL;
 	int max_turns = BA_DEFAULT_TURNS, verbose = 0;
 	int opt_new = 0;
 	char *prompt = NULL, *home, *cwd, *session_id = NULL;
@@ -1025,18 +1032,18 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	int rc = 0;
 	unsigned opts;
 	const char *o_u = NULL, *o_k = NULL, *o_m = NULL, *o_p = NULL;
-	const char *o_t = NULL, *o_s = NULL, *o_o = NULL;
-	/* bit positions follow the option string "vu:k:m:p:t:s:o:nci" */
+	const char *o_t = NULL, *o_s = NULL, *o_o = NULL, *o_e = NULL;
+	/* bit positions follow the option string "vu:k:m:p:t:s:o:e:nci" */
 	enum {
 		OPT_verbose = 1 << 0,
-		OPT_new     = 1 << 8,
-		OPT_continue= 1 << 9,
-		OPT_init    = 1 << 10,
+		OPT_new     = 1 << 9,
+		OPT_continue= 1 << 10,
+		OPT_init    = 1 << 11,
 	};
 
 	opts = getopt32(argv, "^"
-		"vu:k:m:p:t:s:o:nci" "\0",
-		&o_u, &o_k, &o_m, &o_p, &o_t, &o_s, &o_o);
+		"vu:k:m:p:t:s:o:e:nci" "\0",
+		&o_u, &o_k, &o_m, &o_p, &o_t, &o_s, &o_o, &o_e);
 	if (opts & OPT_verbose) verbose = 1;
 	if (opts & OPT_new) opt_new = 1;
 	/* OPT_continue is the default behavior; the flag is a no-op kept
@@ -1069,6 +1076,10 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	if (o_t) max_turns = atoi(o_t);
 	if (o_s) session_arg = o_s;
 	if (o_o) output_fmt = o_o;
+	if (o_e) effort = o_e;
+	if (effort && strcmp(effort, "low") != 0 && strcmp(effort, "medium") != 0
+	 && strcmp(effort, "high") != 0)
+		bb_error_msg_and_die("bad effort '%s' (low|medium|high)", effort);
 	if (max_turns <= 0) max_turns = BA_DEFAULT_TURNS;
 
 	argv += optind;
@@ -1186,6 +1197,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			repl.provider = provider;
 			repl.api_url = api_url;
 			repl.api_key = api_key;
+			repl.effort = effort;
 			repl.fmt = (strcmp(output_fmt, "json") == 0)
 			           ? BA_FMT_STREAM_JSON : BA_FMT_HUMAN;
 
@@ -1276,6 +1288,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	root.provider = provider;
 	root.api_url = api_url;
 	root.api_key = api_key;
+	root.effort = effort;
 	root.fmt = (strcmp(output_fmt, "json") == 0)
 	           ? BA_FMT_STREAM_JSON : BA_FMT_HUMAN;
 

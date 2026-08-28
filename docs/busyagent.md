@@ -21,6 +21,7 @@ busyagent [-vnu] [-k KEY] [-m MODEL] [-p PROVIDER] [-t TURNS] [-s ID] [-o FMT] [
     -m MODEL    model name                                ($BB_AGENT_MODEL)
     -p NAME     openai | claude | responses   (default openai, $BB_AGENT_PROVIDER)
     -t N        max tool-use turns             (default 8)
+    -e LVL      thinking effort: low|medium|high (default off, $BB_AGENT_EFFORT)
     -s ID       resume a specific session id
     -n          force a new session (CI / batch isolation)
     -c          explicit alias of the default continue-by-cwd behaviour

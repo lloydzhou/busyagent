@@ -115,6 +115,19 @@ testing "broken tools.json falls back to builtins" \
 	"1\n" \
 	"" ""
 
+# === thinking effort (-e) ============================================
+# the body-size observation point again: -e high must grow the request
+# (thinking + output_config / reasoning_effort), bad levels rejected.
+testing "thinking effort reaches the request" \
+	'rm -rf ba.ef; E1=$(BB_AGENT_HOME=$PWD/ba.ef busyagent -n q1 -e high -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); E2=$(BB_AGENT_HOME=$PWD/ba.ef busyagent -n q2 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$E1" -gt $((E2 + 15)) && echo effort-in-request' \
+	"effort-in-request\n" \
+	"" ""
+
+testing "bad effort level is rejected" \
+	'busyagent hi -e turbo -u http://127.0.0.1:9/x -k k -m m 2>&1; echo rc=$?' \
+	"busyagent: bad effort 'turbo' (low|medium|high)\nrc=1\n" \
+	"" ""
+
 # === session semantics (offline, observed via -v) ===================
 
 rm -rf ba.h1
@@ -154,6 +167,6 @@ testing "every turn records a user_input event" \
 	"4\n" \
 	"" ""
 
-rm -rf ba.testhome ba.tl ba.tw ba.th ba.h1 ba.h2 ba.h3 ba.proj1 ba.proj2
+rm -rf ba.testhome ba.tl ba.tw ba.th ba.ef ba.h1 ba.h2 ba.h3 ba.proj1 ba.proj2
 
 exit $FAILCOUNT
