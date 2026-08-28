@@ -6,52 +6,154 @@
 
 # testing "test name" "command(s)" "expected result" "file input" "stdin"
 
-# All cases are offline: error paths, argument handling and the session
-# store layout. Anything needing a live LLM endpoint stays out of the
-# testsuite (see docs/busyagent.md for the applet contract).
+# All cases are offline: CLI contract, argument validation and the
+# cwd-bound session semantics (observed via -v diagnostics). Anything
+# needing a live LLM endpoint stays out of the testsuite (see
+# docs/busyagent.md for the applet contract).
+#
+# NOTE: command strings are single-quoted so double quotes inside grep
+# patterns survive; every invocation expected to fail ends in
+# "|| true" because the runner uses sh -e.
 
-# --- no endpoint configured ---------------------------------------------
+# === argument validation ============================================
+
 testing "busyagent without base URL fails cleanly" \
-       "busyagent hi 2>&1; echo rc=\$?" \
-       "busyagent: no base URL: use -u URL or \$BB_AGENT_BASE_URL\nrc=1\n" \
-       "" ""
+	'busyagent hi 2>&1; echo rc=$?' \
+	"busyagent: no base URL: use -u URL or \$BB_AGENT_BASE_URL\nrc=1\n" \
+	"" ""
 
-# --- usage ---------------------------------------------------------------
+testing "busyagent rejects unknown provider" \
+	'busyagent hi -u http://127.0.0.1:9/x -k k -m m -p foo 2>&1; echo rc=$?' \
+	"busyagent: bad provider 'foo' (claude|openai|responses)\nrc=1\n" \
+	"" ""
+
+testing "busyagent without api key fails" \
+	'busyagent hi -u http://127.0.0.1:9/x -m m 2>&1; echo rc=$?' \
+	"busyagent: no API key: use -k KEY or \$BB_AGENT_API_KEY\nrc=1\n" \
+	"" ""
+
+testing "busyagent without model fails" \
+	'busyagent hi -u http://127.0.0.1:9/x -k k 2>&1; echo rc=$?' \
+	"busyagent: no model: use -m MODEL\nrc=1\n" \
+	"" ""
+
+# === usage ==========================================================
+
 testing "busyagent --help prints usage" \
-       "busyagent --help 2>&1 | grep -m1 '^Usage: busyagent'" \
-       "Usage: busyagent [OPTIONS] [PROMPT]\n" \
-       "" ""
+	'busyagent --help 2>&1 | grep -m1 "^Usage: busyagent"' \
+	"Usage: busyagent [OPTIONS] [PROMPT]\n" \
+	"" ""
 
-# --- starter tools.json (-i) --------------------------------------------
+# === starter tools.json (-i) ========================================
+
 rm -rf ba.testhome
 testing "busyagent -i writes a starter tools.json" \
-       "BB_AGENT_HOME=\$PWD/ba.testhome busyagent -i 2>&1 | sed 's|^wrote .*/|wrote |' && grep -c '\"name\"' \$PWD/ba.testhome/tools.json" \
-       "wrote tools.json\n5\n" \
-       "" ""
+	'BB_AGENT_HOME=$PWD/ba.testhome busyagent -i 2>&1 | sed "s|^wrote .*/|wrote |" && test $(grep -c "\"input_schema\"" $PWD/ba.testhome/tools.json) -eq 12 && echo twelve-ok' \
+	"wrote tools.json\ntwelve-ok\n" \
+	"" ""
 
-# --- unusable URL scheme ---------------------------------------------------
+testing "busyagent -i export lists the core tools" \
+	'rm -rf ba.tl; BB_AGENT_HOME=$PWD/ba.tl busyagent -i >/dev/null 2>&1; for t in Bash Read Grep SubAgent; do grep -m1 -o "\"$t\"" ba.tl/tools.json || echo MISSING-$t; done' \
+	"\"Bash\"\n\"Read\"\n\"Grep\"\n\"SubAgent\"\n" \
+	"" ""
+
+testing "busyagent -i refuses to overwrite" \
+	'rm -rf ba.tw; BB_AGENT_HOME=$PWD/ba.tw busyagent -i >/dev/null 2>&1; BB_AGENT_HOME=$PWD/ba.tw busyagent -i 2>&1 | sed "s|.*/tools.json|tools.json|"' \
+	"tools.json already exists (delete it first to re-export)\n" \
+	"" ""
+
+testing "busyagent -i PATH writes a custom location" \
+	'BB_AGENT_HOME=$PWD/ba.testhome busyagent -i $PWD/ba.testhome/custom.json 2>&1 | sed "s|^wrote .*/|wrote |" && test -s $PWD/ba.testhome/custom.json && echo custom-ok' \
+	"wrote custom.json\ncustom-ok\n" \
+	"" ""
+
+# === transport error paths ==========================================
+
 # ftp:// is rejected by the URL parser before any socket is touched.
 testing "busyagent rejects non-http scheme" \
-       "busyagent hi -u ftp://127.0.0.1:9/x -k k -m m 2>&1 | grep -o 'HTTP request failed'" \
-       "HTTP request failed\n" \
-       "" ""
+	'busyagent hi -u ftp://127.0.0.1:9/x -k k -m m 2>&1 | grep -o "HTTP request failed"' \
+	"HTTP request failed\n" \
+	"" ""
 
-# --- https reaches the connect stage (TLS compiled in) --------------------
-# Port 1 on loopback: refused immediately by xconnect_stream, no retries.
+# no scheme at all is equally rejected
+testing "busyagent rejects schemeless URL" \
+	'busyagent hi -u 127.0.0.1:9/x -k k -m m 2>&1 | grep -o "HTTP request failed"' \
+	"HTTP request failed\n" \
+	"" ""
+
+# port 1 on loopback: refused immediately by xconnect, no retries burned;
+# proves the https branch is compiled in and reaches the connect stage.
 testing "busyagent https connect failure is reported" \
-       "busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -o \"can't connect to remote host (127.0.0.1)\"" \
-       "can't connect to remote host (127.0.0.1)\n" \
-       "" ""
+	'busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -o "can.t connect to remote host (127.0.0.1)"' \
+	"can't connect to remote host (127.0.0.1)\n" \
+	"" ""
 
-# --- session store layout ---------------------------------------------------
-# A failed first turn still creates the cwd-bound session directory; the
-# jsonl files appear once a turn actually appends events.
-rm -rf ba.testhome2
-testing "busyagent creates the cwd-bound session directory" \
-       "BB_AGENT_HOME=\$PWD/ba.testhome2 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1; ls -d ba.testhome2/projects/*/ >/dev/null && echo session-dir-ok" \
-       "session-dir-ok\n" \
-       "" ""
+# empty piped prompt is refused before any request is attempted
+testing "busyagent refuses an empty piped prompt" \
+	'busyagent -u ftp://127.0.0.1:9/x -k k -m m 2>&1 | sed "s|.*busyagent: ||"' \
+	"empty prompt (no PROMPT arg and empty stdin)\n" \
+	"" ""
 
-rm -rf ba.testhome ba.testhome2
+# multi-line piped prompts are accepted (reach the transport, not the
+# empty-prompt guard)
+testing "busyagent accepts a multi-line piped prompt" \
+	'printf "line one\nline two\n" | busyagent -u ftp://127.0.0.1:9/x -k k -m m 2>&1 | grep -o "HTTP request failed"' \
+	"HTTP request failed\n" \
+	"" ""
+
+# === dynamic tools.json actually reaches the request =================
+# The request body size in -v diagnostics is the observation point:
+# a dynamic entry with a large description must grow the body; broken
+# JSON must fall back to builtins (same size as baseline).
+testing "dynamic tools.json is loaded into the request" \
+	'rm -rf ba.th; mkdir -p ba.th; printf "[{\"name\": \"MyProbe\", \"description\": \"%s\", \"input_schema\": {\"type\": \"object\", \"properties\": {}}}]" "$(head -c 600 /dev/zero | tr "\\0" x)" > ba.th/tools.json; B1=$(BB_AGENT_HOME=$PWD/ba.th busyagent -n q1 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); rm ba.th/tools.json; B2=$(BB_AGENT_HOME=$PWD/ba.th busyagent -n q2 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$B1" -gt $((B2 + 500)) && echo dynamic-effective' \
+	"dynamic-effective\n" \
+	"" ""
+
+testing "broken tools.json falls back to builtins" \
+	'printf "not json at all" > ba.th/tools.json; BB_AGENT_HOME=$PWD/ba.th busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -c "tools.json parse failed"' \
+	"1\n" \
+	"" ""
+
+# === session semantics (offline, observed via -v) ===================
+
+rm -rf ba.h1
+testing "first call in a fresh home starts a new session" \
+	'BB_AGENT_HOME=$PWD/ba.h1 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "(new)"' \
+	"(new)\n" \
+	"" ""
+
+testing "second call in the same cwd resumes it" \
+	'BB_AGENT_HOME=$PWD/ba.h1 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "(resumed)"' \
+	"(resumed)\n" \
+	"" ""
+
+testing "default resolution creates exactly one session directory" \
+	'ls -d ba.h1/projects/*/*/ | wc -l' \
+	"1\n" \
+	"" ""
+
+testing "-n forces a fresh session each call" \
+	'BB_AGENT_HOME=$PWD/ba.h1 busyagent -n first -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; BB_AGENT_HOME=$PWD/ba.h1 busyagent -n second -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; ls -d ba.h1/projects/*/*/ | wc -l' \
+	"3\n" \
+	"" ""
+
+testing "--session pins the directory name" \
+	'BB_AGENT_HOME=$PWD/ba.h2 busyagent -s mysession hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; test -d ba.h2/projects/*/mysession && echo pinned-ok' \
+	"pinned-ok\n" \
+	"" ""
+
+testing "sessions are bound to the working directory" \
+	'mkdir -p ba.proj1 ba.proj2; (cd ba.proj1 && BB_AGENT_HOME=$OLDPWD/ba.h3 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true); (cd ba.proj2 && BB_AGENT_HOME=$OLDPWD/ba.h3 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true); ls ba.h3/projects/ | wc -l' \
+	"2\n" \
+	"" ""
+
+# two resumed+new calls recorded their user_input turns in the trace
+testing "every turn records a user_input event" \
+	'cat ba.h1/projects/*/*/events.jsonl | grep -c "\"type\":\"user_input\""' \
+	"4\n" \
+	"" ""
+
+rm -rf ba.testhome ba.tl ba.tw ba.th ba.h1 ba.h2 ba.h3 ba.proj1 ba.proj2
 
 exit $FAILCOUNT

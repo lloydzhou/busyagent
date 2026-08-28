@@ -788,7 +788,8 @@ static int ba_run_session(BaRunCtx *ctx)
 		pctx.plan = paths.plan;
 		pctx.plan_draft = paths.plan_draft;
 		sys_full = ba_build_prompt(&pctx);
-		tools_json = ba_tools_json();   /* constant across turns */
+		ba_tools_init(ctx->home, &paths);   /* 动态区：$BB_AGENT_HOME/tools.json */
+	tools_json = ba_tools_json();   /* constant across turns */
 		for (turn = 0; turn < max_turns; turn++) {
 			TurnCtx tctx;
 			char **lines = NULL;

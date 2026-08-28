@@ -4289,7 +4289,12 @@ static int ba_tools_parse(const char *json)
 		int an, j;
 
 		item = json_array_get(arr, i);
-		g_tools[i].name = json_get_string(item, "name");
+		{
+			JsonVal fnv = json_get(item, "function");
+			g_tools[i].name = (fnv.type != JSON_NULL)
+					? json_get_string(fnv, "name")
+					: json_get_string(item, "name");
+		}
 		exec = json_get(item, "exec");
 		g_tools[i].applet = json_get_string(exec, "applet");
 		argv_val = json_get(exec, "argv");
@@ -4328,12 +4333,11 @@ int ba_tools_init(const char *home, const SessionPaths *paths)
 	if (data && ba_tools_parse(data) == 0) {
 		g_tools_json_text = data;
 	} else {
-		if (data)
+		if (data) {
 			bb_error_msg("tools.json parse failed, dynamic zone ignored (builtins remain)");
-		else
-			bb_error_msg("no %s — builtin 11 tools active, dynamic zone empty "
-				     "(busyagent -i exports a starter table)", path);
-		free(data);
+			free(data);
+		}
+		/* missing file is the normal path: builtins only, stay quiet */
 		g_tools_json_text = NULL;
 	}
 	free(path);
@@ -4390,7 +4394,10 @@ char *ba_tools_json(void)
         sb_truncate(&sb, sb.len - 2);   /* 去掉 "]\n" 结尾，追加动态区 */
         for (i = 0; i < n; i++) {
             JsonVal item = json_array_get(jp.val, i);
-            char *nm = json_get_string(item, "name");
+            JsonVal fnv = json_get(item, "function");
+            char *nm = (fnv.type != JSON_NULL)
+                     ? json_get_string(fnv, "name")
+                     : json_get_string(item, "name");
             /* 内置名不允许动态区覆盖 */
             if (nm && (!strcmp(nm, "Read") || !strcmp(nm, "Write") || !strcmp(nm, "Edit")
                     || !strcmp(nm, "Bash") || !strcmp(nm, "Glob") || !strcmp(nm, "Grep")
@@ -4402,17 +4409,13 @@ char *ba_tools_json(void)
                 continue;
             }
             {
-                char *desc = json_get_string(item, "description");
-                JsonVal sch = json_get(item, "input_schema");
-                char *sch_txt = (sch.type != JSON_NULL) ? val_span_dup(src, sch) : NULL;
-                sb_append(&sb, ",\n  {\n    \"name\":");
-                sb_append_json_string(&sb, nm ? nm : "");
-                sb_append(&sb, ",\"description\":");
-                sb_append_json_string(&sb, desc ? desc : "");
-                sb_append(&sb, ",\"input_schema\":");
-                sb_append(&sb, sch_txt && sch_txt[0] ? sch_txt : "{}");
-                sb_append(&sb, "}\n");
-                free(nm); free(desc); free(sch_txt);
+                /* OpenAI function shape: append the entry verbatim so
+                 * descriptions/parameters survive byte-for-byte */
+                char *span = val_span_dup(src, item);
+                sb_append(&sb, ",\n  ");
+                sb_append(&sb, span);
+                free(span);
+                free(nm);
             }
         }
         sb_append(&sb, "]\n");
@@ -4421,50 +4424,7 @@ char *ba_tools_json(void)
 }
 
 /* 动态区示例模板（-i 导出）：与内置 11 项不重叠的 POSIX 直给原语 */
-static const char ba_tools_template[] =
-"[\n"
-"  {\n"
-"    \"name\": \"ls\",\n"
-"    \"description\": \"List directory contents (busybox ls).\",\n"
-"    \"exec\": { \"applet\": \"ls\", \"argv\": [\"-la\", \"$path\"] },\n"
-"    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"Directory or file (default cwd)\" } } }\n"
-"  },\n"
-"  {\n"
-"    \"name\": \"head\",\n"
-"    \"description\": \"Print the first lines of a file (busybox head).\",\n"
-"    \"exec\": { \"applet\": \"head\", \"argv\": [\"-n\", \"${lines}\", \"$path\"] },\n"
-"    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to read\" },\n"
-"                      \"lines\": { \"type\": \"integer\", \"description\": \"Number of lines (default 10)\" } },\n"
-"      \"required\": [\"path\"] }\n"
-"  },\n"
-"  {\n"
-"    \"name\": \"tail\",\n"
-"    \"description\": \"Print the last lines of a file (busybox tail).\",\n"
-"    \"exec\": { \"applet\": \"tail\", \"argv\": [\"-n\", \"${lines}\", \"$path\"] },\n"
-"    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to read\" },\n"
-"                      \"lines\": { \"type\": \"integer\", \"description\": \"Number of lines (default 10)\" } },\n"
-"      \"required\": [\"path\"] }\n"
-"  },\n"
-"  {\n"
-"    \"name\": \"wc\",\n"
-"    \"description\": \"Count lines, words and bytes of a file (busybox wc).\",\n"
-"    \"exec\": { \"applet\": \"wc\", \"argv\": [\"$path\"] },\n"
-"    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to count\" } },\n"
-"      \"required\": [\"path\"] }\n"
-"  },\n"
-"  {\n"
-"    \"name\": \"stat\",\n"
-"    \"description\": \"Display file status (size, mode, timestamps; busybox stat).\",\n"
-"    \"exec\": { \"applet\": \"stat\", \"argv\": [\"$path\"] },\n"
-"    \"input_schema\": { \"type\": \"object\",\n"
-"      \"properties\": { \"path\": { \"type\": \"string\", \"description\": \"File to inspect\" } },\n"
-"      \"required\": [\"path\"] }\n"
-"  }\n"
-"]\n";
+/* template is derived from ba_builtin_schemas at write time */
 
 /* 导出动态区示例模板到 path。条目名不得与内置 11 项重叠
  * （运行期同样强制过滤）。返回 0 成功；-1 已存在；-2 写失败。 */
@@ -4487,9 +4447,27 @@ int ba_tools_write_template(const char *path)
 	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
 	if (fd < 0)
 		return -2;
-	if (full_write(fd, ba_tools_template, strlen(ba_tools_template)) < 0) {
-		close(fd);
-		return -2;
+	{
+		const char *b = ba_builtin_schemas;
+		size_t bl = strlen(b);
+		/* strip the trailing "]" of the builtin array, then close with a
+		 * worked custom entry so the file is one valid JSON array */
+		static const char tail[] =
+			",\n"
+			"  {\n"
+			"    \"name\": \"MyApplet\",\n"
+			"    \"description\": \"Example custom entry - edit or remove.\",\n"
+			"    \"input_schema\": {\n"
+			"      \"type\": \"object\",\n"
+			"      \"properties\": { \"cmd\": { \"type\": \"string\" } },\n"
+			"      \"required\": [\"cmd\"]\n"
+			"    }\n"
+			"  }]\n";
+		if (bl < 2 || full_write(fd, b, bl - 2) < 0
+		 || full_write(fd, tail, sizeof(tail) - 1) < 0) {
+			close(fd);
+			return -2;
+		}
 	}
 	close(fd);
 	return 0;
