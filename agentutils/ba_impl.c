@@ -1556,6 +1556,21 @@ void store_session_paths_free(SessionPaths *p) {
     FREE_PTR(p->plan_draft);
 }
 
+SessionPaths store_session_paths_dup(const SessionPaths *p) {
+    SessionPaths d;
+    memset(&d, 0, sizeof(d));
+    if (!p) return d;
+    d.base_dir     = p->base_dir     ? util_strdup(p->base_dir) : NULL;
+    d.session_dir  = p->session_dir  ? util_strdup(p->session_dir) : NULL;
+    d.conversation = p->conversation ? util_strdup(p->conversation) : NULL;
+    d.events       = p->events       ? util_strdup(p->events) : NULL;
+    d.stats        = p->stats        ? util_strdup(p->stats) : NULL;
+    d.summary      = p->summary      ? util_strdup(p->summary) : NULL;
+    d.plan         = p->plan         ? util_strdup(p->plan) : NULL;
+    d.plan_draft   = p->plan_draft   ? util_strdup(p->plan_draft) : NULL;
+    return d;
+}
+
 char *store_session_project_key(const char *cwd) {
     /* mirrors the bash AWK algorithm:
      *   sub(/^\/+/, "", $0)              - strip leading /
@@ -4514,9 +4529,12 @@ int ba_tools_init(const char *home, const SessionPaths *paths)
 	char *path = NULL;
 	char *data = NULL;
 
+	/* even on the cached fast path the session sink must point at the
+	 * caller's (possibly new) stack frame - a stale pointer here is a
+	 * use-after-free once that frame returns */
+	g_paths = paths;
 	if (g_tools)
 		return g_tool_count;
-	g_paths = paths;
 
 	if (home && home[0])
 		path = xasprintf("%s/tools.json", home);

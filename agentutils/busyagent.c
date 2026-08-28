@@ -63,6 +63,7 @@ typedef struct {
 	BaDisplay disp;
 	const SessionPaths *paths;
 	int verbose;
+	int usage_flushed;   /* one usage event per SSE round */
 } TurnCtx;
 
 static void ba_emit_json_str(StrBuf *sb, const char *key, const char *val)
@@ -145,30 +146,22 @@ static void ba_push_display(TurnCtx *t, const BaDisplayMsg *m)
 	ba_display_push(&t->disp, m);
 }
 
-/* post-tool-turn aggregate push: json mode whole-block text/thinking + usage */
+/* post-round usage push. text/thinking are NOT re-pushed here: the SSE
+ * callback already streamed them live (bash-agent agent.c:974 keeps the
+ * same rule: no batch re-push after streaming). The flag guards against
+ * a double emission if a future caller re-enters. */
 static void ba_flush_turn_events(TurnCtx *t)
 {
-	if (t->disp.format == BA_FMT_STREAM_JSON) {
-		BaDisplayMsg dm;
-		memset(&dm, 0, sizeof(dm));
-		if (t->accum.thinking.len > 0) {
-			dm.type = BA_DM_THINKING;
-			dm.content = t->accum.thinking.data;
-			ba_push_display(t, &dm);
-		}
-		memset(&dm, 0, sizeof(dm));
-		if (t->accum.text.len > 0) {
-			dm.type = BA_DM_TEXT;
-			dm.content = t->accum.text.data;
-			ba_push_display(t, &dm);
-		}
-	}
-	if (t->accum.in_tokens || t->accum.out_tokens)
+	if (t->usage_flushed)
+		return;
+	if (t->accum.in_tokens || t->accum.out_tokens) {
 		ba_push_display(t, &(BaDisplayMsg){ .type = BA_DM_USAGE,
 			.in_tokens = t->accum.in_tokens,
 			.out_tokens = t->accum.out_tokens,
 			.cache_read_tokens = t->accum.cache_read_tokens,
 			.cache_creation_tokens = t->accum.cache_creation_tokens });
+		t->usage_flushed = 1;
+	}
 }
 
 /* SSE callback: mirrors stream_display_callback - events pushed live */
@@ -579,7 +572,19 @@ static void ba_drain_background(BaRunCtx *ctx, SessionPaths *paths,
 			? (int64_t)monotonic_ms() + BA_BG_DRAIN_MS : 0;
 		for (;;) {
 			int reaped = 0;
+			int any_active = 0;
 			int i;
+			/* nothing registered: block-draining an empty registry
+			 * would sleep out the whole BA_BG_DRAIN_MS window (the
+			 * interactive quit path used to hang here for minutes) */
+			for (i = 0; i < BA_BG_MAX; i++) {
+				if (g_bg[i].active) {
+					any_active = 1;
+					break;
+				}
+			}
+			if (!any_active)
+				break;
 			for (i = 0; i < BA_BG_MAX; i++) {
 				int st = 0;
 				pid_t r;
@@ -775,6 +780,11 @@ static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
 
 	rc = ba_run_session(&sub);
 
+	/* the child's runner pointed the tool-state sink (g_paths) at its
+	 * own stack frame; restore the parent's before any parent-side tool
+	 * (PlanConfirm/PlanClear/Skill/...) executes again */
+	ba_tools_set_paths(&parent->paths);
+
 	/* extract the last assistant text (reverse scan, agent.c:1693) */
 	{
 		char **lines = NULL;
@@ -808,20 +818,64 @@ static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
 			free(lines[li]);
 		free(lines);
 
-		/* sub_agent_result event (for replay/stream-json) */
+		/* child usage flows into the parent's event trace and stats
+		 * (bash-agent agent.c:1846-1908: usage kind=sub_agent,
+		 * sub_agent_result carrying tokens, sub_agent_end, stats merge) */
 		{
+			int s_in = store_stats_get_int_file(sub.paths.stats, "total_input_tokens");
+			int s_out = store_stats_get_int_file(sub.paths.stats, "total_output_tokens");
+			int s_cr = store_stats_get_int_file(sub.paths.stats, "total_cache_read_tokens");
+			int s_cc = store_stats_get_int_file(sub.paths.stats, "total_cache_creation_tokens");
+			int s_req = store_stats_get_int_file(sub.paths.stats, "agent_request_count");
 			StrBuf evt;
+
+			sb_init(&evt);
+			sb_appendf(&evt, "{\"type\":\"usage\",\"input_tokens\":%d,\"output_tokens\":%d",
+				s_in, s_out);
+			sb_appendf(&evt, ",\"cache_read_input_tokens\":%d,\"cache_creation_input_tokens\":%d",
+				s_cr, s_cc);
+			sb_append(&evt, ",\"kind\":\"sub_agent\",\"sub_session_id\":");
+			sb_append_json_string(&evt, sub_session_id);
+			sb_append_char(&evt, '}');
+			store_event_append(&parent->paths, evt.data);
+			sb_free(&evt);
+
+			/* sub_agent_result event (for replay/stream-json) */
 			sb_init(&evt);
 			sb_appendf(&evt, "{\"type\":\"sub_agent_result\",\"session_id\":");
 			sb_append_json_string(&evt, sub_session_id);
 			sb_appendf(&evt, ",\"status\":\"%s\"", rc == 0 ? "ok" : "failed");
+			sb_appendf(&evt, ",\"input_tokens\":%d,\"output_tokens\":%d",
+				s_in, s_out);
 			sb_append(&evt, ",\"thinking\":\"\"");
 			sb_append(&evt, ",\"text\":");
 			sb_append_json_string(&evt, result_text ? result_text : "");
 			sb_append_char(&evt, '}');
 			store_event_append(&parent->paths, evt.data);
 			sb_free(&evt);
+
+			sb_init(&evt);
+			sb_appendf(&evt, "{\"type\":\"sub_agent_end\",\"session_id\":");
+			sb_append_json_string(&evt, sub_session_id);
+			sb_appendf(&evt, ",\"status\":\"%s\"}", rc == 0 ? "ok" : "failed");
+			store_event_append(&parent->paths, evt.data);
+			sb_free(&evt);
+
+			store_stats_set_int_file(parent->paths.stats, "total_input_tokens",
+				store_stats_get_int_file(parent->paths.stats, "total_input_tokens") + s_in);
+			store_stats_set_int_file(parent->paths.stats, "total_output_tokens",
+				store_stats_get_int_file(parent->paths.stats, "total_output_tokens") + s_out);
+			store_stats_set_int_file(parent->paths.stats, "total_cache_read_tokens",
+				store_stats_get_int_file(parent->paths.stats, "total_cache_read_tokens") + s_cr);
+			store_stats_set_int_file(parent->paths.stats, "total_cache_creation_tokens",
+				store_stats_get_int_file(parent->paths.stats, "total_cache_creation_tokens") + s_cc);
+			store_stats_set_int_file(parent->paths.stats, "sub_agent_request_count",
+				store_stats_get_int_file(parent->paths.stats, "sub_agent_request_count") + 1);
+			store_stats_set_int_file(parent->paths.stats, "agent_request_count",
+				store_stats_get_int_file(parent->paths.stats, "agent_request_count") + s_req);
 		}
+		store_session_paths_free(&sub.paths);
+		free(sub_session_id);
 		return result_text ? result_text
 		                   : xstrdup(rc == 0 ? "(no text)"
 		                                     : "Error: sub-agent failed");
@@ -990,13 +1044,28 @@ static int ba_run_session(BaRunCtx *ctx)
 				goto out;
 			}
 
+			/* per-round stats persistence: counts and token totals
+			 * (the aggregation bash-agent does in agent_loop; it runs
+			 * BEFORE tool execution there, so intermediate rounds with
+			 * tool calls are counted too, not just the final one) */
+			store_stats_set_int_file(paths.stats, "current_turn_count",
+				store_stats_get_int_file(paths.stats, "current_turn_count") + 1);
+			store_stats_set_int_file(paths.stats, "agent_request_count",
+				store_stats_get_int_file(paths.stats, "agent_request_count") + 1);
+			store_stats_set_int_file(paths.stats, "total_input_tokens",
+				store_stats_get_int_file(paths.stats, "total_input_tokens") + accum->in_tokens);
+			store_stats_set_int_file(paths.stats, "total_output_tokens",
+				store_stats_get_int_file(paths.stats, "total_output_tokens") + accum->out_tokens);
+			store_stats_set_int_file(paths.stats, "total_cache_read_tokens",
+				store_stats_get_int_file(paths.stats, "total_cache_read_tokens") + accum->cache_read_tokens);
+			store_stats_set_int_file(paths.stats, "total_cache_creation_tokens",
+				store_stats_get_int_file(paths.stats, "total_cache_creation_tokens") + accum->cache_creation_tokens);
+
 			if (accum->tool_count > 0 && accum->stop_reason
 			 && (strcmp(accum->stop_reason, "tool_use") == 0
 			  || strcmp(accum->stop_reason, "tool_calls") == 0)) {
 				const char **ids, **contents;
 				int i;
-				/* json mode: intermediate text/thinking/usage also stream */
-				ba_flush_turn_events(&tctx);
 				/* record assistant message with tool calls */
 				{
 					const char **tids = xzalloc(accum->tool_count * sizeof(char *));
@@ -1098,21 +1167,6 @@ static int ba_run_session(BaRunCtx *ctx)
 				continue;   /* next model turn */
 			}
 
-			/* per-turn stats persistence: counts and token totals
-			 * (the aggregation bash-agent does in agent_loop) */
-			store_stats_set_int_file(paths.stats, "current_turn_count",
-				store_stats_get_int_file(paths.stats, "current_turn_count") + 1);
-			store_stats_set_int_file(paths.stats, "agent_request_count",
-				store_stats_get_int_file(paths.stats, "agent_request_count") + 1);
-			store_stats_set_int_file(paths.stats, "total_input_tokens",
-				store_stats_get_int_file(paths.stats, "total_input_tokens") + accum->in_tokens);
-			store_stats_set_int_file(paths.stats, "total_output_tokens",
-				store_stats_get_int_file(paths.stats, "total_output_tokens") + accum->out_tokens);
-			store_stats_set_int_file(paths.stats, "total_cache_read_tokens",
-				store_stats_get_int_file(paths.stats, "total_cache_read_tokens") + accum->cache_read_tokens);
-			store_stats_set_int_file(paths.stats, "total_cache_creation_tokens",
-				store_stats_get_int_file(paths.stats, "total_cache_creation_tokens") + accum->cache_creation_tokens);
-
 			/* final assistant message */
 			store_conv_add_assistant(paths.conversation,
 						 accum->thinking.len ? accum->thinking.data : NULL,
@@ -1138,7 +1192,10 @@ static int ba_run_session(BaRunCtx *ctx)
 	}
 
 out:
-	ctx->paths = paths;
+	/* hand the caller an owned copy: ctx outlives this frame and callers
+	 * (sub-agent result scan, interactive reaper) read ctx->paths after
+	 * return - the shallow struct copy would leave every field dangling */
+	ctx->paths = store_session_paths_dup(&paths);
 	store_session_paths_free(&paths);
 	free(tools_json);
 	free(sys_full);
@@ -1367,6 +1424,10 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 				if (repl.paths.session_dir)
 					ba_drain_background(&repl, &repl.paths,
 							    repl.fmt, 0);
+				/* the previous round's runner handed us an owned
+				 * copy; free it before the next one overwrites */
+				if (repl.paths.session_dir)
+					store_session_paths_free(&repl.paths);
 				repl.prompt = xstrdup(line);
 				rc = ba_run_session(&repl);
 				free(repl.prompt);
@@ -1375,6 +1436,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			if (repl.paths.session_dir)
 				ba_drain_background(&repl, &repl.paths,
 						    repl.fmt, 1);
+			store_session_paths_free(&repl.paths);
 			/* farewell (cagent.c:399-400: Goodbye + resume hint) */
 			fprintf(stderr, "\x1b[36mGoodbye!\x1b[0m\n");
 			fprintf(stderr,

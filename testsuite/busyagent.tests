@@ -156,7 +156,7 @@ testing "bad effort level is rejected" \
 # for -e xhigh is exactly one byte longer than for -e high (same request
 # otherwise), whatever the backend eventually does with it
 testing "extended effort level passes through verbatim" \
-	'rm -rf ba.ex; XH=$(BB_AGENT_HOME=$PWD/ba.ex busyagent -n x1 -e xhigh -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); HI=$(BB_AGENT_HOME=$PWD/ba.ex busyagent -n x2 -e high -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$XH" -eq $((HI + 1)) && echo effort-passthrough' \
+	'rm -rf ba.ex; XH=$(BA_HOME=$PWD/ba.ex busyagent -n x1 -e xhigh -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); HI=$(BA_HOME=$PWD/ba.ex busyagent -n x2 -e high -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$XH" -eq $((HI + 1)) && echo effort-passthrough' \
 	"effort-passthrough\n" \
 	"" ""
 

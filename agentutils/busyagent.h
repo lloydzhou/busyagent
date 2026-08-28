@@ -249,6 +249,9 @@ typedef struct {
 
 void store_session_paths_free(SessionPaths *p);
 
+/* deep copy: every path string duplicated (the source can then be freed) */
+SessionPaths store_session_paths_dup(const SessionPaths *p);
+
 /* build the path set from home, cwd, session_id */
 SessionPaths store_session_paths_for(const char *home, const char *cwd, const char *session_id);
 
