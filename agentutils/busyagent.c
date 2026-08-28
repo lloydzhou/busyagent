@@ -74,7 +74,7 @@ static void ba_emit_json_str(StrBuf *sb, const char *key, const char *val)
 
 /* Render one logical event to stdout (text or stream-json) and to the
  * session trace (events.jsonl). Shapes follow bash-agent display.c. */
-/* display_msg_to_event：与 bash-agent 逐字一致的事件序列化 */
+/* display_msg_to_event: serialization identical to bash-agent */
 static char *ba_display_to_event(const BaDisplayMsg *m)
 {
 	StrBuf buf;
@@ -133,7 +133,7 @@ static char *ba_display_to_event(const BaDisplayMsg *m)
 	return buf.data;
 }
 
-/* push_display_event 同步版：写 events.jsonl + 按 format 渲染 */
+/* synchronous push_display_event: write events.jsonl + render per format */
 static void ba_push_display(TurnCtx *t, const BaDisplayMsg *m)
 {
 	char *evt = ba_display_to_event(m);
@@ -144,7 +144,7 @@ static void ba_push_display(TurnCtx *t, const BaDisplayMsg *m)
 	ba_display_push(&t->disp, m);
 }
 
-/* 工具轮结束后的聚合补推：json 模式整块 text/thinking + usage */
+/* post-tool-turn aggregate push: json mode whole-block text/thinking + usage */
 static void ba_flush_turn_events(TurnCtx *t)
 {
 	if (t->disp.format == BA_FMT_STREAM_JSON) {
@@ -170,7 +170,7 @@ static void ba_flush_turn_events(TurnCtx *t)
 			.cache_creation_tokens = t->accum.cache_creation_tokens });
 }
 
-/* SSE 回调：对齐 bash-agent stream_display_callback —— 事件即时推送 */
+/* SSE callback: mirrors stream_display_callback - events pushed live */
 static void ba_sse_callback(void *ctx, const SseEvent *evt)
 {
 	TurnCtx *t = (TurnCtx *)ctx;
@@ -219,7 +219,7 @@ static int ba_trim_history(const char *conv_path)
 		if (!jp.error) {
 			char *r = json_get_string(jp.val, "role");
 			JsonVal content = json_get(jp.val, "content");
-			/* 真 user 输入行 content 是字符串；tool_result 行是数组 */
+			/* user lines have string content; tool_result lines are arrays */
 			is_user_input = (r && strcmp(r, "user") == 0
 					 && content.type == JSON_STRING);
 			free(r);
@@ -237,11 +237,11 @@ static int ba_trim_history(const char *conv_path)
 }
 
 int busyagent_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
-/* ---- 会话运行上下文（等价 bash-agent 的 Agent 结构体传参方式；
- * 进程内 SubAgent 与 main 共用同一入口，无全局态、无私有 env 协议） ---- */
-/* ---- background bash：派生/收割注册表
- * 语义对齐 async_bash_thread_fn：mkstemp 接输出，完成后
- * 主动注入 exit_code + output（不需要模型回读） ---- */
+/* ---- session run context (the Agent-struct equivalent;
+ * in-process SubAgent and main share one entry, no globals) ---- */
+/* ---- background bash: spawn/reap registry
+ * async_bash_thread_fn semantics: mkstemp captures output, on completion
+ * push exit_code + output proactively) ---- */
 typedef struct {
 	char task_id[80];
 	pid_t pid;
@@ -292,7 +292,7 @@ static char *ba_spawn_background(const char *cmd)
 			_exit(127);
 		}
 		setpgid(pid, pid);
-		close(tmpfd);           /* 父侧不 waitpid：完成由收割器拉取 */
+		close(tmpfd);           /* parent does not waitpid; the reaper pulls */
 		pid = t->pid = pid;
 		t->active = 1;
 	}
@@ -320,8 +320,8 @@ typedef struct {
 
 static int ba_run_session(BaRunCtx *ctx);
 
-/* ---- resume 回放（bash-agent agent.c:508-660 对齐）----
- * 从 events.jsonl 最近 max_turns 个 user_input 起逐事件重放到 display */
+/* ---- resume replay (bash-agent agent.c:508-660) ----
+ * replay events.jsonl from the last max_turns user_input entries */
 static long ba_find_recent_turn_start(const char *events_path, int max_turns)
 {
 	FILE *f = fopen(events_path, "r");
@@ -452,7 +452,7 @@ static int ba_replay_events(const SessionPaths *paths, const BaDisplay *disp,
 			free(message);
 			replayed = 1;
 		} else if (strcmp(type, "sub_agent_result") == 0) {
-			/* agent.c:638-658：thinking 截 120、text 截 200 */
+			/* agent.c:638-658: thinking truncated to 120, text to 200 */
 			char *sid2 = json_get_string(jp.val, "session_id");
 			char *status = json_get_string(jp.val, "status");
 			char *thinking = json_get_string(jp.val, "thinking");
@@ -468,7 +468,7 @@ static int ba_replay_events(const SessionPaths *paths, const BaDisplay *disp,
 				.type = BA_DM_SUB_AGENT_RESULT,
 				.session_id = sid2,
 				.tool_exit_code = (status && strcmp(status, "ok") == 0) ? 0 : 1,
-				.tool_name = thinking,   /* bash-agent 复用该字段装 thinking */
+				.tool_name = thinking,   /* bash-agent reuses this field */
 				.content = text,
 				.in_tokens = in_tok, .out_tokens = out_tok});
 			free(sid2); free(status); free(thinking); free(text);
@@ -498,7 +498,7 @@ static void ba_handle_async_result(const BaDisplay *disp,
                                    SessionPaths *paths, const char *tid,
                                    int exit_code, const char *output)
 {
-	{   /* trace 事件（字段同 bash-agent agent.c:716-721） */
+	{   /* trace event (fields as in bash-agent agent.c:716-721) */
 		StrBuf evt;
 		sb_init(&evt);
 		sb_appendf(&evt, "{\"type\":\"async_task_result\",\"task_id\":\"%s\",\"exit_code\":%d,\"output\":",
@@ -508,14 +508,14 @@ static void ba_handle_async_result(const BaDisplay *disp,
 		store_event_append(paths, evt.data);
 		sb_free(&evt);
 	}
-	if (disp->format != BA_FMT_NONE) {   /* display: 统一 push */
+	if (disp->format != BA_FMT_NONE) {   /* display: unified push */
 			ba_display_push((BaDisplay *)disp, &(BaDisplayMsg){
 				.type = BA_DM_ASYNC_TASK_RESULT,
 				.session_id = (char *)tid,
 				.tool_exit_code = exit_code,
 				.content = (char *)(output ? output : "")});
 	}
-	{   /* 会话注入 user 角色（agent.c:730-735）：驱动下一轮 model turn */
+	{   /* inject as a user message (agent.c:730-735): drives the next turn */
 		StrBuf u;
 		sb_init(&u);
 		sb_appendf(&u, "[bg-bash %s] exit_code=%d\nOutput: %s",
@@ -525,8 +525,8 @@ static void ba_handle_async_result(const BaDisplay *disp,
 	}
 }
 
-/* drain 已完成任务：block=1 时阻塞等待（bash-agent
- * 非交互 drain 循环 agent.c:1513 同款语义） */
+/* drain finished tasks: block=1 waits (same as the bash-agent
+ * non-interactive drain loop, agent.c:1513) */
 static void ba_drain_background(BaRunCtx *ctx, SessionPaths *paths,
                                 BaDisplayFormat fmt, int block)
 {
@@ -569,7 +569,7 @@ static void ba_drain_background(BaRunCtx *ctx, SessionPaths *paths,
 		}
 		if (!reaped)
 			break;
-		block = 0;   /* 剩下的只收已就绪的 */
+		block = 0;   /* afterwards only reap what is ready */
 	}
 }
 
@@ -582,8 +582,8 @@ static int ba_bg_active_count(void)
 	return n;
 }
 
-/* 裁掉 conversation 尾部未应答的 tool_use assistant
- * （fork 复制发生在 tool_result 落库前；openai 对悬空 tool_calls 400） */
+/* trim unanswered trailing tool_use assistant lines
+ * (fork copies before tool_results land; openai 400s on dangling tool_calls) */
 static void ba_trim_trailing_tool_use(const char *conv_path)
 {
 	char **lines = NULL;
@@ -611,13 +611,13 @@ static void ba_trim_trailing_tool_use(const char *conv_path)
 				}
 			}
 			if (!has_tu)
-				break;          /* 尾部 assistant 无 tool_use：干净 */
-			cut = 1;            /* 悬空 tool_use：删掉这一行 */
+				break;          /* no tool_use: clean */
+			cut = 1;            /* dangling tool_use: drop this line */
 			break;
 		}
 	}
 	if (cut > 0 && n >= cut) {
-		/* 重写文件去掉最后 cut 行（trim_tail 语义是保留尾 N 行，方向相反） */
+		/* rewrite without the last cut lines (inverse of trim_tail) */
 		FILE *f = fopen(conv_path, "w");
 		if (f) {
 			for (i = 0; i < n - cut; i++)
@@ -646,7 +646,7 @@ static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
 	sub_session_id = xasprintf("sub_%s", raw_id);
 	free(raw_id);
 
-	/* 记录 sub_agent_start 事件（字段照抄 bash-agent） */
+	/* record sub_agent_start (fields copied from bash-agent) */
 	{
 		StrBuf evt;
 		sb_init(&evt);
@@ -674,11 +674,11 @@ static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
 	sub.api_url = parent->api_url;
 	sub.api_key = parent->api_key;
 	sub.effort = parent->effort;
-	sub.fmt = BA_FMT_NONE;                 /* 无队列架构下的静默等价 */
+	sub.fmt = BA_FMT_NONE;                 /* silent equivalent, no queue */
 
-	/* fork=true：发起侧立即复制父会话（agent.c:1812 同款）。
-	 * 复制发生在父的 tool_result 落库前，尾部可能挂着未应答的
-	 * tool_use assistant；openai 上游对此 400，须裁到完整交换为止 */
+	/* fork=true: copy the parent conversation on the caller side (agent.c:1812).
+	 * The copy happens before the parent's tool_result lands, so the tail may
+	 * hold an unanswered tool_use; openai 400s - trim to a full exchange */
 	if (fork_mode) {
 		SessionPaths sub_paths = store_session_paths_for(parent->home,
 		                                                 parent->cwd,
@@ -690,7 +690,7 @@ static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
 
 	rc = ba_run_session(&sub);
 
-	/* 提取最后一条 assistant 消息的 text（agent.c:1693 同款倒序扫描） */
+	/* extract the last assistant text (reverse scan, agent.c:1693) */
 	{
 		char **lines = NULL;
 		int line_count = 0, li;
@@ -723,7 +723,7 @@ static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
 			free(lines[li]);
 		free(lines);
 
-		/* sub_agent_result 事件（供 replay/stream-json 复现） */
+		/* sub_agent_result event (for replay/stream-json) */
 		{
 			StrBuf evt;
 			sb_init(&evt);
@@ -750,7 +750,7 @@ static void ba_sigint_handler(int sig UNUSED_PARAM)
 	g_interrupted = 1;
 }
 
-/* ---- 会话运行体：等价 bash-agent 的 agent_loop(Agent*, prompt, role) ---- */
+/* ---- session runner: the agent_loop(Agent*, prompt, role) equivalent ---- */
 static int ba_run_session(BaRunCtx *ctx)
 {
 	SessionPaths paths;
@@ -792,7 +792,7 @@ static int ba_run_session(BaRunCtx *ctx)
 	if (store_conv_add_user(paths.conversation, prompt) != 0)
 		bb_error_msg_and_die("conversation append failed");
 
-	/* system prompt：对齐 bash-agent 的分块结构（ba_prompt.c） */
+	/* system prompt: block structure aligned with bash-agent */
 	{
 		BaPromptCtx pctx;
 		int turn;
@@ -802,7 +802,7 @@ static int ba_run_session(BaRunCtx *ctx)
 		pctx.plan = paths.plan;
 		pctx.plan_draft = paths.plan_draft;
 		sys_full = ba_build_prompt(&pctx);
-		ba_tools_init(ctx->home, &paths);   /* 动态区：$BB_AGENT_HOME/tools.json */
+		ba_tools_init(ctx->home, &paths);   /* dynamic zone: tools.json */
 	tools_json = ba_tools_json();   /* constant across turns */
 		for (turn = 0; turn < max_turns; turn++) {
 			TurnCtx tctx;
@@ -814,8 +814,8 @@ static int ba_run_session(BaRunCtx *ctx)
 			int hdr_count = 0, sse_rc;
 			SseAccumulator *accum;
 
-			/* 循环顶收割：上一轮期间完成的后台任务先注入
-			 * 再构造请求（对齐 bash-agent 的队列回注时点） */
+			/* reap at loop top: inject tasks finished during the last
+			 * turn before building the request (queue re-injection) */
 			ba_drain_background(ctx, &paths, ctx->fmt, 0);
 
 			ba_trim_history(paths.conversation);
@@ -875,7 +875,7 @@ static int ba_run_session(BaRunCtx *ctx)
 			if (g_interrupted)
 				sse_rc = 0;   /* cancelled: not an error, stop quietly */
 			if (sse_rc != 0 || accum->error) {
-				/* SSE_ERROR 回调已渲染过时不重复（json 流/trace 双份） */
+				/* SSE_ERROR already rendered; avoid duplicates */
 				if (!accum->error)
 					ba_push_display(&tctx, &(BaDisplayMsg){
 						.type = BA_DM_ERROR, .content = (char *)"HTTP request failed"});
@@ -893,7 +893,7 @@ static int ba_run_session(BaRunCtx *ctx)
 			  || strcmp(accum->stop_reason, "tool_calls") == 0)) {
 				const char **ids, **contents;
 				int i;
-				/* json 模式下中间轮的 text/thinking/usage 也要进输出流和 trace */
+				/* json mode: intermediate text/thinking/usage also stream */
 				ba_flush_turn_events(&tctx);
 				/* record assistant message with tool calls */
 				{
@@ -933,8 +933,8 @@ static int ba_run_session(BaRunCtx *ctx)
 					int handled = 0;
 
 					if (strcmp(accum->tools[i].name, "Bash") == 0) {
-						/* bash-agent agent.c:1075 同款：Bash
-						 * background=true 在 loop 层截获 */
+						/* as in agent.c:1075: Bash with
+						 * background=true intercepted at loop level */
 						JsonParse bjp = json_parse_root(
 							accum->tools[i].input_json.data);
 						char *cmd = NULL;
@@ -951,7 +951,7 @@ static int ba_run_session(BaRunCtx *ctx)
 						}
 						free(cmd);
 					} else if (strcmp(accum->tools[i].name, "SubAgent") == 0) {
-						/* bash-agent agent.c:1050 同款：loop 层拦截 SubAgent */
+						/* as in agent.c:1050: SubAgent intercepted at loop level */
 						JsonParse sjp = json_parse_root(
 							accum->tools[i].input_json.data);
 						char *sprompt = NULL, *sdesc = NULL;
@@ -1017,17 +1017,17 @@ static int ba_run_session(BaRunCtx *ctx)
 			ba_push_display(&tctx, &(BaDisplayMsg){
 				.type = BA_DM_STOP,
 				.content = accum->stop_reason ? accum->stop_reason : "end_turn"});
-			/* 换行由 STOP 渲染的 ensure_newline 条件补：
-			 * 模型回答本身以 \n 结尾时不再多打（bash-agent
-			 * display.c DISPLAY_STOP 同款） */
+			/* the newline is the STOP renderer's conditional ensure_newline:
+			 * answers already ending in \n get no extra one (bash-agent
+			 * display.c DISPLAY_STOP behaviour) */
 			sse_accum_free(accum);
 
-			/* end_turn 但仍有后台任务：阻塞收割并以注入结果
-			 * 继续新轮（bash-agent 非交互 drain → run_loop 同款） */
+			/* end_turn with live background tasks: block-drain and continue
+			 * with injected results (non-interactive drain parity) */
 			if (ba_bg_active_count() > 0 && turn < max_turns - 1) {
 				ba_drain_background(ctx, &paths, ctx->fmt, 1);
 				sse_accum_init(&tctx.accum);
-				continue;   /* 注入的 [bg-bash] user 消息驱动新回合 */
+				continue;   /* the injected [bg-bash] user message drives a new turn */
 			}
 			break;
 		}
@@ -1145,7 +1145,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 		if (home_env && home_env[0]) {
 			home = xstrdup(home_env);
 		} else {
-			/* 持久会话记忆需要持久位置：$HOME/.busyagent */
+			/* persistent memory needs a persistent location */
 			const char *h = getenv("HOME");
 			home = (h && h[0]) ? xasprintf("%s/.busyagent", h) : xstrdup("/tmp/busyagent");
 		}
@@ -1167,16 +1167,16 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	}
 	if (!argv[0]) {
 		if (isatty(STDIN_FILENO)) {
-			/* ---- 交互式 REPL（bash-agent cagent 交互模式对齐）----
-			 * 行编辑用 busybox lineedit（read_line_input），
-			 * 能力等价 linenoise：历史/光标/常用快捷键；
-			 * 多行粘贴、剪贴板图片注入延后（linenoise 特性） */
+			/* ---- interactive REPL (bash-agent cagent mode) ----
+			 * line editing via busybox lineedit (read_line_input),
+			 * capability-equivalent to linenoise: history/cursor/shortcuts;
+			 * multi-line paste and image injection deferred */
 			char line[8192];
 			BaRunCtx repl;
-			/* 行编辑 state：运行期上下键历史；持久化自管
-			 * （hist_file 置空关闭 lineedit 的内建读写，
-			 * 避免与手写 append 双写交错）：history 文件
-			 * 每行一条、启动回灌 —— 角色对齐 bash-agent 的
+			/* lineedit state: in-session history; persistence is ours
+			 * (hist_file NULL disables lineedit's built-in load/save
+			 * to avoid double writes): the history file
+			 * is one entry per line, re-seeded on startup -
 			 * $HOME/.bash-agent/history（HistoryLoad/Save） */
 			line_input_t *li;
 			char *hist_path;
@@ -1204,7 +1204,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 
 			fprintf(stderr, "busyagent ready (interactive). "
 					"Type 'quit' or Ctrl-D to exit.\n");
-			/* resumed 会话：先回放最近 10 轮事件（cagent.c:350-355 同款） */
+			/* resumed session: replay the last 10 turns first */
 			{
 				SessionPaths rp = store_session_paths_for(home, cwd, session_id);
 				if (access(rp.session_dir, F_OK) == 0) {
@@ -1242,8 +1242,8 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 					continue;
 				if (!strcmp(line, "quit") || !strcmp(line, "exit"))
 					break;
-				{   /* 行级持久化（bash-agent 每行 HistoryAdd+Save
-				     * 同款语义）；quit/空行不入历史 */
+				{   /* per-line persistence (HistoryAdd+Save
+				     * parity); quit/empty lines are not recorded */
 					int hf = open(hist_path,
 						O_WRONLY | O_CREAT | O_APPEND,
 						0600);
@@ -1254,23 +1254,23 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 						close(hf);
 					}
 				}
-				/* 已完成的后台任务先收割展示（交互模式不阻塞：
-				 * bash-agent input-loop 注释同款语义）。
-				 * 首次输入前 repl.paths 未建，run_session
-				 * 循环顶收割点负责首轮；此后每次进入前
-				 * 先展示期间完成项 */
+				/* reap finished background tasks first (interactive mode
+				 * does not block: input-loop semantics).
+				 * Before the first input repl.paths does not exist;
+				 * the loop-top reaper covers round one, afterwards
+				 * show whatever finished between inputs */
 				if (repl.paths.session_dir)
 					ba_drain_background(&repl, &repl.paths,
 							    repl.fmt, 0);
 				repl.prompt = xstrdup(line);
 				rc = ba_run_session(&repl);
 				free(repl.prompt);
-				session_id = repl.session_id; /* run 后 sid 稳定 */
+				session_id = repl.session_id; /* stable across runs */
 			}
 			if (repl.paths.session_dir)
 				ba_drain_background(&repl, &repl.paths,
 						    repl.fmt, 1);
-			/* 退出提示（cagent.c:399-400 同款：Goodbye + resume 提示） */
+			/* farewell (cagent.c:399-400: Goodbye + resume hint) */
 			fprintf(stderr, "\x1b[36mGoodbye!\x1b[0m\n");
 			fprintf(stderr,
 				"\x1b[90mResume with: --session %s  or  --continue\x1b[0m\n",

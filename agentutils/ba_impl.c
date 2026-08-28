@@ -24,7 +24,7 @@
 #include <unistd.h>
 
 /* ============================================================
- * StrBuf — 动态字符串缓冲区
+ * StrBuf - growable string buffer
  * ============================================================ */
 
 void sb_init(StrBuf *sb) {
@@ -107,12 +107,12 @@ void sb_append_json_string(StrBuf *sb, const char *src) {
             case '\t': sb_append(sb, "\\t"); src++; break;
             default:
                 if (c < 0x20) {
-                    /* 控制字符 → \uXXXX（JSON 规范要求） */
+                    /* control chars -> \uXXXX (JSON spec) */
                     sb_appendf(sb, "\\u%04x", c);
                     src++;
                 } else {
-                    /* ASCII 可打印 + 所有非控制字节（含 UTF-8 多字节）原样输出
-                     * UTF-8 非法字节由上游 util_sanitize_utf8 在源头处理 */
+                    /* ASCII printable + all non-control bytes (incl. UTF-8 multibyte) pass through;
+                     * invalid UTF-8 is fixed at the source by util_sanitize_utf8 */
                     sb_append_char(sb, c);
                     src++;
                 }
@@ -135,14 +135,14 @@ void sb_append_shell_arg(StrBuf *sb, const char *src) {
     sb_append_char(sb, '\'');
 }
 
-/* UTF-8 sanitize：与 awk/sanitize_utf8.awk 完全一致的逻辑
- * 逐字节扫描，非法 UTF-8 字节替换为字面文本 \ufffd（6 个 ASCII 字符）
- * 返回新 malloc'd 字符串，调用者负责 free
+/* UTF-8 sanitize: logic identical to awk/sanitize_utf8.awk:
+ * byte-by-byte scan, invalid UTF-8 bytes become the literal text \ufffd (6 ASCII chars).
+ * Returns a new malloc'd string; caller frees.
  */
 char *util_sanitize_utf8(const char *src) {
     if (!src) return util_strdup("");
     size_t len = strlen(src);
-    /* 最坏情况：每个字节都非法，替换为 6 字符 \ufffd */
+    /* worst case: every byte invalid, replaced by 6-char \ufffd */
     StrBuf sb;
     sb_init(&sb);
     sb_ensure(&sb, len * 6 + 1);
@@ -153,11 +153,11 @@ char *util_sanitize_utf8(const char *src) {
     while (p < end) {
         unsigned char b = *p;
         if (b < 0x80) {
-            /* ASCII (0x00-0x7F): 直接输出 */
+            /* ASCII (0x00-0x7F): pass through */
             sb_append_char(&sb, b);
             p++;
         } else if (b >= 0xC2 && b <= 0xDF) {
-            /* 2 字节序列: C2-DF + 80-BF */
+            /* 2-byte sequence: C2-DF + 80-BF */
             if (p + 1 < end && p[1] >= 0x80 && p[1] <= 0xBF) {
                 sb_appendn(&sb, (const char *)p, 2);
                 p += 2;
@@ -166,7 +166,7 @@ char *util_sanitize_utf8(const char *src) {
                 p++;
             }
         } else if (b >= 0xE0 && b <= 0xEF) {
-            /* 3 字节序列: E0-EF + 80-BF + 80-BF */
+            /* 3-byte sequence: E0-EF + 80-BF + 80-BF */
             if (p + 2 < end && p[1] >= 0x80 && p[1] <= 0xBF && p[2] >= 0x80 && p[2] <= 0xBF) {
                 sb_appendn(&sb, (const char *)p, 3);
                 p += 3;
@@ -175,7 +175,7 @@ char *util_sanitize_utf8(const char *src) {
                 p++;
             }
         } else if (b >= 0xF0 && b <= 0xF4) {
-            /* 4 字节序列: F0-F4 + 80-BF + 80-BF + 80-BF */
+            /* 4-byte sequence: F0-F4 + 80-BF + 80-BF + 80-BF */
             if (p + 3 < end && p[1] >= 0x80 && p[1] <= 0xBF && p[2] >= 0x80 && p[2] <= 0xBF && p[3] >= 0x80 && p[3] <= 0xBF) {
                 sb_appendn(&sb, (const char *)p, 4);
                 p += 4;
@@ -184,7 +184,7 @@ char *util_sanitize_utf8(const char *src) {
                 p++;
             }
         } else {
-            /* 非法字节: C0-C1(过长编码), 80-BF(孤立 continuation), F5-FF(超范围) */
+            /* invalid: C0-C1 (overlong), 80-BF (stray continuation), F5-FF (out of range) */
             sb_append(&sb, "\\ufffd");
             p++;
         }
@@ -193,14 +193,14 @@ char *util_sanitize_utf8(const char *src) {
 }
 
 /* ============================================================
- * 工具函数
+ * utility functions
  * ============================================================ */
 
 char *util_new_session_id(void) {
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
-    char *buf = malloc(64);  /* 比实际需要的大，消除 -Wformat-truncation 警告 */
+    char *buf = malloc(64);  /* larger than needed; silences -Wformat-truncation */
     unsigned short r = (unsigned short)(rand() & 0xFFFF);
     snprintf(buf, 64, "%04d%02d%02d-%02d%02d%02d-%04x",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
@@ -210,12 +210,12 @@ char *util_new_session_id(void) {
 
 char *util_path_join(const char *a, const char *b) {
     size_t alen = strlen(a);
-    /* 跳过 b 前导斜杠 */
+    /* skip leading slashes of b */
     while (*b == '/') b++;
     size_t blen = strlen(b);
     char *r = malloc(alen + 1 + blen + 1);
     memcpy(r, a, alen);
-    /* 确保 a 末尾有斜杠 */
+    /* make sure a ends with a slash */
     if (alen > 0 && a[alen - 1] != '/') {
         r[alen++] = '/';
     }
@@ -271,7 +271,7 @@ long util_epoch_seconds(void) {
 int util_utf8_char_count(const char *s) {
     int count = 0;
     for (; *s; s++) {
-        /* UTF-8 后续字节是 10xxxxxx (0x80-0xBF)，不计为字符 */
+        /* UTF-8 continuation bytes are 10xxxxxx (0x80-0xBF); not counted */
         if ((*(unsigned char*)s & 0xC0) != 0x80) count++;
     }
     return count;
@@ -280,7 +280,7 @@ int util_utf8_char_count(const char *s) {
 size_t util_utf8_truncate_len(const char *s, size_t max_bytes) {
     size_t len = strlen(s);
     if (len <= max_bytes) return len;
-    /* 从 max_bytes 处往前跳过 UTF-8 后继字节 (10xxxxxx)，确保不在字符中间切断 */
+    /* walk back over UTF-8 continuation bytes so we never cut mid-character */
     while (max_bytes > 0 && ((unsigned char)s[max_bytes] & 0xC0) == 0x80) {
         max_bytes--;
     }
@@ -290,7 +290,7 @@ size_t util_utf8_truncate_len(const char *s, size_t max_bytes) {
 void util_truncate_str(char *s, size_t max_total) {
     size_t len = strlen(s);
     if (len <= max_total) return;
-    /* 留 3 字节给 "..."，UTF-8 安全截断 */
+    /* leave 3 bytes for "..."; UTF-8-safe truncation */
     size_t cut = (max_total >= 3) ? max_total - 3 : 0;
     cut = util_utf8_truncate_len(s, cut);
     s[cut] = '.';
@@ -301,7 +301,7 @@ void util_truncate_str(char *s, size_t max_total) {
 
 void util_truncate_chars(char *s, int max_chars) {
     if (util_utf8_char_count(s) <= max_chars) return;
-    /* 留 3 字符给 "..."，找到前 (max_chars - 3) 个字符的字节位置 */
+    /* leave 3 chars for "..."; find the byte offset of the (max_chars - 3)-th char */
     int target = max_chars >= 3 ? max_chars - 3 : 0;
     int char_count = 0;
     char *p = s;
@@ -353,7 +353,7 @@ int util_write_file(const char *path, const char *content) {
 #include <errno.h>
 
 /* ============================================================
- * 内部辅助
+ * internal helpers
  * ============================================================ */
 
 static void skip_ws(const char *src, size_t *pos) {
@@ -380,22 +380,22 @@ static JsonParse make_val(JsonType type, const char *src, size_t start, size_t e
     return p;
 }
 
-/* 解析 JSON 字符串（从开引号开始） */
+/* parse a JSON string (starting at the opening quote) */
 static JsonParse parse_string(const char *src, size_t *pos) {
     size_t start = *pos;
-    (*pos)++; /* 跳过开引号 */
+    (*pos)++; /* skip opening quote */
     while (src[*pos] && src[*pos] != '"') {
         if (src[*pos] == '\\') {
-            (*pos)++; /* 跳过转义字符 */
+            (*pos)++; /* skip escaped char */
         }
         (*pos)++;
     }
     if (src[*pos] != '"') return make_err("unclosed string");
-    (*pos)++; /* 跳过闭引号 */
+    (*pos)++; /* skip closing quote */
     return make_val(JSON_STRING, src, start, *pos);
 }
 
-/* 解析 JSON 数字 */
+/* parse a JSON number */
 static JsonParse parse_number(const char *src, size_t *pos) {
     size_t start = *pos;
     if (src[*pos] == '-') (*pos)++;
@@ -412,13 +412,13 @@ static JsonParse parse_number(const char *src, size_t *pos) {
     return make_val(JSON_NUMBER, src, start, *pos);
 }
 
-/* 前向声明 */
+/* forward declarations */
 static JsonParse json_parse_internal(const char *src, size_t *pos);
 
-/* 解析 JSON 数组 */
+/* parse a JSON array */
 static JsonParse parse_array(const char *src, size_t *pos) {
     size_t start = *pos;
-    (*pos)++; /* 跳过 [ */
+    (*pos)++; /* skip [ */
     skip_ws(src, pos);
     if (src[*pos] == ']') { (*pos)++; return make_val(JSON_ARRAY, src, start, *pos); }
     for (;;) {
@@ -433,10 +433,10 @@ static JsonParse parse_array(const char *src, size_t *pos) {
     return make_val(JSON_ARRAY, src, start, *pos);
 }
 
-/* 解析 JSON 对象 */
+/* parse a JSON object */
 static JsonParse parse_object(const char *src, size_t *pos) {
     size_t start = *pos;
-    (*pos)++; /* 跳过 { */
+    (*pos)++; /* skip { */
     skip_ws(src, pos);
     if (src[*pos] == '}') { (*pos)++; return make_val(JSON_OBJECT, src, start, *pos); }
     for (;;) {
@@ -458,7 +458,7 @@ static JsonParse parse_object(const char *src, size_t *pos) {
     return make_val(JSON_OBJECT, src, start, *pos);
 }
 
-/* 解析 JSON 值 */
+/* parse a JSON value */
 static JsonParse json_parse_internal(const char *src, size_t *pos) {    skip_ws(src, pos);
     char c = src[*pos];
     if (c == '"') return parse_string(src, pos);
@@ -480,7 +480,7 @@ static JsonParse json_parse_internal(const char *src, size_t *pos) {    skip_ws(
     return make_err("unexpected character");
 }
 
-/* 公开的解析函数 */
+/* public parse entry points */
 JsonParse json_parse(const char *src, size_t *pos) {
     return json_parse_internal(src, pos);
 }
@@ -496,7 +496,7 @@ JsonParse json_parse_root(const char *src) {
 }
 
 /* ============================================================
- * 查询函数
+ * queries
  * ============================================================ */
 
 JsonVal json_get(JsonVal obj, const char *key) {
@@ -505,7 +505,7 @@ JsonVal json_get(JsonVal obj, const char *key) {
         memset(&null_val, 0, sizeof(null_val));
         return null_val;
     }
-    size_t pos = obj.start + 1; /* 跳过 { */
+    size_t pos = obj.start + 1; /* skip { */
     const char *src = obj.src;
     skip_ws(src, &pos);
     if (src[pos] == '}') {
@@ -515,10 +515,10 @@ JsonVal json_get(JsonVal obj, const char *key) {
     }
     for (;;) {
         skip_ws(src, &pos);
-        /* 解析 key */
+        /* parse key */
         JsonParse kp = parse_string(src, &pos);
         if (kp.error) break;
-        /* 比较 key（不含引号） */
+        /* compare key (without quotes) */
         size_t klen = (kp.val.end - 1) - (kp.val.start + 1);
         const char *kstr = src + kp.val.start + 1;
         bool match = (strlen(key) == klen && strncmp(key, kstr, klen) == 0);
@@ -529,7 +529,7 @@ JsonVal json_get(JsonVal obj, const char *key) {
         if (match) {
             return json_parse(src, &pos).val;
         }
-        /* 跳过值 */
+        /* skip the value */
         JsonParse vp = json_parse(src, &pos);
         if (vp.error) break;
         skip_ws(src, &pos);
@@ -549,7 +549,7 @@ char *json_get_string(JsonVal obj, const char *key) {
 int json_get_int(JsonVal obj, const char *key) {
     JsonVal v = json_get(obj, key);
     if (v.type != JSON_NUMBER) return 0;
-    /* 从 src 中提取子串并转 int */
+    /* extract the span and convert to int */
     char buf[64];
     size_t len = v.end - v.start;
     if (len >= sizeof(buf)) return 0;
@@ -581,13 +581,13 @@ bool json_get_bool(JsonVal obj, const char *key, bool def) {
 }
 
 /* ============================================================
- * 数组操作
+ * array operations
  * ============================================================ */
 
 int json_array_len(JsonVal arr) {
     if (arr.type != JSON_ARRAY) return 0;
     int count = 0;
-    size_t pos = arr.start + 1; /* 跳过 [ */
+    size_t pos = arr.start + 1; /* skip [ */
     const char *src = arr.src;
     skip_ws(src, &pos);
     if (src[pos] == ']') return 0;
@@ -634,17 +634,17 @@ JsonVal json_array_get(JsonVal arr, int index) {
 }
 
 /* ============================================================
- * 值提取
+ * value extraction
  * ============================================================ */
 
 char *json_string_val(JsonVal v) {
     if (v.type != JSON_STRING) return NULL;
-    /* 解码 JSON 字符串（去掉引号，处理转义） */
+    /* decode a JSON string (strip quotes, handle escapes) */
     const char *src = v.src;
-    size_t start = v.start + 1; /* 跳过开引号 */
-    size_t end = v.end - 1;     /* 跳过闭引号 */
+    size_t start = v.start + 1; /* skip opening quote */
+    size_t end = v.end - 1;     /* skip closing quote */
     size_t len = end - start;
-    char *buf = malloc(len * 2 + 1); /* 最坏情况 */
+    char *buf = malloc(len * 2 + 1); /* worst case */
     size_t out = 0;
     for (size_t i = start; i < end; i++) {
         if (src[i] == '\\') {
@@ -659,7 +659,7 @@ char *json_string_val(JsonVal v) {
                 case 'r':  buf[out++] = '\r'; break;
                 case 't':  buf[out++] = '\t'; break;
                 case 'u': {
-                    /* \uXXXX — 支持 surrogate pair */
+                    /* \uXXXX - surrogate pairs supported */
                     unsigned int cp = 0;
                     int hex_digits = 0;
                     for (int j = 0; j < 4 && i + 1 < end; j++) {
@@ -671,14 +671,14 @@ char *json_string_val(JsonVal v) {
                         else if (h >= 'A' && h <= 'F') { cp += h - 'A' + 10; hex_digits++; }
                         else break;
                     }
-                    /* 畸形 \u（hex 不足 4 位）→ U+FFFD，避免内嵌 NUL 截断下游 */
+                    /* malformed \u (short hex) -> U+FFFD; avoid embedded NUL */
                     if (hex_digits < 4)
                         cp = 0xFFFD;
-                    /* high surrogate? 检查紧跟的 \uDC00-\uDFFF */
+                    /* high surrogate? check the following \uDC00-\uDFFF */
                     if (cp >= 0xD800 && cp <= 0xDBFF &&
                         i + 1 < end && src[i + 1] == '\\' && src[i + 2] == 'u') {
                         size_t saved = i;
-                        i += 2; /* 跳过 \u */
+                        i += 2; /* skip \u */
                         unsigned int lo = 0;
                         int valid = 1;
                         for (int j = 0; j < 4 && i + 1 < end; j++) {
@@ -692,11 +692,11 @@ char *json_string_val(JsonVal v) {
                         if (valid && lo >= 0xDC00 && lo <= 0xDFFF) {
                             cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                         } else {
-                            /* 不是合法 low surrogate，回退 */
+                            /* not a valid low surrogate; fall back */
                             i = saved;
                         }
                     }
-                    /* UTF-8 编码 */
+                    /* UTF-8 encode */
                     if (cp < 0x80) {
                         buf[out++] = (char)cp;
                     } else if (cp < 0x800) {
@@ -721,7 +721,7 @@ char *json_string_val(JsonVal v) {
         }
     }
     buf[out] = '\0';
-    /* 缩减到实际大小 */
+    /* shrink to the actual size */
     char *result = realloc(buf, out + 1);
     return result ? result : buf;
 }
@@ -738,14 +738,14 @@ double json_number_val(JsonVal v) {
 
 bool json_bool_val(JsonVal v) {
     if (v.type != JSON_BOOL) return false;
-    /* true 的文本是 "true"，false 是 "false" */
+    /* true spells "true", false "false" */
     return v.src[v.start] == 't';
 }
 
 char *json_as_string(JsonVal v) {
     if (v.type == JSON_STRING) return json_string_val(v);
     if (v.type == JSON_NULL) return NULL;
-    /* 其他类型：提取原始文本 */
+    /* other types: take the raw text */
     size_t len = v.end - v.start;
     char *s = malloc(len + 1);
     memcpy(s, v.src + v.start, len);
@@ -754,19 +754,19 @@ char *json_as_string(JsonVal v) {
 }
 
 /* ============================================================
- * Object 迭代器
+ * object iterator
  * ============================================================ */
 
 void json_obj_iter_init(JsonObjectIter *it, JsonVal obj) {
     memset(it, 0, sizeof(*it));
     if (obj.type != JSON_OBJECT) return;
     it->src = obj.src;
-    it->pos = obj.start + 1; /* 跳过 { */
+    it->pos = obj.start + 1; /* skip { */
     it->first = true;
 }
 
 bool json_obj_iter_next(JsonObjectIter *it) {
-    /* 释放上一次迭代的 key */
+    /* free the previous iteration's key */
     free((char *)it->key);
     it->key = NULL;
 
@@ -775,26 +775,26 @@ bool json_obj_iter_next(JsonObjectIter *it) {
     skip_ws(src, &it->pos);
     if (src[it->pos] == '}' || src[it->pos] == '\0') return false;
     if (!it->first) {
-        /* 跳过逗号 */
+        /* skip the comma */
         if (src[it->pos] == ',') it->pos++;
         skip_ws(src, &it->pos);
         if (src[it->pos] == '}' || src[it->pos] == '\0') return false;
     }
     it->first = false;
-    /* 解析 key */
+    /* parse the key */
     JsonParse kp = parse_string(src, &it->pos);
     if (kp.error) return false;
-    /* key 文本（不含引号） */
+    /* key text (without quotes) */
     size_t klen = (kp.val.end - 1) - (kp.val.start + 1);
     char *key = malloc(klen + 1);
     memcpy(key, src + kp.val.start + 1, klen);
     key[klen] = '\0';
-    it->key = key; /* 注意：指向临时 buffer，调用者用完需自行处理 */
-    /* 跳过 : */
+    it->key = key; /* points at a temp buffer */
+    /* skip : */
     skip_ws(src, &it->pos);
     if (src[it->pos] == ':') it->pos++;
     skip_ws(src, &it->pos);
-    /* 解析 value */
+    /* parse the value */
     JsonParse vp = json_parse(src, &it->pos);
     if (vp.error) { free(key); return false; }
     it->val = vp.val;
@@ -802,7 +802,7 @@ bool json_obj_iter_next(JsonObjectIter *it) {
 }
 
 /* ============================================================
- * JSONL 追加
+ * JSONL append
  * ============================================================ */
 
 int jsonl_append(const char *path, const char *json_line) {
@@ -1402,26 +1402,26 @@ void store_session_paths_free(SessionPaths *p) {
 }
 
 char *store_session_project_key(const char *cwd) {
-    /* 对齐 bash 版 AWK 算法：
-     *   sub(/^\/+/, "", $0)              — 去前导 /
+    /* mirrors the bash AWK algorithm:
+     *   sub(/^\/+/, "", $0)              - strip leading /
      *   gsub(/\//, "-", $0)              — / → -
-     *   gsub(/[^A-Za-z0-9._-]/, "-", $0) — 非字母数字._- → -
-     *   gsub(/-+/, "-", $0)              — 压缩连续 -
-     *   sub(/^-+/, "", $0)               — 去前导 -
-     *   sub(/-+$/, "", $0)               — 去尾部 -
-     *   print "-" $0                      — 加 - 前缀
+     *   gsub(/[^A-Za-z0-9._-]/, "-", $0) - map others to -
+     *   gsub(/-+/, "-", $0)              - squeeze runs of -
+     *   sub(/^-+/, "", $0)               - strip leading -
+     *   sub(/-+$/, "", $0)               - strip trailing -
+     *   print "-" $0                      - prefix with -
      */
     if (!cwd || !cwd[0]) return util_strdup("-");
 
     size_t len = strlen(cwd);
-    char *key = malloc(len + 3); /* 足够加前缀 - */
+    char *key = malloc(len + 3); /* room for the - prefix */
     if (!key) return NULL;
 
-    /* 跳过前导 / */
+    /* skip leading / */
     const char *src = cwd;
     while (*src == '/') src++;
 
-    /* 逐步转换 */
+    /* convert in one pass */
     size_t ki = 0;
     char prev = '\0';
     for (; *src; src++) {
@@ -1430,17 +1430,17 @@ char *store_session_project_key(const char *cwd) {
         else if (!(  (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                      (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
             c = '-';
-        /* 压缩连续 - */
+        /* squeeze runs of - */
         if (c == '-' && prev == '-') continue;
         key[ki++] = c;
         prev = c;
     }
     key[ki] = '\0';
 
-    /* 去尾部 - */
+    /* strip trailing - */
     while (ki > 0 && key[ki - 1] == '-') key[--ki] = '\0';
 
-    /* 加前缀 - */
+    /* prefix with - */
     char *result = malloc(ki + 2);
     if (!result) { free(key); return NULL; }
     result[0] = '-';
@@ -1466,7 +1466,7 @@ SessionPaths store_session_paths_for(const char *home, const char *cwd, const ch
     sb_appendf(&buf, "%s/%s", p.base_dir, session_id);
     p.session_dir = util_strdup(buf.data);
 
-    /* 各文件路径 */
+    /* the file paths */
     sb_truncate(&buf, 0);
     sb_appendf(&buf, "%s/conversation.jsonl", p.session_dir);
     p.conversation = util_strdup(buf.data);
@@ -1496,7 +1496,7 @@ SessionPaths store_session_paths_for(const char *home, const char *cwd, const ch
     return p;
 }
 
-/* touch 文件（如果不存在则创建） */
+/* touch a file (create when missing) */
 static int touch_file(const char *path) {
     FILE *f = fopen(path, "a");
     if (!f) return -1;
@@ -1521,7 +1521,7 @@ int store_session_init(const SessionPaths *p, int is_new) {
     touch_file(p->plan_draft);
 
     if (is_new) {
-        /* 写入初始 stats.json */
+        /* write the initial stats.json */
         FILE *f = fopen(p->stats, "w");
         if (!f) return -1;
         fprintf(f, "{\"current_turn_count\":0,\"agent_request_count\":0,"
@@ -1532,12 +1532,12 @@ int store_session_init(const SessionPaths *p, int is_new) {
                    "\"last_updated\":\"\"}\n");
         fclose(f);
 
-        /* 写入 session_start 事件（与 bash 版对齐） */
+        /* write the session_start event (bash parity) */
         {
             StrBuf evt;
             sb_init(&evt);
             sb_append(&evt, "{\"type\":\"session_start\",\"session_id\":");
-            /* 从 session_dir 路径提取 session_id */
+            /* extract session_id from the session_dir path */
             const char *sid = strrchr(p->session_dir, '/');
             sb_append_json_string(&evt, sid ? sid + 1 : "");
             sb_append_char(&evt, '}');
@@ -1548,7 +1548,7 @@ int store_session_init(const SessionPaths *p, int is_new) {
         touch_file(p->stats);
     }
 
-    /* 创建 images 目录 */
+    /* create the images directory */
     {
         char imgdir[1024];
         snprintf(imgdir, sizeof(imgdir), "%s/images", p->session_dir);
@@ -1608,12 +1608,12 @@ char *store_session_resolve_continue(const char *home, const char *cwd) {
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.' || strncmp(entry->d_name, "sub_", 4) == 0) continue;
-        /* 尝试解析目录名为时间戳: YYYYMMDD-HHMMSS-XXXX */
+        /* try to parse the dir name as a timestamp */
         struct stat st;
         sb_truncate(&buf, 0);
         sb_appendf(&buf, "%s/projects/%s/%s", home, key, entry->d_name);
         if (stat(buf.data, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-        /* 优先用 events.jsonl 的 mtime，fallback 到目录 mtime（对齐 bash/rust） */
+        /* prefer events.jsonl mtime, fall back to dir mtime */
         time_t mtime = st.st_mtime;
         size_t base_len = buf.len;
         sb_append(&buf, "/events.jsonl");
@@ -1644,7 +1644,7 @@ int store_session_list_rows(const char *home, const char *cwd, StrBuf *out) {
     int n = scandir(buf.data, &namelist, NULL, alphasort);
     if (n < 0) { sb_free(&buf); free(key); return 0; }
 
-    /* 收集有效 session 的 name 和 mtime */
+    /* collect valid session names and mtimes */
     char **names = calloc(n, sizeof(char *));
     time_t *mtimes = calloc(n, sizeof(time_t));
     int valid = 0;
@@ -1663,11 +1663,11 @@ int store_session_list_rows(const char *home, const char *cwd, StrBuf *out) {
     }
     free(namelist);
 
-    /* 按 mtime 降序排序 */
-    /* 间接排序：用索引数组 */
+    /* sort by mtime, newest first */
+    /* indirect sort via an index array */
     int *order = calloc(valid, sizeof(int));
     for (int i = 0; i < valid; i++) order[i] = i;
-    /* 简单选择排序（session 数量通常不大）—— 用 mtimes[order[i]] 比较 */
+    /* selection sort (few sessions); compare mtimes[order[i]] */
     for (int i = 0; i < valid - 1; i++) {
         for (int j = i + 1; j < valid; j++) {
             if (mtimes[order[j]] > mtimes[order[i]]) {
@@ -1684,12 +1684,12 @@ int store_session_list_rows(const char *home, const char *cwd, StrBuf *out) {
         sb_appendf(&buf, "%s/projects/%s/%s", home, key, names[i]);
         stat(buf.data, &st);
 
-        /* modified: 目录 mtime，格式 YYYY-MM-DD HH:MM（对齐 bash） */
+        /* modified: dir mtime, YYYY-MM-DD HH:MM (bash parity) */
         char time_buf[32];
         struct tm *tm = localtime(&st.st_mtime);
         strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M", tm);
 
-        /* preview: 从 summary.txt 取第一行非空内容，超 60 字符截断为 57 + ... */
+        /* preview: first non-empty summary line; >60 chars -> 57 + ... */
         char preview[1024];
         preview[0] = '\0';
         size_t base_len = buf.len;
@@ -1713,7 +1713,7 @@ int store_session_list_rows(const char *home, const char *cwd, StrBuf *out) {
         }
         sb_truncate(&buf, base_len);
 
-        /* UTF-8 字符数截断（对齐 bash ${#preview} / rust chars().count()） */
+        /* truncate by UTF-8 char count (bash ${#preview} parity) */
         util_truncate_chars(preview, 60);
 
         sb_appendf(out, "%-40s %-16s %s\n", names[i], time_buf, preview);
@@ -1730,7 +1730,7 @@ int store_session_list_rows(const char *home, const char *cwd, StrBuf *out) {
 }
 
 /* ============================================================
- * conversation.jsonl 操作
+ * conversation.jsonl operations
  * ============================================================ */
 
 int store_conv_add_user(const char *path, const char *content) {
@@ -1752,7 +1752,7 @@ int store_conv_add_assistant(const char *path, const char *thinking, const char 
     sb_init(&buf);
     sb_append(&buf, "{\"role\":\"assistant\",\"content\":[");
 
-    /* thinking block — 仅在有内容时写入（空块会被 Claude API 拒绝） */
+    /* thinking block - only when non-empty (Claude API rejects empty) */
     if (thinking && thinking[0]) {
         sb_append(&buf, "{\"type\":\"thinking\",\"thinking\":");
         sb_append_json_string(&buf, thinking);
@@ -1760,7 +1760,7 @@ int store_conv_add_assistant(const char *path, const char *thinking, const char 
         first = 0;
     }
 
-    /* text block — 同上 */
+    /* text block - same */
     if (text && text[0]) {
         if (!first) sb_append(&buf, ",");
         sb_append(&buf, "{\"type\":\"text\",\"text\":");
@@ -1777,12 +1777,12 @@ int store_conv_add_assistant(const char *path, const char *thinking, const char 
         sb_append(&buf, ",\"name\":");
         sb_append_json_string(&buf, tool_names[i]);
         sb_append(&buf, ",\"input\":");
-        sb_append(&buf, tool_inputs[i]); /* 已经是 JSON */
+        sb_append(&buf, tool_inputs[i]); /* already JSON */
         sb_append(&buf, "}");
         first = 0;
     }
 
-    /* 全空（无 thinking/text/tool_use）时补占位 text，保持消息合法 */
+    /* all-empty message gets a placeholder text to stay legal */
     if (first)
         sb_append(&buf, "{\"type\":\"text\",\"text\":\"(empty)\"}");
 
@@ -1826,9 +1826,9 @@ int store_conv_line_count(const char *path, char ***out, int *out_count) {
     ssize_t read_len;
     if (!lines) goto fail;
 
-    /* getline 会按真实换行符扩容，不能将超长 JSONL 记录误当成多行。 */
+    /* getline grows on real newlines; a long JSONL record is one line */
     while ((read_len = getline(&line, &line_cap, f)) != -1) {
-        /* 去除尾部换行 */
+        /* strip trailing newline */
         size_t len = (size_t)read_len;
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             line[--len] = '\0';
@@ -1870,7 +1870,7 @@ int store_conv_trim_tail(const char *path, int keep_lines) {
         return 0;
     }
 
-    /* 重写文件，只保留最后 keep_lines 行 */
+    /* rewrite keeping only the last keep_lines lines */
     FILE *f = fopen(path, "w");
     if (!f) {
         for (int i = 0; i < count; i++) free(lines[i]);
@@ -1919,7 +1919,7 @@ long store_conv_total_bytes(const char *path) {
 }
 
 /* ============================================================
- * stats.json 操作
+ * stats.json operations
  * ============================================================ */
 
 char *store_stats_read(const char *path) {
@@ -1960,30 +1960,30 @@ void store_stats_add_int(JsonVal obj, const char *key, int delta) {
 }
 
 void store_stats_set_int(JsonVal obj, const char *key, int value) {
-    /* 原地修改 JSON 源字符串中的数字值。
-     * 仅在 store_stats_update 的回调中使用。
-     * 新数字位数 <= 旧数字位数时直接覆写，多余位用空格填充。
-     * 新数字位数 > 旧数字位数时无法原地修改，跳过。 */
+    /* modify a numeric value inside the JSON source in place.
+     * Used only as the store_stats_update callback.
+     * If the new number fits, overwrite; pad leftover digits with spaces.
+     * If it does not fit, skip (cannot grow in place). */
     if (!obj.src) return;
-    /* 在源文本中找到 "key":<number> 模式 */
+    /* find "key":<number> in the source text */
     char search[128];
     snprintf(search, sizeof(search), "\"%s\"", key);
     const char *p = strstr(obj.src, search);
     if (!p) return;
     p += strlen(search);
-    /* 跳过空白和冒号 */
+    /* skip whitespace and the colon */
     while (*p == ' ' || *p == ':') p++;
-    /* p 现在指向值的开始 */
+    /* p now points at the start of the value */
     const char *val_start = p;
-    /* 找到值的结束（逗号、}或空白） */
+    /* find the end of the value (comma, } or whitespace) */
     while (*p && *p != ',' && *p != '}' && *p != ' ' && *p != '\n' && *p != '\r') p++;
     int old_len = (int)(p - val_start);
     char new_val[32];
     snprintf(new_val, sizeof(new_val), "%d", value);
     int new_len = (int)strlen(new_val);
-    if (new_len > old_len) return; /* 无法原地扩展 */
+    if (new_len > old_len) return; /* cannot grow in place */
     memcpy((char*)val_start, new_val, new_len);
-    /* 用空格填充多余位置 */
+    /* pad leftover positions with spaces */
     for (int i = new_len; i < old_len; i++) ((char*)val_start)[i] = ' ';
 }
 
@@ -1991,7 +1991,7 @@ int store_stats_get_int(JsonVal obj, const char *key) {
     return json_get_int(obj, key);
 }
 
-/* 简易文件级操作：从 stats 文件中读取整数字段 */
+/* simple file-level helper: read an integer field from the stats file */
 int store_stats_get_file_int(const char *path, const char *key) {
     char *content = store_stats_read(path);
     if (!content) return 0;
@@ -2001,9 +2001,9 @@ int store_stats_get_file_int(const char *path, const char *key) {
     return val;
 }
 
-/* 设置 stats 文件中的整数字段。
- * 读取已有字段；缺失/无效字段按 0 处理；写回标准 stats JSON。
- * 这样旧版本缺字段时，下一次正常写入会自然补齐，不做历史回算。 */
+/* Set an integer field in the stats file.
+ * Reads existing fields; missing/invalid read as 0; writes canonical stats JSON.
+ * Old versions missing fields get them on the next write; no backfill. */
 int store_stats_get_int_file(const char *path, const char *key)
 {
 	char *txt = store_stats_read(path);
@@ -2065,7 +2065,7 @@ void store_stats_set_int_file(const char *path, const char *key, int value) {
     }
 }
 
-/* 通用 stats 更新：读取→修改→写回 */
+/* generic stats update: read -> mutate -> write back */
 int store_stats_update(const char *path, stats_update_fn fn, void *ctx) {
     char *content = util_read_file(path);
     if (!content) return -1;
@@ -2073,10 +2073,10 @@ int store_stats_update(const char *path, stats_update_fn fn, void *ctx) {
     JsonParse jp = json_parse_root(content);
     if (jp.error) { free(content); return -1; }
 
-    /* 调用回调修改（我们用 StrBuf 重新序列化整个对象） */
+    /* let the callback mutate (re-serialize via StrBuf) */
     fn(ctx, jp.val);
 
-    /* 重新序列化 */
+    /* re-serialize */
     StrBuf buf;
     sb_init(&buf);
     sb_append_char(&buf, '{');
@@ -2088,7 +2088,7 @@ int store_stats_update(const char *path, stats_update_fn fn, void *ctx) {
         first = 0;
         sb_append_json_string(&buf, it.key);
         sb_append_char(&buf, ':');
-        /* 值直接取原始文本 */
+        /* value taken verbatim from the source text */
         size_t vlen = it.val.end - it.val.start;
         sb_appendn(&buf, jp.val.src + it.val.start, vlen);
     }
@@ -2102,7 +2102,7 @@ int store_stats_update(const char *path, stats_update_fn fn, void *ctx) {
 }
 
 /* ============================================================
- * events.jsonl 操作
+ * events.jsonl operations
  * ============================================================ */
 
 static _Thread_local int g_store_event_stream_json = 0;
@@ -2128,7 +2128,7 @@ int store_event_lines(const SessionPaths *p, char ***out, int *out_count) {
 }
 
 /* ============================================================
- * summary / plan 文件操作
+ * summary / plan file operations
  * ============================================================ */
 
 char *store_summary_get(const SessionPaths *p) {
@@ -2180,7 +2180,7 @@ int store_plan_clear(const SessionPaths *p) {
 #include <string.h>
 #include <stdio.h>
 
-/* ---- DisplayState（逐字移植） ---- */
+/* ---- DisplayState (ported verbatim) ---- */
 static void ds_init(BaDisplay *ds) {
     memset(ds, 0, sizeof(*ds));
     ds->last_char[0] = '\n';
@@ -2209,10 +2209,10 @@ static void ds_update_last_char(BaDisplay *ds, const char *text) {
     }
 }
 
-/* linenoiseWrite 的非交互等价（busyagent 无 raw-mode 终端） */
+/* non-interactive equivalent of linenoiseWrite (no raw-mode terminal) */
 static void lw_write(const char *s, size_t n) {
-    /* bash-agent 的 linenoiseWrite 为即时输出；流式 delta 不能滞留在
-     * stdout 缓冲（tty 全缓冲/管道场景会整体延迟到退出才可见） */
+    /* bash-agent's linenoiseWrite flushes immediately; streamed deltas
+     * must not sit in stdout buffering (would delay until exit) */
     fwrite(s, 1, n, stdout);
     fflush(stdout);
 }
@@ -2242,7 +2242,7 @@ void ba_disp_init(BaDisplay *d, BaDisplayFormat fmt)
     d->out = stdout;
 }
 
-/* ---- tool_call 摘要（逐字移植 agent_tool_display_summary） ---- */
+/* ---- tool-call summary (verbatim port of agent_tool_display_summary) ---- */
 char *ba_tool_call_summary(const char *name, const char *input_json)
 {
     char *field = NULL;
@@ -2255,7 +2255,7 @@ char *ba_tool_call_summary(const char *name, const char *input_json)
             field = json_get_string(jp.val, "pattern");
         } else if (!strcmp(name, "Bash")) {
             field = json_get_string(jp.val, "command");
-            /* 替换换行为空格，截断过长命令（对齐 bash 版行为） */
+            /* newlines to spaces, truncate long commands (bash parity) */
             if (field) {
                 char *p;
                 while ((p = strchr(field, '\n')) != NULL) *p = ' ';
@@ -2304,7 +2304,7 @@ char *ba_tool_call_summary(const char *name, const char *input_json)
     return xstrdup("");
 }
 
-/* ---- 渲染主体：逐字移植 render_message 双分支 ---- */
+/* ---- main renderer: verbatim port of the render_message branches ---- */
 char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
 {
     StrBuf buf;
@@ -2390,7 +2390,7 @@ char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
         return buf.data;
     }
 
-    /* human 模式（ANSI/截断规则逐字移植） */
+    /* human mode (ANSI/truncation rules ported verbatim) */
     switch (msg->type) {
     case BA_DM_THINKING:
         if (msg->content)
@@ -2473,7 +2473,7 @@ char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
         break;
 
     case BA_DM_SUB_AGENT_START:
-        break;   /* human 无输出（display.c:250 同款） */
+        break;   /* no human output (same as display.c:250) */
 
     case BA_DM_SUB_AGENT_RESULT: {
         ensure_newline(ds);
@@ -2638,8 +2638,8 @@ static void parse_openai_sse_event(StreamCtx *sctx, const char *data, size_t dat
                 char *id = json_get_string(tc, "id");
                 char *name = json_get_string(fn, "name");
                 char *arguments = json_get_string(fn, "arguments");
-                /* 非标准 OpenAI 兼容 API（如 sensenova）在后续 chunk 中
-                 * 发送空字符串 "" 而非省略字段，必须用 [0] 检查避免覆盖 */
+                /* non-standard OpenAI-compatible APIs (e.g. sensenova) send empty
+                 * strings "" instead of omitting fields; [0] guard */
                 if (id && id[0]) {
                     FREE_PTR(tool->id);
                     tool->id = id;
@@ -2659,8 +2659,8 @@ static void parse_openai_sse_event(StreamCtx *sctx, const char *data, size_t dat
             }
         }
         char *finish = json_get_string(choice, "finish_reason");
-        /* 非标准 API 可能用空字符串 "" 代替 null（如 sensenova），
-         * 空字符串不应触发 STOP */
+        /* non-standard APIs may use "" instead of null (e.g. sensenova);
+         * an empty string must not trigger STOP */
         if (finish && finish[0]) {
             if (strcmp(finish, "tool_calls") == 0) {
                 streamctx_emit_openai_tool_calls(sctx);
@@ -2805,8 +2805,8 @@ static void parse_responses_sse_event(StreamCtx *sctx, const char *event, const 
     }
 }
 
-/* 喂入一块解码后的响应体字节，内部按行切分 SSE 事件。
- * 由 bb_http.c 的数据泵调用；返回 0 表示收到取消信号应中止。 */
+/* Feed one decoded chunk of body; splits SSE events internally.
+ * Called by the http pump; returns 0 when cancelled. */
 int sse_stream_feed(StreamCtx *sctx, const char *ptr, size_t total) {
     if (sctx->cancelled && *(sctx->cancelled)) return 0;
 
@@ -2844,7 +2844,7 @@ int sse_stream_feed(StreamCtx *sctx, const char *ptr, size_t total) {
     return 1;
 }
 
-/* 初始化/释放 StreamCtx（原 http_post_sse 中的内联初始化抽出） */
+/* init/free StreamCtx (extracted from the old inline init) */
 void sse_stream_init(StreamCtx *sctx, const char *provider,
                      sse_callback_fn callback, void *ctx,
                      volatile int *cancelled) {
@@ -2857,8 +2857,8 @@ void sse_stream_init(StreamCtx *sctx, const char *provider,
 }
 
 
-/* 流结束后：处理非 SSE 的残留 JSON、检查 responses 是否收到终止事件。
- * 对应原 curl 版 http_post_sse 成功分支的收尾逻辑。 */
+/* After the stream: handle leftover non-SSE JSON, check responses termination.
+ * Mirrors the success tail of the old curl-based http_post_sse. */
 void sse_stream_finish(StreamCtx *sctx, const char *provider,
                        sse_callback_fn callback, void *ctx) {
     process_residual_json(sctx, provider, callback, ctx);
@@ -2875,10 +2875,10 @@ void sse_stream_free(StreamCtx *sctx) {
 }
 
 /* ============================================================
- * HTTP 请求
+ * HTTP request
  * ============================================================ */
 
-/* forward declaration — 定义在 sse_parse_event 之前 */
+/* forward declaration - defined before sse_parse_event */
 static void emit_simple_event(sse_callback_fn callback, void *ctx,
                               SseEventType type, const char *content);
 
@@ -2901,7 +2901,7 @@ static void fill_openai_usage_event(SseEvent *evt, JsonVal usage) {
     }
 }
 
-/* 处理非 SSE 响应：如果 line_buf 中有残留 JSON，作为完整响应解析 */
+/* handle non-SSE responses: parse leftover JSON in line_buf as a full reply */
 static void process_residual_json(StreamCtx *sctx, const char *provider,
                                   sse_callback_fn callback, void *ctx) {
     if (!sctx->line_buf.data || sctx->line_buf.len == 0) return;
@@ -3019,7 +3019,7 @@ static void process_residual_json(StreamCtx *sctx, const char *provider,
 
 
 /* ============================================================
- * SSE 事件解析
+ * SSE event parsing
  * ============================================================ */
 
 static void emit_simple_event(sse_callback_fn callback, void *ctx,
@@ -3027,12 +3027,12 @@ static void emit_simple_event(sse_callback_fn callback, void *ctx,
     SseEvent evt;
     memset(&evt, 0, sizeof(evt));
     evt.type = type;
-    evt.content = (char *)content;  /* 临时，不 free */
+    evt.content = (char *)content;  /* borrowed, not freed */
     callback(ctx, &evt);
 }
 
-/* 在回调中复制字符串的工具函数 */
-/* 保留备用 */
+/* helpers that copy strings inside the callback */
+/* kept for future use */
 #if 0
 static char *dup_and_free(char *s) {
     return util_strdup(s);
@@ -3047,13 +3047,13 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
         return 0;
     }
 
-    /* 解析 JSON */
+    /* parse JSON */
     size_t pos = 0;
     JsonParse jp = json_parse(data, &pos);
     if (jp.error) return 0;
 
     if (strcmp(provider, "claude") == 0) {
-        /* Claude SSE 格式 */
+        /* Claude SSE format */
         char *type = json_get_string(jp.val, "type");
         if (!type) return 0;
 
@@ -3067,14 +3067,14 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
                 char *text = json_get_string(delta, "thinking");
                 if (text) { emit_simple_event(callback, ctx, SSE_THINKING, text); free(text); }
             } else if (dtype && strcmp(dtype, "input_json_delta") == 0) {
-                /* 工具调用 input 增量 */
+                /* tool-call input delta */
                 char *partial = json_get_string(delta, "partial_json");
                 if (partial) {
                     SseEvent evt;
                     memset(&evt, 0, sizeof(evt));
                     evt.type = SSE_TOOL_INPUT_DELTA;
                     evt.content = partial;
-                    evt.tool_id = NULL; /* index 用于匹配 */
+                    evt.tool_id = NULL; /* index is used for matching */
                     callback(ctx, &evt);
                     free(partial);
                 }
@@ -3092,13 +3092,13 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
                 evt.tool_id = id;
                 evt.tool_name = name;
                 callback(ctx, &evt);
-                /* 回调中已复制，这里释放 */
+                /* copied in the callback; free here */
                 free(id);
                 free(name);
             }
             free(cb_type);
         } else if (strcmp(type, "content_block_stop") == 0) {
-            /* 工具调用完成 — 由累积器在收到 stop 后统一处理 */
+            /* tool call complete - the accumulator handles it after stop */
         } else if (strcmp(type, "message_delta") == 0) {
             JsonVal delta = json_get(jp.val, "delta");
             char *stop_reason = json_get_string(delta, "stop_reason");
@@ -3112,8 +3112,8 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
                 memset(&evt, 0, sizeof(evt));
                 evt.type = SSE_USAGE;
                 evt.out_tokens = json_get_int(usage, "output_tokens");
-                /* input/cache_* 字段仅在 message_start 未提供时取（与 Rust 版对齐）
-                 * OpenAI 路径无 message_start，通过 transport 合成 message_delta */
+                /* input/cache_* only when message_start did not provide them (Rust parity);
+                 * the OpenAI path has no message_start; transport synthesizes it */
                 int it = json_get_int(usage, "input_tokens");
                 int cr = json_get_int(usage, "cache_read_input_tokens");
                 int cc = json_get_int(usage, "cache_creation_input_tokens");
@@ -3135,7 +3135,7 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
                 callback(ctx, &evt);
             }
         } else if (strcmp(type, "error") == 0) {
-            /* Claude 错误形如 {"type":"error","error":{"type":..,"message":..}} */
+            /* Claude errors look like {"type":"error","error":{...}} */
             char *msg = NULL;
             JsonVal err_obj = json_get(jp.val, "error");
             if (err_obj.type == JSON_OBJECT)
@@ -3147,7 +3147,7 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
         }
         free(type);
     } else {
-        /* OpenAI SSE 格式 */
+        /* OpenAI SSE format */
         char *obj_type = json_get_string(jp.val, "object");
         if (!obj_type) return 0;
 
@@ -3225,7 +3225,7 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
 }
 
 /* ============================================================
- * SSE 累积器
+ * SSE accumulator
  * ============================================================ */
 
 void sse_accum_init(SseAccumulator *acc) {
@@ -3288,7 +3288,7 @@ void sse_accum_callback(void *ctx, const SseEvent *evt) {
     }
 
     case SSE_TOOL_CALL: {
-        /* 完整的工具调用（非增量模式，如 OpenAI） */
+        /* complete tool call (non-streaming, e.g. OpenAI) */
         if (acc->tool_count >= acc->tool_cap) {
             acc->tool_cap *= 2;
             acc->tools = realloc(acc->tools, acc->tool_cap * sizeof(ToolCallAccum));
@@ -3324,7 +3324,7 @@ void sse_accum_callback(void *ctx, const SseEvent *evt) {
         break;
 
     case SSE_RETRY:
-        /* 清空当前累积（对齐 stream_display_callback） */
+        /* reset current accumulation (stream_display_callback parity) */
         sb_truncate(&acc->text, 0);
         sb_truncate(&acc->thinking, 0);
         for (int i = 0; i < acc->tool_count; i++) {
@@ -3344,7 +3344,7 @@ void sse_accum_callback(void *ctx, const SseEvent *evt) {
 }
 
 /* ============================================================
- * 请求体构建
+ * request body building
  * ============================================================ */
 
 char *build_claude_request(const char *model, const char *system_prompt,
@@ -3354,7 +3354,7 @@ char *build_claude_request(const char *model, const char *system_prompt,
     StrBuf buf;
     sb_init(&buf);
 
-    /* 字段顺序对齐 Go/Rust 的 map 字母序：
+    /* field order matches the Go/Rust map alphabetical order:
      * max_tokens → messages → model → output_config → stream → system → thinking → tools */
     sb_append(&buf, "{\"max_tokens\":");
     sb_appendf(&buf, "%d", max_tokens);
@@ -3371,7 +3371,7 @@ char *build_claude_request(const char *model, const char *system_prompt,
     sb_append(&buf, ",\"model\":");
     sb_append_json_string(&buf, model);
 
-    /* output_config (仅 thinking != disabled) */
+    /* output_config (only when thinking != disabled) */
     if (thinking && strcmp(thinking, "disabled") != 0) {
         sb_append(&buf, ",\"output_config\":{\"effort\":");
         sb_append_json_string(&buf, effort ? effort : "high");
@@ -3387,7 +3387,7 @@ char *build_claude_request(const char *model, const char *system_prompt,
         sb_append_json_string(&buf, system_prompt);
     }
 
-    /* thinking (仅 thinking != disabled) */
+    /* thinking (only when thinking != disabled) */
     if (thinking && strcmp(thinking, "disabled") != 0) {
         sb_append(&buf, ",\"thinking\":{\"type\":");
         sb_append_json_string(&buf, thinking);
@@ -3403,7 +3403,7 @@ char *build_claude_request(const char *model, const char *system_prompt,
     sb_append(&buf, "}");
 
     char *result = buf.data;
-    /* 不要 sb_free，因为我们返回 buf.data */
+    /* no sb_free: we return buf.data */
     return result;
 }
 
@@ -3780,10 +3780,10 @@ char *convert_to_responses(const char *claude_body) {
 #include <sys/utsname.h>
 
 /* ============================================================
- * system prompt 构建 — 辅助函数（逐字移植）
+ * system prompt building - helpers (ported verbatim)
  * ============================================================ */
 
-/* 追加 XML section：<tag>\ncontent\n</tag> 或 <tag name="name">\ncontent\n</tag> */
+/* append an XML section: <tag>... or <tag name=...> */
 static void prompt_append_attr_escaped(StrBuf *buf, const char *src) {
     if (!src) return;
     for (; *src; src++) {
@@ -3826,12 +3826,12 @@ static void prompt_append_section(StrBuf *buf, const char *tag,
     }
 }
 
-/* util_path_join 等价物（busybox 侧无该 helper） */
+/* util_path_join equivalent (busybox has no such helper) */
 static char *pj(const char *a, const char *b) {
     return xasprintf("%s/%s", a, b);
 }
 
-/* util_read_file 等价物 */
+/* util_read_file equivalent */
 static char *read_all(const char *path) {
     int fd = open(path, O_RDONLY);
     long sz;
@@ -3848,7 +3848,7 @@ static char *read_all(const char *path) {
     return buf;
 }
 
-/* 检测 locale：LC_ALL → LC_MESSAGES → LANG → "en_US"，去掉 .xxx 后缀 */
+/* locale detection: LC_ALL -> LC_MESSAGES -> LANG -> "en_US", strip .xxx */
 static const char *detect_locale(void) {
     static char buf[128];
     const char *loc = getenv("LC_ALL");
@@ -3864,9 +3864,9 @@ static const char *detect_locale(void) {
     return buf;
 }
 
-/* 在 dir 下查找指令文件（AGENTS.md / AGENT.md；通用 agent 目录，不绑定特定工具），
- * 返回内容（需 free），无则 NULL。bash-agent 还会找 CLAUDE.md 变体，此处按
- * 项目决定不绑 Claude 目录。 */
+/* find an instructions file in dir (AGENTS.md / AGENT.md; generic agent dirs),
+ * Returns malloc'd content or NULL. bash-agent also looks for CLAUDE.md
+ * variants; this project does not bind Claude dirs. */
 static char *find_instruction_file(const char *dir) {
     const char *candidates[] = { "AGENTS.md", "AGENT.md", NULL };
     int i;
@@ -3882,7 +3882,7 @@ static char *find_instruction_file(const char *dir) {
     return NULL;
 }
 
-/* 从 SKILL.md 内容中提取摘要：优先 description: 行，否则取第一个非空非标题非---行 */
+/* extract a summary from SKILL.md: prefer description:, else first non-empty non-heading non--- line */
 static void extract_skill_summary(const char *md, StrBuf *out) {
     const char *p = md;
     char line[1024];
@@ -3890,7 +3890,7 @@ static void extract_skill_summary(const char *md, StrBuf *out) {
     char fallback[1024] = "";
 
     while (*p) {
-        /* 读取一行 */
+        /* read one line */
         int li = 0;
         while (*p && *p != '\n' && li < (int)sizeof(line) - 1) {
             line[li++] = *p++;
@@ -3908,11 +3908,11 @@ static void extract_skill_summary(const char *md, StrBuf *out) {
                 *e = '\0';
                 if (*s == '\0') continue;
 
-                /* description: 行 */
+                /* description: line */
                 if (strncmp(s, "description:", 12) == 0) {
                     char *val = s + 12;
                     while (*val == ' ' || *val == '\t') val++;
-                    /* 去掉引号 */
+                    /* strip quotes */
                     size_t vl = strlen(val);
                     if (vl >= 2 && ((val[0] == '"' && val[vl-1] == '"') ||
                                     (val[0] == '\'' && val[vl-1] == '\''))) {
@@ -3923,7 +3923,7 @@ static void extract_skill_summary(const char *md, StrBuf *out) {
                     found = 1;
                     return;
                 }
-                /* fallback：非标题、非---、非``` */
+                /* fallback: not a heading, not ---, not ``` */
                 if (!found && fallback[0] == '\0' && s[0] != '#' &&
                     !(s[0] == '-' && s[1] == '-' && s[2] == '-' && s[3] == '\0') &&
                     !(s[0] == '`' && s[1] == '`' && s[2] == '`')) {
@@ -3938,8 +3938,8 @@ static void extract_skill_summary(const char *md, StrBuf *out) {
     }
 }
 
-/* 扫描 skill 目录列表（去重），构建 skill-index。
- * busyagent 目录序：cwd/skills > $HOME/.agents/skills > bag_home/skills */
+/* scan the skill dir list (dedup) and build the skill-index.
+ * order: cwd/skills > $HOME/.agents/skills > bag_home/skills */
 static void build_skill_index(StrBuf *index, const char *cwd,
                               const char *agents_home, const char *bag_home) {
     char *dirs[4];
@@ -3952,7 +3952,7 @@ static void build_skill_index(StrBuf *index, const char *cwd,
             dirs[dcount++] = xasprintf("%s/skills", bag_home);
     }
 
-    /* 去重 seen 列表 */
+    /* dedup via the seen list */
     char *seen[256];
     int seen_count = 0;
 
@@ -3962,23 +3962,23 @@ static void build_skill_index(StrBuf *index, const char *cwd,
         struct dirent *ent;
         while ((ent = readdir(dir)) != NULL) {
             if (ent->d_name[0] == '.') continue;
-            /* 检查是否已 seen */
+            /* already seen? */
             int dup = 0;
             for (int s = 0; s < seen_count; s++) {
                 if (strcmp(seen[s], ent->d_name) == 0) { dup = 1; break; }
             }
             if (dup) continue;
 
-            /* 检查 SKILL.md 是否存在 */
+            /* SKILL.md present? */
             char *skill_md = xasprintf("%s/%s/SKILL.md", dirs[d], ent->d_name);
             char *md_content = read_all(skill_md);
             free(skill_md);
             if (!md_content || !md_content[0]) { free(md_content); continue; }
 
-            /* 记录 seen */
+            /* mark seen */
             if (seen_count < 256) seen[seen_count++] = util_strdup(ent->d_name);
 
-            /* 提取摘要 */
+            /* extract the summary */
             StrBuf summary;
             sb_init(&summary);
             extract_skill_summary(md_content, &summary);
@@ -4015,7 +4015,7 @@ char *ba_load_skill(const char *skill_name, const char *cwd,
         content = read_all(md_path);
         free(md_path);
         if (content) {
-            /* 替换 ${BA_AGENT_SKILL_DIR} 占位符 */
+            /* replace ${BA_AGENT_SKILL_DIR} placeholders */
             const char *placeholder = strstr(content, "${BA_AGENT_SKILL_DIR}");
             if (placeholder) {
                 StrBuf replaced;
@@ -4027,7 +4027,7 @@ char *ba_load_skill(const char *skill_name, const char *cwd,
                 free(content);
                 content = replaced.data;
             }
-            /* 格式: Base directory: <dir>\n\n<content>（与 bash-agent 一致） */
+            /* format: Base directory: <dir>\n\n<content> (bash-agent parity) */
             StrBuf full;
             sb_init(&full);
             sb_appendf(&full, "Base directory: %s\n\n%s", skill_dir_path, content);
@@ -4044,7 +4044,7 @@ char *ba_load_skill(const char *skill_name, const char *cwd,
 }
 
 /* ============================================================
- * system prompt 构建 — 主函数（块顺序与文本对齐 bash-agent）
+ * system prompt building - main function (block order follows bash-agent)
  * ============================================================ */
 
 char *ba_build_prompt(const BaPromptCtx *ctx) {
@@ -4102,7 +4102,7 @@ char *ba_build_prompt(const BaPromptCtx *ctx) {
         prompt_append_section(&buf, "using-your-tools", tool_guidance, NULL);
     }
 
-    /* 5. sub-agent-guidance（同步语义微调，其余逐字） */
+    /* 5. sub-agent-guidance (sync wording adjusted, rest verbatim) */
     {
         const char *sag =
             "- **When to use**: delegating independent sub-tasks that do NOT need your current conversation context — e.g. investigating a separate file, running a focused search, testing a hypothesis in isolation.\n"
@@ -4113,7 +4113,7 @@ char *ba_build_prompt(const BaPromptCtx *ctx) {
         prompt_append_section(&buf, "sub-agent-guidance", sag, NULL);
     }
 
-    /* 6. todo-guidance（逐字） */
+    /* 6. todo-guidance (verbatim) */
     {
         const char *todo =
             "- Use TodoWrite proactively for complex multi-step implementation, debugging, refactoring, review, or multi-file tasks.\n"
@@ -4183,7 +4183,7 @@ char *ba_build_prompt(const BaPromptCtx *ctx) {
     {
         char *plan = ctx->plan ? read_all(ctx->plan) : NULL;
         if (plan && plan[0]) {
-            /* bash 版 name 属性 = plan 文件路径 */
+            /* bash version: name attribute = plan file path */
             prompt_append_section(&buf, "current-plan", plan, ctx->plan);
         }
         free(plan);
@@ -4202,7 +4202,7 @@ char *ba_build_prompt(const BaPromptCtx *ctx) {
         sb_free(&ol);
     }
 
-    /* 去掉末尾 \n（bash 版 printf '%s' "${output%$'\\n'}"） */
+    /* drop the trailing \n (bash printf '%s' semantics) */
     if (buf.len > 0 && buf.data[buf.len - 1] == '\n') {
         buf.data[buf.len - 1] = '\0';
         buf.len--;
@@ -4252,8 +4252,8 @@ typedef struct {
 
 static BaTool *g_tools;
 static int g_tool_count;
-static char *g_tools_json_text;   /* 当前生效的 tools 数组原文 */
-static const SessionPaths *g_paths;   /* 内置状态工具（Plan*）的会话落点 */
+static char *g_tools_json_text;   /* raw text of the active tools array */
+static const SessionPaths *g_paths;   /* session sink for builtin state tools */
 
 static char *read_file_all(const char *path)
 {
@@ -4360,7 +4360,7 @@ void ba_tools_free(void)
 	g_tools_json_text = NULL;
 }
 
-/* span 复制：JsonVal 是 (src,start,end) 视图 */
+/* span copy: JsonVal is a (src,start,end) view */
 static char *val_span_dup(const char *src, JsonVal v)
 {
     size_t n = v.end - v.start;
@@ -4370,10 +4370,10 @@ static char *val_span_dup(const char *src, JsonVal v)
     return s;
 }
 
-/* 当前生效的 tools 数组（LLM 视角：剥离 busyagent 专有的 exec 字段）。
- * 无工具表时返回 NULL —— 调用方据此在请求中省略 tools 字段。 */
-/* LLM 看到的 tools 数组 = 内置 11 项 + 动态区（剥离 exec）。
- * 无动态区时仅内置（sh 锚点保证能力完备）。 */
+/* The tools array as the LLM sees it (exec stripped).
+ * NULL when no table: the caller omits tools from the request. */
+/* LLM-visible tools = 11 builtins + dynamic zone (exec stripped).
+ * Without a dynamic zone only the builtins ship (sh anchor). */
 char *ba_tools_json(void)
 {
     const char *src = g_tools_json_text;
@@ -4390,14 +4390,14 @@ char *ba_tools_json(void)
         n = json_array_len(jp.val);
         sb_init(&sb);
         sb_append(&sb, ba_builtin_schemas);
-        sb_truncate(&sb, sb.len - 2);   /* 去掉 "]\n" 结尾，追加动态区 */
+        sb_truncate(&sb, sb.len - 2);   /* drop trailing "]\n", append dynamic zone */
         for (i = 0; i < n; i++) {
             JsonVal item = json_array_get(jp.val, i);
             JsonVal fnv = json_get(item, "function");
             char *nm = (fnv.type != JSON_NULL)
                      ? json_get_string(fnv, "name")
                      : json_get_string(item, "name");
-            /* 内置名不允许动态区覆盖 */
+            /* builtin names may not be shadowed */
             if (nm && (!strcmp(nm, "Read") || !strcmp(nm, "Write") || !strcmp(nm, "Edit")
                     || !strcmp(nm, "Bash") || !strcmp(nm, "Glob") || !strcmp(nm, "Grep")
                     || !strcmp(nm, "TodoWrite") || !strcmp(nm, "PlanConfirm")
@@ -4422,11 +4422,11 @@ char *ba_tools_json(void)
     return sb.data;
 }
 
-/* 动态区示例模板（-i 导出）：与内置 11 项不重叠的 POSIX 直给原语 */
+/* dynamic-zone starter template (-i export) */
 /* template is derived from ba_builtin_schemas at write time */
 
-/* 导出动态区示例模板到 path。条目名不得与内置 11 项重叠
- * （运行期同样强制过滤）。返回 0 成功；-1 已存在；-2 写失败。 */
+/* Export the starter tools table to path. Entry names must not overlap
+ * the builtins (enforced at runtime too). 0 ok; -1 exists; -2 write error. */
 int ba_tools_write_template(const char *path)
 {
 	int fd;
@@ -4658,7 +4658,7 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 		return sb.data;
 	}
 
-	/* ---- 内置保留名（L2/L3）：主循环语义，不走 exec 映射 ---- */
+	/* ---- builtin reserved names (L2/L3): loop-level semantics ---- */
 
 	if (strcmp(name, "Bash") == 0) {
 		char *cmd = json_get_string(jp.val, "command");
@@ -4673,10 +4673,10 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 		}
 
 		if (background) {
-			/* 对齐 bash-agent async_bash_thread_fn：mkstemp 临时文件接
-			 * stdout/stderr，setpgid 进程组隔离，立即返回 task_id。
-			 * 差异：bash-agent 经 msgqueue 以 async_task_result 事件回注；
-			 * 单 turn 无该通道，故告知模型稍后用 Read 读临时文件。 */
+			/* Mirrors async_bash_thread_fn: mkstemp captures stdout/stderr,
+			 * setpgid isolates the group, returns task_id immediately.
+			 * Difference: bash-agent re-injects via msgqueue;
+			 * single-turn has no such channel, the model Reads the file later. */
 			char tmp_template[] = "/tmp/ba_async_bash_XXXXXX";
 			int tmpfd = mkstemp(tmp_template);
 			pid_t pid;
@@ -4698,7 +4698,7 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 				return sb.data;
 			}
 			if (pid == 0) {
-				/* 双 fork：孙进程由 init 收养，busyagent 立即返回 */
+				/* double fork: init adopts the grandchild */
 				pid_t pid2 = fork();
 				if (pid2 == 0) {
 					setpgid(0, 0);
@@ -4715,12 +4715,12 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 						_exit(127);
 					}
 				}
-				_exit(0);   /* 中间代立即退出 */
+				_exit(0);   /* the middle generation exits */
 			}
 			setpgid(pid, pid);
 			close(tmpfd);
 			while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
-				continue;   /* 只收中间代；真任务由 init 收养 */
+				continue;   /* reap only the middle child */
 
 			snprintf(resp, sizeof(resp),
 			         "Async task started: task_id=%s. Output file (read it with "
@@ -4734,7 +4734,7 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 			char *sh_argv[4];
 			int tmo = tmo_ms;
 			if (!tmo && tmo_sec > 0)
-				tmo = tmo_sec * 1000;   /* bash-agent 秒制参数兼容 */
+				tmo = tmo_sec * 1000;   /* bash-agent takes seconds */
 			if (!tmo)
 				tmo = timeout_ms;
 
@@ -4752,7 +4752,7 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 	}
 
 	if (strcmp(name, "Read") == 0) {
-		/* cat -n 语义：整文件或 offset/limit 分页（纯 C，无 fork） */
+		/* cat -n semantics: whole file or offset/limit paging (no fork) */
 		char *path = json_get_string(jp.val, "path");
 		int offset = json_get_int(jp.val, "offset");
 		int limit = json_get_int(jp.val, "limit");
@@ -4846,9 +4846,9 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 				StrBuf nb;
 				sb_init(&nb);
 				sb_append(&nb, data);
-				sb_truncate(&nb, hit - data);   /* 前段 */
-				sb_append(&nb, new_s);          /* 替换文本 */
-				sb_append(&nb, hit + strlen(old_s)); /* 后段 */
+				sb_truncate(&nb, hit - data);   /* head */
+				sb_append(&nb, new_s);          /* replacement */
+				sb_append(&nb, hit + strlen(old_s)); /* tail */
 				{
 					int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 					if (fd < 0) {
@@ -4936,13 +4936,13 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 	}
 
 	if (strcmp(name, "TodoWrite") == 0) {
-		/* todos 数组 → markdown checklist，仅作为 tool_result 回喂。
-		 * 持久化由 conversation history 承担（本工具的完整调用记录
-		 * 就是状态本身），不落盘、不注入 system prompt。 */
+		/* todos array -> markdown checklist, fed back as the tool result.
+		 * Persistence lives in the conversation history (the full call record
+		 * IS the state); nothing hits disk or the system prompt. */
 		JsonVal todos = json_get(jp.val, "todos");
 		int total, i;
 		if (todos.type != JSON_ARRAY) {
-			sb_append(&sb, "OK");   /* 对齐 bash-agent：非法形状不报错 */
+			sb_append(&sb, "OK");   /* bash-agent parity: no error on bad shapes */
 			return sb.data;
 		}
 		total = json_array_len(todos);
@@ -4957,7 +4957,7 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 			sb_append(&sb, "\n");
 			free(content); free(st);
 		}
-		/* 去掉末尾换行（对齐 bash-agent） */
+		/* drop the trailing newline (bash-agent parity) */
 		if (sb.len > 0 && sb.data[sb.len - 1] == '\n') {
 			sb.data[sb.len - 1] = '\0';
 			sb.len--;
@@ -4974,8 +4974,8 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 		}
 		store_plan_set(g_paths, draft);
 		store_plan_draft_clear(g_paths);
-		/* 注：bash-agent 由 agent_loop 在 compact 后执行 mv；本实现为单 turn
- * 同步模型、无 compact 机制，故在此直接落盘 */
+		/* note: bash-agent moves the file after compaction; this port
+ * is synchronous without compaction, so write it here */
 		sb_append(&sb, "Plan confirmed and locked in.");
 		free(draft);
 		return sb.data;
@@ -4989,9 +4989,9 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 	}
 
 	if (strcmp(name, "Skill") == 0) {
-		/* L2 知识级：经 ba_load_skill 统一搜索
+		/* L2 knowledge level: unified search via ba_load_skill
 		 * cwd/skills > ~/.agents/skills > $BB_AGENT_HOME/skills，
-		 * 支持 ${BA_AGENT_SKILL_DIR} 占位符替换 */
+		 * supports ${BA_AGENT_SKILL_DIR} substitution */
 		char *skill = json_get_string(jp.val, "name");
 		const char *agents_home = getenv("HOME");
 		const char *bag_home = getenv("BB_AGENT_HOME");
@@ -5021,12 +5021,12 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 	}
 
 	if (strcmp(name, "SubAgent") == 0) {
-		/* 占位：由 turn 循环层截获处理（bash-agent tools.c 同款） */
+		/* placeholder: intercepted by the turn loop (tools.c parity) */
 		sb_append(&sb, "SubAgent handled by agent layer");
 		return sb.data;
 	}
 
-	/* ---- L0/L1：exec 映射 ---- */
+	/* ---- L0/L1: exec mapping ---- */
 
 	tool = find_tool(name);
 	if (!tool || !tool->applet) {

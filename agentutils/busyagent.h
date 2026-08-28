@@ -8,14 +8,14 @@
 #include <stddef.h>
 
 /*
- * 工具函数 — 字符串处理、路径拼接、时间戳等
+ * utility functions - strings, paths, timestamps
  */
 
-/* 动态字符串缓冲区 */
+/* growable string buffer */
 typedef struct {
     char *data;
-    size_t len;      /* 当前字符串长度（不含 '\0'） */
-    size_t cap;      /* 缓冲区容量 */
+    size_t len;      /* current length (excluding '\0') */
+    size_t cap;      /* buffer capacity */
 } StrBuf;
 
 void sb_init(StrBuf *sb);
@@ -26,66 +26,66 @@ void sb_appendn(StrBuf *sb, const char *s, size_t n);
 void sb_appendf(StrBuf *sb, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 void sb_append_char(StrBuf *sb, char c);
-/* 截断到指定长度 */
+/* truncate to a given length */
 void sb_truncate(StrBuf *sb, size_t len);
 
-/* JSON 字符串转义：将 src 转义后追加到 sb */
+/* JSON-escape src and append to sb */
 void sb_append_json_string(StrBuf *sb, const char *src);
-/* shell 参数转义：将 src 作为单个 shell 参数安全追加到 sb */
+/* shell-quote src as one argument and append to sb */
 void sb_append_shell_arg(StrBuf *sb, const char *src);
 
-/* 生成 session id: YYYYMMDD-HHMMSS-XXXX */
+/* session id: YYYYMMDD-HHMMSS-XXXX */
 char *util_new_session_id(void);
 
-/* 路径拼接：a/b （处理尾部/前导斜杠） */
+/* join paths a/b (handles trailing/leading slashes) */
 char *util_path_join(const char *a, const char *b);
 
-/* 确保目录存在（递归创建，类似 mkdir -p） */
+/* ensure a directory exists (recursive, mkdir -p) */
 int util_mkdirs(const char *path, int mode);
 
-/* 获取家目录路径 */
+/* home directory path */
 const char *util_home_dir(void);
 
-/* 复制字符串（strdup 的安全版本，NULL 安全） */
+/* strdup, NULL-safe */
 char *util_strdup(const char *s);
 
-/* 安全的 free + 置 NULL */
+/* free + NULL */
 #define FREE_PTR(p) do { free(p); (p) = NULL; } while(0)
 
-/* 从环境变量读取，带默认值 */
+/* getenv with a default */
 const char *util_env(const char *name, const char *defval);
 
-/* 获取当前时间戳字符串 (ISO 8601) */
+/* current timestamp string (ISO 8601) */
 char *util_timestamp_now(void);
 
-/* 解析带 k/m/g 后缀的数字（对齐 bash 版 util_parse_size） */
+/* parse a number with k/m/g suffixes (util_parse_size parity) */
 long util_parse_size(const char *s);
 
-/* 获取当前 epoch 秒 */
+/* current epoch seconds */
 long util_epoch_seconds(void);
 
-/* 计算 UTF-8 字符数（近似 token 计数用） */
+/* count UTF-8 characters (approximate token counting) */
 int util_utf8_char_count(const char *s);
 
-/* 返回不超过 max_bytes 的安全截断位置（不切断 UTF-8 多字节字符） */
+/* largest offset <= max_bytes that never splits a UTF-8 char */
 size_t util_utf8_truncate_len(const char *s, size_t max_bytes);
 
-/* 原地截断到 max_total 字节以内（UTF-8 安全），超长时尾部追加 "..." */
+/* truncate in place to max_total bytes (UTF-8 safe), append "..." */
 void util_truncate_str(char *s, size_t max_total);
 
-/* 原地截断到 max_chars 个 UTF-8 字符以内，超长时尾部追加 "..." */
+/* truncate in place to max_chars UTF-8 chars, append "..." */
 void util_truncate_chars(char *s, int max_chars);
 
-/* UTF-8 sanitize：将非法字节替换为 \ufffd 字面文本，返回新 malloc'd 字符串 */
+/* UTF-8 sanitize: invalid bytes become the \ufffd literal, malloc'd */
 char *util_sanitize_utf8(const char *src);
 
-/* trim 尾部空白 */
+/* trim trailing whitespace */
 char *util_rtrim(char *s);
 
-/* 读取整个文件到字符串 */
+/* read a whole file into a string */
 char *util_read_file(const char *path);
 
-/* 写入整个文件 */
+/* write a whole file */
 int util_write_file(const char *path, const char *content);
 
 #endif /* UTIL_H */
@@ -98,16 +98,16 @@ int util_write_file(const char *path, const char *content);
 #include <stdbool.h>
 
 /*
- * 轻量 JSON 解析器 — 仅支持解析 Claude/OpenAI API 响应和 conversation.jsonl
+ * lightweight JSON parser - what Claude/OpenAI responses and
  *
- * 设计：
- *   - 单遍扫描，零拷贝（值指向原始 JSON 字符串内部）
- *   - 提供 json_get_string 等提取函数，返回需要 free 的副本
- *   - 支持 JSON 对象、数组、字符串、数字、布尔、null
- *   - 不支持 JSON 写入（用 StrBuf 手动拼接即可）
+ * design:
+ *   - single pass, zero copy (values point into the original text)
+ *   - json_get_string etc. return malloc'd copies
+ *   - objects, arrays, strings, numbers, booleans, null
+ *   - no serialization (assemble via StrBuf instead)
  */
 
-/* JSON 值类型 */
+/* JSON value types */
 typedef enum {
     JSON_NULL,
     JSON_BOOL,
@@ -117,88 +117,88 @@ typedef enum {
     JSON_OBJECT,
 } JsonType;
 
-/* JSON 值 — 指向原始 JSON 文本内部的视图 */
+/* JSON value - a view into the original JSON text */
 typedef struct {
     JsonType type;
-    const char *src;        /* 指向原始 JSON 字符串 */
-    size_t start;           /* 值在 src 中的起始位置 */
-    size_t end;             /* 值在 src 中的结束位置（不含） */
-    /* 对于 STRING：src+start..src+end 是原始值（含引号） */
-    /* 对于 OBJECT/ARRAY：src+start..src+end 是整个结构 */
+    const char *src;        /* the original JSON string */
+    size_t start;           /* value start offset in src */
+    size_t end;             /* value end offset in src (exclusive) */
+    /* STRING: src+start..src+end is the raw value (with quotes) */
+    /* OBJECT/ARRAY: src+start..src+end is the whole structure */
 } JsonVal;
 
-/* 解析结果 */
+/* parse result */
 typedef struct {
-    JsonVal val;            /* 解析出的值 */
-    const char *error;      /* 错误信息，NULL 表示成功 */
+    JsonVal val;            /* parsed value */
+    const char *error;      /* error message, NULL on success */
 } JsonParse;
 
 /* ============================================================
- * 解析函数
+ * parsing
  * ============================================================ */
 
-/* 解析 JSON 值，从 src+pos 开始，返回解析结果和更新后的 pos */
+/* parse a JSON value from src+pos; updates pos */
 JsonParse json_parse(const char *src, size_t *pos);
 
-/* 解析完整的 JSON 字符串（从根开始） */
+/* parse a complete JSON string (from the root) */
 JsonParse json_parse_root(const char *src);
 
 /* ============================================================
- * 查询函数 — 从 OBJECT 中提取字段
+ * queries - extract fields from an OBJECT
  * ============================================================ */
 
-/* 获取 object 中 key 对应的值，如果不存在返回 type=JSON_NULL */
+/* value for key, or type=JSON_NULL when absent */
 JsonVal json_get(JsonVal obj, const char *key);
 
-/* 获取字符串值（返回需要 free 的副本，找不到返回 NULL） */
+/* string value (malloc'd copy, NULL when absent) */
 char *json_get_string(JsonVal obj, const char *key);
 
-/* 获取整数值 */
+/* integer value */
 int json_get_int(JsonVal obj, const char *key);
 
-/* 获取 long long 整数值（用于大 token 计数） */
+/* long long value (large token counts) */
 long long json_get_ll(JsonVal obj, const char *key);
 
-/* 获取浮点数值 */
+/* double value */
 double json_get_double(JsonVal obj, const char *key);
 
-/* 获取布尔值（找不到返回 def） */
+/* boolean value (def when absent) */
 bool json_get_bool(JsonVal obj, const char *key, bool def);
 
 /* ============================================================
- * 数组操作
+ * array operations
  * ============================================================ */
 
-/* 获取数组长度 */
+/* array length */
 int json_array_len(JsonVal arr);
 
-/* 获取数组第 i 个元素（越界返回 JSON_NULL） */
+/* i-th element (JSON_NULL when out of range) */
 JsonVal json_array_get(JsonVal arr, int index);
 
 /* ============================================================
- * 值提取
+ * value extraction
  * ============================================================ */
 
-/* 从 JSON_STRING 值中提取解码后的字符串（返回需 free 的副本） */
+/* decoded string from a JSON_STRING (malloc'd copy) */
 char *json_string_val(JsonVal v);
 
-/* 从 JSON_NUMBER 值中提取 double */
+/* double from a JSON_NUMBER */
 double json_number_val(JsonVal v);
 
-/* 从 JSON_BOOL 值中提取 bool */
+/* bool from a JSON_BOOL */
 bool json_bool_val(JsonVal v);
 
-/* 通用提取：如果 v 是字符串则解码返回，否则返回 NULL */
+/* generic: decode when v is a string, else NULL */
 char *json_as_string(JsonVal v);
 
 /* ============================================================
- * 遍历 OBJECT 的键值对
+ * iterate OBJECT key/value pairs
  * ============================================================ */
 
 typedef struct {
-    const char *key;        /* 键名（malloc 分配，_next 自动释放上次） */
-    JsonVal val;            /* 值 */
-    /* 内部状态 */
+    const char *key;        /* key (malloc'd; _next frees the previous) */
+    JsonVal val;            /* value */
+    /* internal state */
     const char *src;
     size_t pos;
     bool first;
@@ -206,13 +206,13 @@ typedef struct {
 
 void json_obj_iter_init(JsonObjectIter *it, JsonVal obj);
 bool json_obj_iter_next(JsonObjectIter *it);
-void json_obj_iter_cleanup(JsonObjectIter *it);  /* 提前退出循环时调用 */
+void json_obj_iter_cleanup(JsonObjectIter *it);  /* call to break out early */
 
 /* ============================================================
- * JSON Lines 追加写入
+ * JSON Lines appending
  * ============================================================ */
 
-/* 向 JSONL 文件追加一行（自动加 \n） */
+/* append one line to a JSONL file (adds \n) */
 int jsonl_append(const char *path, const char *json_line);
 
 #endif /* JSON_H */
@@ -223,19 +223,19 @@ int jsonl_append(const char *path, const char *json_line);
 
 
 /*
- * 会话存储 — session 管理、conversation.jsonl 读写、stats.json 更新
+ * session store - session management, conversation I/O, stats updates
  *
- * 目录结构（与 bash/go/rust 一致）：
+ * layout (same as bash/go/rust):
  *   ~/.bash-agent/projects/<project-key>/<session-id>/
- *     conversation.jsonl  — 对话历史
- *     events.jsonl        — 事件日志
- *     stats.json          — 统计数据
- *     summary.md          — 上下文摘要
- *     plan.md             — 已确认的计划
- *     plan.draft          — 计划草稿
+ *     conversation.jsonl  - dialogue history
+ *     events.jsonl        - event log
+ *     stats.json          - statistics
+ *     summary.md          - context summary
+ *     plan.md             - confirmed plan
+ *     plan.draft          - plan draft
  */
 
-/* 会话路径集 */
+/* session path set */
 typedef struct {
     char *base_dir;         /* ~/.bash-agent/projects/<key>/ */
     char *session_dir;      /* base_dir/<session-id>/ */
@@ -249,77 +249,77 @@ typedef struct {
 
 void store_session_paths_free(SessionPaths *p);
 
-/* 根据 home, cwd, session_id 生成路径集 */
+/* build the path set from home, cwd, session_id */
 SessionPaths store_session_paths_for(const char *home, const char *cwd, const char *session_id);
 
-/* 确保会话目录和文件存在 */
+/* ensure the session directory and files exist */
 int store_session_init(const SessionPaths *p, int is_new);
 
-/* 为子 agent 创建新会话（初始化目录） */
+/* create a new session for a child agent */
 int store_session_init_sub(const SessionPaths *parent_paths, const SessionPaths *sub_paths, int fork);
 
-/* 复制 conversation/summary/plan 到新 session（不 init child，对齐 bash/go/rust 版 store_session_fork） */
+/* copy conversation/summary/plan into a new session (store_session_fork parity) */
 int store_session_fork(const SessionPaths *parent, const SessionPaths *child);
 
 const char *store_session_image_dir(const SessionPaths *paths);
 
-/* 从 cwd 生成 project key（简化为路径替换 / 为 -） */
+/* project key from cwd (slashes to -) */
 char *store_session_project_key(const char *cwd);
 
-/* 生成新的 session ID（格式: YYYYMMDD-HHMMSS-XXXX） */
+/* new session id (YYYYMMDD-HHMMSS-XXXX) */
 char *session_new_id(void);
 
-/* 查找最近一个会话（用于 --continue） */
+/* find the most recent session (for --continue) */
 char *store_session_resolve_continue(const char *home, const char *cwd);
 
-/* 列出所有会话行（用于 --list-sessions），格式化行写入 out，返回行数 */
+/* list sessions; formatted lines into out, returns count */
 int store_session_list_rows(const char *home, const char *cwd, StrBuf *out);
 
 /* ============================================================
- * conversation.jsonl 操作
+ * conversation.jsonl operations
  * ============================================================ */
 
-/* 追加 user 消息 */
+/* append a user message */
 int store_conv_add_user(const char *path, const char *content);
 
-/* 追加 assistant 消息（含 thinking, text, tool_calls） */
+/* append an assistant message (thinking, text, tool_calls) */
 int store_conv_add_assistant(const char *path, const char *thinking, const char *text,
-                       /* tool_calls: 数组 of {id, name, input_json}，count 个 */
+                       /* tool_calls: array of {id, name, input_json} */
                        int tool_count, const char **tool_ids,
                        const char **tool_names, const char **tool_inputs);
 
-/* 追加 tool_result 消息 */
+/* append a tool_result message */
 int store_conv_add_tool_results(const char *path, int count, const char **tool_use_ids,
                           const char **contents);
 
-/* 读取所有行（JSON 字符串数组，每个元素需 free） */
+/* read all lines (array of malloc'd strings) */
 int store_conv_line_count(const char *path, char ***out, int *out_count);
 
-/* 保留最后 keep_lines 行 */
+/* keep only the last keep_lines lines */
 int store_conv_trim_tail(const char *path, int keep_lines);
 
-/* 统计 user 输入消息数量 */
+/* count user-input messages */
 int store_conv_user_turn_count(const char *path);
 
-/* 计算总字节数 */
+/* total bytes */
 long store_conv_total_bytes(const char *path);
 
 /* ============================================================
- * stats.json 操作
+ * stats.json operations
  * ============================================================ */
 
-/* 读取 stats（返回 JSON 字符串，需 free） */
+/* read stats (malloc'd JSON string) */
 char *store_stats_read(const char *path);
 
-/* 更新 stats（读取→调用 callback→写回） */
+/* update stats (read -> callback -> write back) */
 typedef void (*stats_update_fn)(void *ctx, JsonVal stats);
 int store_stats_update(const char *path, stats_update_fn fn, void *ctx);
 
-/* 常用更新操作 */
+/* common updates */
 void store_stats_add_int(JsonVal obj, const char *key, int delta);
 void store_stats_set_int(JsonVal obj, const char *key, int value);
 
-/* 简易文件级操作：直接读写 stats 文件中的整数字段 */
+/* simple file-level helpers: integer fields in the stats file */
 int store_stats_get_file_int(const char *path, const char *key);
 void store_stats_set_int_file(const char *path, const char *key, int value);
 int store_stats_get_int_file(const char *path, const char *key);
@@ -327,21 +327,21 @@ int store_stats_get_int_file(const char *path, const char *key);
 void store_event_set_stream_json(int enabled);
 int store_event_stream_json_enabled(void);
 
-/* 从 stats 中读取整数值 */
+/* read an integer from stats */
 int store_stats_get_int(JsonVal obj, const char *key);
 
 /* ============================================================
- * events.jsonl 操作
+ * events.jsonl operations
  * ============================================================ */
 
-/* 追加事件（JSON 字符串） */
+/* append an event (JSON string) */
 int store_event_append(const SessionPaths *p, const char *json_str);
 
-/* 读取所有事件行 */
+/* read all event lines */
 int store_event_lines(const SessionPaths *p, char ***out, int *out_count);
 
 /* ============================================================
- * summary / plan 文件操作
+ * summary / plan file operations
  * ============================================================ */
 
 char *store_summary_get(const SessionPaths *p);
@@ -390,16 +390,16 @@ typedef enum {
 typedef enum {
     BA_FMT_HUMAN,
     BA_FMT_STREAM_JSON,
-    BA_FMT_NONE,     /* SubAgent 子回合：只写 events.jsonl，不打 stdout */
+    BA_FMT_NONE,     /* SubAgent child turn: events.jsonl only */
 } BaDisplayFormat;
 
-/* 对齐 bash-agent DisplayMessage 字段子集 */
+/* the bash-agent DisplayMessage field subset */
 typedef struct {
     int type;
     char *content;      /* TEXT/THINKING/STOP(reason)/ERROR/TOOL_RESULT content/summary */
     char *tool_name;
     char *tool_id;
-    char *tool_input;   /* 已是 JSON 文本 */
+    char *tool_input;   /* already JSON text */
     char *session_id;   /* SubAgent/bg task id */
     int in_tokens, out_tokens, cache_read_tokens, cache_creation_tokens;
     int tool_exit_code;
@@ -409,16 +409,16 @@ typedef struct {
     char last_char[8];
     int prev_was_thinking;
     BaDisplayFormat format;
-    FILE *out;          /* stream-json 目标（stdout） */
+    FILE *out;          /* stream-json sink (stdout) */
 } BaDisplay;
 
 void ba_disp_init(BaDisplay *d, BaDisplayFormat fmt);
 
-/* 单条消息：stream-json 输出事件行；human 按颜色/截断规则渲染。
- * 同时返回需要写入 events.jsonl 的 JSON 文本（调用方 free），或 NULL。 */
+/* One message: stream-json emits an event line; human renders with
+ * colors and truncation. Returns the events.jsonl text (caller frees). */
 char *ba_display_push(BaDisplay *d, const BaDisplayMsg *m);
 
-/* 工具调用摘要（对齐 bash-agent agent_tool_display_summary） */
+/* tool-call summary (agent_tool_display_summary parity) */
 char *ba_tool_call_summary(const char *name, const char *input_json);
 
 #endif /* BA_DISPLAY_H */
@@ -429,46 +429,46 @@ char *ba_tool_call_summary(const char *name, const char *input_json);
 
 
 /*
- * 传输层 — SSE 流式解析与请求体构建（无 libcurl）
+ * transport - SSE stream parsing and request building (no libcurl)
  *
- * HTTP 收发在 bb_http.c（libbb 原语，明文）；本文件只做协议层。
+ * HTTP I/O uses libbb primitives; this is protocol only.
  */
 
-/* SSE 事件回调 */
+/* SSE event callback */
 typedef enum {
-    SSE_TEXT,               /* 文本增量 */
-    SSE_THINKING,           /* 思考增量 */
-    SSE_TOOL_CALL_START,    /* 工具调用开始（id + name 已知） */
-    SSE_TOOL_INPUT_DELTA,   /* 工具调用 input_json 增量 */
-    SSE_TOOL_CALL,          /* 工具调用完成（完整，无增量） */
-    SSE_USAGE,              /* token 用量 */
-    SSE_STOP,               /* 停止 */
-    SSE_ERROR,              /* 错误 */
-    SSE_RETRY,              /* 重试（清空当前累积） */
+    SSE_TEXT,               /* text delta */
+    SSE_THINKING,           /* thinking delta */
+    SSE_TOOL_CALL_START,    /* tool call started (id + name known) */
+    SSE_TOOL_INPUT_DELTA,       /* tool-call input_json delta */
+    SSE_TOOL_CALL,          /* tool call complete (whole) */
+    SSE_USAGE,              /* token usage */
+    SSE_STOP,               /* stop */
+    SSE_ERROR,              /* error */
+    SSE_RETRY,              /* retry (reset the accumulator) */
 } SseEventType;
 
 typedef struct {
     SseEventType type;
-    char *content;           /* TEXT/THINKING/STOP/ERROR: 文本内容 */
-    char *tool_id;           /* TOOL_CALL: 工具调用 ID */
-    char *tool_name;         /* TOOL_CALL: 工具名 */
-    char *tool_input;        /* TOOL_CALL: 工具参数 JSON */
-    int in_tokens;           /* USAGE: 输入 token */
-    int out_tokens;          /* USAGE: 输出 token */
-    int cache_read_tokens;   /* USAGE: 缓存读取 token */
-    int cache_creation_tokens; /* USAGE: 缓存创建 token */
+    char *content;           /* TEXT/THINKING/STOP/ERROR: text */
+    char *tool_id;           /* TOOL_CALL: call id */
+    char *tool_name;         /* TOOL_CALL: tool name */
+    char *tool_input;        /* TOOL_CALL: arguments JSON */
+    int in_tokens;           /* USAGE: input tokens */
+    int out_tokens;          /* USAGE: output tokens */
+    int cache_read_tokens;   /* USAGE: cache-read tokens */
+    int cache_creation_tokens; /* USAGE: cache-creation tokens */
 } SseEvent;
 
 typedef void (*sse_callback_fn)(void *ctx, const SseEvent *evt);
 
-/* 流式 POST 请求，通过回调传递 SSE 事件 */
+/* streaming POST; SSE events via the callback */
 int http_post_sse(const char *url, const char **headers, int header_count,
                   const char *body, size_t body_len,
                   const char *provider,
                   sse_callback_fn callback, void *ctx,
                   volatile int *cancelled);
 
-/* 流式回调上下文（SSE 行切分与 provider 分派的状态） */
+/* streaming callback context (line split + provider dispatch) */
 typedef struct {
     int index;
     char *id;
@@ -479,9 +479,9 @@ typedef struct {
 typedef struct {
     sse_callback_fn callback;
     void *ctx;
-    StrBuf line_buf;        /* 累积 SSE 行 */
-    char *event;            /* Responses SSE 事件名 */
-    char *provider;         /* "claude"、"openai" 或 "responses" */
+    StrBuf line_buf;        /* accumulating SSE line */
+    char *event;            /* Responses SSE event name */
+    char *provider;         /* "claude", "openai" or "responses" */
     volatile int *cancelled;
     OpenAIToolAccum *openai_tools;
     int openai_tool_count;
@@ -497,81 +497,81 @@ typedef struct {
     int responses_item_cap;
 } StreamCtx;
 
-/* 传输无关的 SSE 数据泵接口（由 ba_transport.c 实现，bb_http.c 调用） */
+/* transport-agnostic SSE pump interface */
 void sse_stream_init(StreamCtx *sctx, const char *provider,
                      sse_callback_fn callback, void *ctx,
                      volatile int *cancelled);
 void sse_stream_free(StreamCtx *sctx);
-/* 流结束收尾：残留 JSON 处理 + responses 终止检查 */
+/* stream tail: leftover JSON + responses termination check */
 void sse_stream_finish(StreamCtx *sctx, const char *provider,
                        sse_callback_fn callback, void *ctx);
-/* 喂入一块已解码的响应体字节；返回 0 表示取消，应中止传输 */
+/* feed one decoded body chunk; 0 means cancelled */
 int sse_stream_feed(StreamCtx *sctx, const char *ptr, size_t len);
 
-/* 解析 SSE 事件行（从 HTTP 响应体的 "data: ..." 行解析） */
+/* parse an SSE event line (from "data: ..." lines) */
 int sse_parse_event(const char *provider, const char *data, size_t data_len,
                     sse_callback_fn callback, void *ctx);
 
 /* ============================================================
- * SSE 累积器 — 用于 agent_loop 中收集流式事件
+ * SSE accumulator - collects streamed events for the turn loop
  * ============================================================ */
 
-/* 累积的工具调用 */
+/* accumulated tool call */
 typedef struct {
     char *id;
     char *name;
-    StrBuf input_json;     /* 累积 input_json_delta */
+    StrBuf input_json;     /* accumulated input_json_delta */
 } ToolCallAccum;
 
 typedef struct {
-    /* 累积的文本 */
+    /* accumulated text */
     StrBuf text;
     StrBuf thinking;
 
-    /* 累积的工具调用列表 */
+    /* accumulated tool-call list */
     ToolCallAccum *tools;
     int tool_count;
     int tool_cap;
 
-    /* 当前正在累积的 content_block 索引（-1 表示无） */
+    /* current content_block index (-1 = none) */
     int current_block_index;
     char *current_block_type;  /* "text", "thinking", "tool_use" */
-    char *current_tool_id;     /* content_block_start 时的 tool id */
-    char *current_tool_name;   /* content_block_start 时的 tool name */
+    char *current_tool_id;     /* tool id at content_block_start */
+    char *current_tool_name;   /* tool name at content_block_start */
 
-    /* 统计 */
+    /* statistics */
     int in_tokens;
     int out_tokens;
     int cache_read_tokens;
     int cache_creation_tokens;
 
-    /* 停止原因 */
+    /* stop reason */
     char *stop_reason;
 
-    /* 错误 */
+    /* error */
     char *error;
 
-    /* 状态标记 */
-    int stopped;            /* 收到 stop 事件 */
+    /* status flags */
+    int stopped;            /* stop event received */
 } SseAccumulator;
 
-/* 初始化/释放累积器 */
+/* init/free the accumulator */
 void sse_accum_init(SseAccumulator *acc);
 void sse_accum_free(SseAccumulator *acc);
 
-/* SSE 回调 — 累积事件到 SseAccumulator */
+/* SSE callback - accumulate events into SseAccumulator */
 void sse_accum_callback(void *ctx, const SseEvent *evt);
 
-/* 构建请求体 */
+/* build the request body */
 char *build_claude_request(const char *model, const char *system_prompt,
                            const char *tools_json,
                            char **conv_lines, int conv_line_count,
                            int max_tokens, const char *thinking, const char *effort);
 
-/* 将 Claude 请求体转换为 OpenAI 格式 */
+/* convert a Claude request body to OpenAI format */
 char *convert_to_openai(const char *claude_body);
 
-/* 将 Claude 请求体转换为 Responses API 格式 */
+/* convert a Claude request body to Responses API format */
 char *convert_to_responses(const char *claude_body);
 
 #endif /* TRANSPORT_H */
@@ -590,22 +590,22 @@ char *convert_to_responses(const char *claude_body);
 #define BA_PROMPT_H
 
 
-/* Prompt 构建上下文（对应 bash-agent 的 Agent 字段子集） */
+/* prompt build context (the Agent field subset) */
 typedef struct {
-    const char *cwd;        /* 当前工作目录 */
-    const char *home;       /* $BB_AGENT_HOME（busyagent 根目录） */
-    const char *plan;       /* PLAN_FILE 路径（session_dir/plan.md） */
-    const char *plan_draft; /* PLAN_DRAFT_FILE 路径 */
+    const char *cwd;        /* working directory */
+    const char *home;       /* $BB_AGENT_HOME root */
+    const char *plan;       /* PLAN_FILE path */
+    const char *plan_draft; /* PLAN_DRAFT_FILE path */
 } BaPromptCtx;
 
-/* 构建完整 system prompt，返回需 free 的字符串 */
+/* build the full system prompt; caller frees */
 char *ba_build_prompt(const BaPromptCtx *ctx);
 
-/* 加载技能内容（Skill 工具用），返回需 free 的字符串或 NULL。
- * 搜索序与 system prompt 的 skill-index 一致：
+/* load a skill's content; malloc'd string or NULL.
+ * Search order matches the system prompt skill-index:
  *   $CWD/skills > ~/.agents/skills > $BB_AGENT_HOME/skills
- * agents_home 传 $HOME（可 NULL）；bag_home 传 $BB_AGENT_HOME（不可 NULL）。
- * out_skill_dir 出参为命中目录（可 NULL 不取）。 */
+ * agents_home is $HOME (may be NULL); bag_home is $BB_AGENT_HOME.
+ * out_skill_dir receives the hit directory (optional). */
 char *ba_load_skill(const char *skill_name, const char *cwd,
                     const char *agents_home, const char *bag_home,
                     char **out_skill_dir);
