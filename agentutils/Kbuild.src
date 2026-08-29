@@ -6,7 +6,10 @@
 
 lib-y:=
 
-ccflags-y += -std=gnu11 -Wno-unused-parameter -D_GNU_SOURCE
-ccflags-y += -Wno-declaration-after-statement
+# busybox's kbuild (scripts/Makefile.lib) has no ccflags-y; per-object
+# flags via CFLAGS_<file>.o are the supported extension point
+# (-D_GNU_SOURCE and -std=gnu99 already come from Makefile.flags).
+CFLAGS_ba_impl.o = -Wno-declaration-after-statement
+CFLAGS_busyagent.o = -Wno-declaration-after-statement
 
 INSERT
