@@ -1,20 +1,23 @@
 # agentutils — busyagent applet
 
-One invocation = one user turn of an LLM agent loop: resolve the
-cwd-bound session (default resumes the latest), rebuild its history
-into the request prefix, stream the reply over plain HTTP (SSE),
+Resolve the cwd-bound session (default resumes the latest), rebuild its
+history into the request prefix, stream the reply over HTTP(S) (SSE),
 execute tool calls with busybox applets, feed results back until the
-model stops, append the turn's events to the session trace, exit.
+model stops, and append the turn's events to the session trace. With a
+PROMPT argument that loop runs once and exits; a tty on stdin starts an
+interactive REPL instead (sessions auto-resume per cwd).
 
 ## Files
 
 | File | Role |
 |---|---|
-| `busyagent.c` | CLI (getopt32), session resolution, turn loop, renderer/trace |
-| `bb_http.c` | plain-HTTP transport on libbb primitives (no curl); phase-2 TLS lands here |
-| `ba_tools.c` | table-driven tool execution (see below) |
-| `ba_{json,util,protocol,store,transport}.[ch]` | pure-C modules ported from [bash-agent](https://github.com/lloydzhou/bash-agent), curl paths removed |
-| `tools.json` | **source of the embedded default tool table** — see below |
+| `busyagent.c` | CLI (getopt32), session resolution, turn loop, background-bash registry, renderer/trace |
+| `ba_impl.c` | everything else in one translation unit: JSON, utils, protocol, session store, HTTP(S) transport, SSE parsing, display, tools |
+| `busyagent.h` | shared declarations (events, accumulator, store, transport API) |
+| `ba_builtin_schemas.h` | the compiled-in builtin tool schemas |
+
+Nothing is embedded from a `tools.json` at build time: the **only**
+runtime source of dynamic tools is `$BA_HOME/tools.json`.
 
 ## tools.json lifecycle (dynamic zone only — nothing embedded)
 
@@ -42,12 +45,12 @@ base honestly.
 | Group | Builtins | Mechanism |
 |---|---|---|
 | content | Read (offset/limit, cat -n), Write, Edit (exact-once) | pure C |
-| execution | Bash | sh -c on busybox sh; background=true detaches to a task log |
+| execution | Bash | sh -c on busybox sh; background=true registers a capped background task (see below) |
 | index/delegate | Glob (find -name), Grep (grep -nHr --include) | busybox applets |
 | state | TodoWrite | checklist as tool_result; conversation history IS the state |
 | state | PlanConfirm / PlanClear | plan.draft -> plan.md; current plan injected into system prompt |
 | knowledge | Skill | SKILL.md loaded from cwd/skills > ~/.agents/skills > $BA_HOME/skills |
-| delegate | SubAgent | self-bootstrapping fork+exec `busyagent --new`, env-passed config |
+| delegate | SubAgent | in-process synchronous child session (`sub_` prefix, depth 1); `fork: true` copies the parent conversation first; nested SubAgent calls are rejected |
 
 Dynamic zone ($BA_HOME/tools.json via `busyagent -i`) carries
 world-operation primitives only (default sample: ls/head/tail/wc/stat).
@@ -56,7 +59,7 @@ removes nothing essential: every dynamic entry is expressible through
 Bash.
 
 Each tool entry carries an `exec` mapping that never reaches the LLM
-(stripped by `ba_tools_json()`):
+(stripped from the schemas sent to the model):
 
 ```json
 "exec": { "applet": "grep", "argv": ["-nH", "-r", "-e", "$pattern", "$path"] }
@@ -67,20 +70,12 @@ JSON (missing optional keys drop their argument). NOFORK applets are
 called in-process via `run_nofork_applet()` inside a forked child;
 anything else execs busybox itself. Children are SIGKILLed on timeout.
 
-To regenerate `ba_tools_embed.h` after editing `tools.json`:
-
-```
-python3 - <<'EOF'
-data = open('agentutils/tools.json','rb').read()
-lines = ['/* tools.json embedded at build time - generated from agentutils/tools.json, do not edit */',
-         'static const char embedded_tools_json[] = {']
-for i in range(0, len(data), 20):
-    lines.append('\t' + ','.join(str(b) for b in data[i:i+20]) + ',')
-lines.append('\t0 };')
-lines.append('#define embedded_tools_json_len %d' % len(data))
-open('agentutils/ba_tools_embed.h','w').write('\n'.join(lines) + '\n')
-EOF
-```
+Background bash (`background: true` in Bash input) does not just
+detach: every task is registered (max 16), carries a hard 1-hour
+deadline (killed by process group, reported as exit code 124) and its
+log file is capped at 512 KiB via `RLIMIT_FSIZE`; finished tasks are
+reaped each turn and their exit code plus output pushed back into the
+conversation, and nothing outlives the applet process.
 
 ## Terminology (kept aligned with issue #2)
 

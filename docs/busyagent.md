@@ -1,7 +1,7 @@
 # busyagent — an LLM agent applet for busybox
 
 `busyagent` runs an LLM agent loop against the surrounding busybox applets:
-it streams the reply over plain HTTP (SSE), executes the tool calls the model
+it streams the reply over HTTP(S) (SSE), executes the tool calls the model
 asks for, feeds the results back, and repeats until the model finishes. Each
 invocation resumes the session bound to the current working directory, so
 conversations continue across runs; without a PROMPT argument (or with a tty
@@ -59,7 +59,9 @@ The model may call any of the applets exposed in the bundled tool set
   the call blocks until the child finishes and its final text becomes the
   tool result; there is no background/parallel execution. `fork: true`
   copies the parent conversation first; nested SubAgent calls are rejected
-- read-only-root friendly: the session store is append-only jsonl
+- plain jsonl session store: events.jsonl is append-only; conversation.jsonl is
+  trimmed in place at each turn to bound the context (the file is rewritten,
+  not only appended)
 
 ## Dynamic tool table
 
