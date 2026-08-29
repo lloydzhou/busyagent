@@ -532,6 +532,10 @@ typedef unsigned smalluint;
 #endif
 
 #if defined(ANDROID) || defined(__ANDROID__)
+   /* bionic's mntent.h does not declare addmntent(); libc exports it */
+#  include <stdio.h>
+struct mntent;
+extern int addmntent(FILE *, const struct mntent *);
 # if __ANDROID_API__ < 8
    /* ANDROID < 8 has no [f]dprintf at all */
 #  undef HAVE_DPRINTF

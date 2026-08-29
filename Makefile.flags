@@ -186,7 +186,9 @@ endif
 
 ifeq ($(CONFIG_FEATURE_NSLOOKUP_BIG),y)
 ifneq (,$(findstring linux,$(shell $(CC) $(CFLAGS) -dumpmachine)))
+ifeq (,$(findstring android,$(shell $(CC) $(CFLAGS) -dumpmachine)))
 LDLIBS += resolv
+endif
 endif
 ifneq (,$(findstring gnu,$(shell $(CC) $(CFLAGS) -dumpmachine)))
 LDLIBS += resolv

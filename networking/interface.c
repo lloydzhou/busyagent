@@ -54,7 +54,8 @@
 #define _PATH_PROCNET_IFINET6           "/proc/net/if_inet6"
 
 #ifdef HAVE_AFINET6
-# ifndef _LINUX_IN6_H
+# if !defined(_LINUX_IN6_H) && !defined(__ANDROID__)
+/* bionic's <net/if.h> already provides struct in6_ifreq */
 /*
  * This is from linux/include/net/ipv6.h
  */
