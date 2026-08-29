@@ -59,6 +59,8 @@
 #define BA_DEFAULT_TURNS  8
 #define BA_CTX_LIMIT_BYTES (512 * 1024)
 
+char *ba_display_event_json(const BaDisplayMsg *m, int stream_output);
+
 /* ---- per-turn context: accumulator + renderer + trace ---- */
 
 typedef struct {
@@ -71,69 +73,9 @@ typedef struct {
 
 /* Render one logical event to stdout (text or stream-json) and to the
  * session trace (events.jsonl). Shapes follow bash-agent display.c. */
-/* display_msg_to_event: serialization identical to bash-agent */
-static char *ba_display_to_event(const BaDisplayMsg *m)
-{
-	StrBuf buf;
-	sb_init(&buf);
-	switch (m->type) {
-	case BA_DM_TEXT:
-		sb_append(&buf, "{\"type\":\"text\",\"content\":");
-		sb_append_json_string(&buf, m->content ? m->content : "");
-		sb_append_char(&buf, '}');
-		break;
-	case BA_DM_THINKING:
-		sb_append(&buf, "{\"type\":\"thinking\",\"content\":");
-		sb_append_json_string(&buf, m->content ? m->content : "");
-		sb_append_char(&buf, '}');
-		break;
-	case BA_DM_TOOL_CALL:
-		sb_append(&buf, "{\"type\":\"tool_call\",\"name\":");
-		sb_append_json_string(&buf, m->tool_name ? m->tool_name : "");
-		sb_append(&buf, ",\"id\":");
-		sb_append_json_string(&buf, m->tool_id ? m->tool_id : "");
-		sb_append(&buf, ",\"input\":");
-		if (m->tool_input) sb_append(&buf, m->tool_input); else sb_append(&buf, "{}");
-		sb_append_char(&buf, '}');
-		break;
-	case BA_DM_TOOL_RESULT:
-		sb_append(&buf, "{\"type\":\"tool_result\",\"tool_use_id\":");
-		sb_append_json_string(&buf, m->tool_id ? m->tool_id : "");
-		sb_append(&buf, ",\"name\":");
-		sb_append_json_string(&buf, m->tool_name ? m->tool_name : "");
-		sb_append(&buf, ",\"content\":");
-		sb_append_json_string(&buf, m->content ? m->content : "");
-		sb_append_char(&buf, '}');
-		break;
-	case BA_DM_USAGE:
-		sb_appendf(&buf,
-			"{\"type\":\"usage\",\"input_tokens\":%d,\"output_tokens\":%d,"
-			"\"cache_read_input_tokens\":%d,\"cache_creation_input_tokens\":%d,"
-			"\"kind\":\"agent\"}",
-			m->in_tokens, m->out_tokens,
-			m->cache_read_tokens, m->cache_creation_tokens);
-		break;
-	case BA_DM_STOP:
-		sb_append(&buf, "{\"type\":\"stop\",\"reason\":");
-		sb_append_json_string(&buf, m->content ? m->content : "");
-		sb_append_char(&buf, '}');
-		break;
-	case BA_DM_ERROR:
-		sb_append(&buf, "{\"type\":\"error\",\"message\":");
-		sb_append_json_string(&buf, m->content ? m->content : "");
-		sb_append_char(&buf, '}');
-		break;
-	default:
-		sb_free(&buf);
-		return NULL;
-	}
-	return buf.data;
-}
-
-/* synchronous push_display_event: write events.jsonl + render per format */
 static void ba_push_display(TurnCtx *t, const BaDisplayMsg *m)
 {
-	char *evt = ba_display_to_event(m);
+	char *evt = ba_display_event_json(m, 0);
 	if (evt) {
 		store_event_append(t->paths, evt);
 		free(evt);
@@ -715,6 +657,12 @@ static void ba_trim_trailing_tool_use(const char *conv_path)
 	free(lines);
 }
 
+static void ba_stats_add(const char *path, const char *key, int delta)
+{
+	store_stats_set_int_file(path, key,
+		store_stats_get_int_file(path, key) + delta);
+}
+
 static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
                                  const char *description, int fork_mode)
 {
@@ -856,18 +804,12 @@ static char *ba_handle_sub_agent(BaRunCtx *parent, const char *prompt,
 			store_event_append(&parent->paths, evt.data);
 			sb_free(&evt);
 
-			store_stats_set_int_file(parent->paths.stats, "total_input_tokens",
-				store_stats_get_int_file(parent->paths.stats, "total_input_tokens") + s_in);
-			store_stats_set_int_file(parent->paths.stats, "total_output_tokens",
-				store_stats_get_int_file(parent->paths.stats, "total_output_tokens") + s_out);
-			store_stats_set_int_file(parent->paths.stats, "total_cache_read_tokens",
-				store_stats_get_int_file(parent->paths.stats, "total_cache_read_tokens") + s_cr);
-			store_stats_set_int_file(parent->paths.stats, "total_cache_creation_tokens",
-				store_stats_get_int_file(parent->paths.stats, "total_cache_creation_tokens") + s_cc);
-			store_stats_set_int_file(parent->paths.stats, "sub_agent_request_count",
-				store_stats_get_int_file(parent->paths.stats, "sub_agent_request_count") + 1);
-			store_stats_set_int_file(parent->paths.stats, "agent_request_count",
-				store_stats_get_int_file(parent->paths.stats, "agent_request_count") + s_req);
+			ba_stats_add(parent->paths.stats, "total_input_tokens", s_in);
+			ba_stats_add(parent->paths.stats, "total_output_tokens", s_out);
+			ba_stats_add(parent->paths.stats, "total_cache_read_tokens", s_cr);
+			ba_stats_add(parent->paths.stats, "total_cache_creation_tokens", s_cc);
+			ba_stats_add(parent->paths.stats, "sub_agent_request_count", 1);
+			ba_stats_add(parent->paths.stats, "agent_request_count", s_req);
 		}
 		store_session_paths_free(&sub.paths);
 		free(sub_session_id);
@@ -1043,18 +985,12 @@ static int ba_run_session(BaRunCtx *ctx)
 			 * (the aggregation bash-agent does in agent_loop; it runs
 			 * BEFORE tool execution there, so intermediate rounds with
 			 * tool calls are counted too, not just the final one) */
-			store_stats_set_int_file(paths.stats, "current_turn_count",
-				store_stats_get_int_file(paths.stats, "current_turn_count") + 1);
-			store_stats_set_int_file(paths.stats, "agent_request_count",
-				store_stats_get_int_file(paths.stats, "agent_request_count") + 1);
-			store_stats_set_int_file(paths.stats, "total_input_tokens",
-				store_stats_get_int_file(paths.stats, "total_input_tokens") + accum->in_tokens);
-			store_stats_set_int_file(paths.stats, "total_output_tokens",
-				store_stats_get_int_file(paths.stats, "total_output_tokens") + accum->out_tokens);
-			store_stats_set_int_file(paths.stats, "total_cache_read_tokens",
-				store_stats_get_int_file(paths.stats, "total_cache_read_tokens") + accum->cache_read_tokens);
-			store_stats_set_int_file(paths.stats, "total_cache_creation_tokens",
-				store_stats_get_int_file(paths.stats, "total_cache_creation_tokens") + accum->cache_creation_tokens);
+			ba_stats_add(paths.stats, "current_turn_count", 1);
+			ba_stats_add(paths.stats, "agent_request_count", 1);
+			ba_stats_add(paths.stats, "total_input_tokens", accum->in_tokens);
+			ba_stats_add(paths.stats, "total_output_tokens", accum->out_tokens);
+			ba_stats_add(paths.stats, "total_cache_read_tokens", accum->cache_read_tokens);
+			ba_stats_add(paths.stats, "total_cache_creation_tokens", accum->cache_creation_tokens);
 
 			if (accum->tool_count > 0 && accum->stop_reason
 			 && (strcmp(accum->stop_reason, "tool_use") == 0

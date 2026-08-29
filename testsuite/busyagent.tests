@@ -6,10 +6,10 @@
 
 # testing "test name" "command(s)" "expected result" "file input" "stdin"
 
-# All cases are offline: CLI contract, argument validation and the
-# cwd-bound session semantics (observed via -v diagnostics). Anything
-# needing a live LLM endpoint stays out of the testsuite (see
-# docs/busyagent.md for the applet contract).
+# Most cases are offline: CLI contract, argument validation and the
+# cwd-bound session semantics (observed via -v diagnostics). The final
+# section exercises the main agent loop against a local BusyBox httpd CGI
+# endpoint when HTTPD and FEATURE_HTTPD_CGI are enabled.
 #
 # NOTE: command strings are single-quoted so double quotes inside grep
 # patterns survive; every invocation expected to fail ends in
@@ -200,5 +200,163 @@ testing "every turn records a user_input event" \
 	"" ""
 
 rm -rf ba.testhome ba.tl ba.tw ba.tx ba.tj ba.tk ba.th ba.ef ba.h1 ba.h2 ba.h3 ba.proj1 ba.proj2
+
+# === main agent loop (local httpd CGI) ===============================
+
+optional HTTPD FEATURE_HTTPD_CGI
+
+if [ -z "$SKIP" ]; then
+	ROOT=$PWD/ba.e2e
+	WEB=$ROOT/www
+	HOME_DIR=$ROOT/home
+	PORT=$((18000 + $$ % 20000))
+	BASE=http://127.0.0.1:$PORT/cgi-bin/mock
+	TARGET=$PWD/ba.e2e-written.txt
+	HTTPD_PID=
+
+	cleanup_e2e()
+	{
+		[ -n "$HTTPD_PID" ] && kill "$HTTPD_PID" 2>/dev/null
+		wait "$HTTPD_PID" 2>/dev/null
+		rm -rf "$ROOT" "$TARGET"
+	}
+	trap cleanup_e2e EXIT INT TERM
+
+	rm -rf "$ROOT" "$TARGET"
+	mkdir -p "$WEB/cgi-bin" "$HOME_DIR"
+	cat > "$WEB/cgi-bin/mock" <<'MOCK'
+#!/bin/sh
+body=$(cat)
+path=${PATH_INFO:-}
+
+has() { case $body in *"$1"*) return 0;; *) return 1;; esac; }
+header() { printf 'Content-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n'; }
+
+claude_text()
+{
+	text=$1 more=${2:-}
+	printf '%s\n\n' \
+		'event: message_start' \
+		'data: {"type":"message_start","message":{"id":"msg_mock","role":"assistant","content":[],"model":"test","usage":{"input_tokens":10,"output_tokens":0}}}' \
+		'event: content_block_start' \
+		'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'
+	printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"%s"}}\n\n' "$text"
+	[ -z "$more" ] || printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"%s"}}\n\n' "$more"
+	printf '%s\n\n' \
+		'event: content_block_stop' \
+		'data: {"type":"content_block_stop","index":0}' \
+		'event: message_delta' \
+		'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}' \
+		'event: message_stop' \
+		'data: {"type":"message_stop"}'
+}
+
+claude_tool()
+{
+	name=$1 id=$2 input=$3
+	printf '%s\n\n' \
+		'event: message_start' \
+		'data: {"type":"message_start","message":{"id":"msg_tool","role":"assistant","content":[],"model":"test","usage":{"input_tokens":10,"output_tokens":0}}}'
+	printf 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"%s","name":"%s","input":{}}}\n\n' "$id" "$name"
+	printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"%s"}}\n\n' "$input"
+	printf '%s\n\n' \
+		'event: content_block_stop' \
+		'data: {"type":"content_block_stop","index":0}' \
+		'event: message_delta' \
+		'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":6}}' \
+		'event: message_stop' \
+		'data: {"type":"message_stop"}'
+}
+
+openai_text()
+{
+	printf 'data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","model":"test","choices":[{"index":0,"delta":{"role":"assistant","content":"%s"},"finish_reason":null}]}\n\n' "$1"
+	printf '%s\n\n' \
+		'data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3}}' \
+		'data: [DONE]'
+}
+
+responses_text()
+{
+	printf 'event: response.output_text.delta\ndata: {"delta":"%s"}\n\n' "$1"
+	printf '%s\n\n' \
+		'event: response.completed' \
+		'data: {"response":{"usage":{"input_tokens":10,"output_tokens":3}}}'
+}
+
+header
+case $path in
+*/chat/completions) openai_text 'openai-e2e-ok'; exit;;
+*/responses) responses_text 'responses-e2e-ok'; exit;;
+esac
+
+if has 'WRITE_E2E_MARKER'; then
+	if has 'tool_result'; then
+		claude_text 'write-e2e-done'
+	else
+		claude_tool Write tool_write '{\"path\":\"__TARGET__\",\"content\":\"written-by-agent\"}'
+	fi
+elif has 'PLAN_E2E_MARKER'; then
+	if has 'tool_result'; then
+		claude_text 'plan-e2e-done'
+	else
+		claude_tool PlanConfirm tool_plan '{}'
+	fi
+elif has 'SUB_E2E_MARKER'; then
+	if has 'tool_result'; then
+		claude_text 'parent-e2e-done'
+	elif has 'SUB_CHILD_E2E'; then
+		claude_text 'child-e2e-result'
+	else
+		claude_tool SubAgent tool_sub '{\"prompt\":\"SUB_CHILD_E2E\",\"description\":\"e2e child\"}'
+	fi
+else
+	claude_text 'claude-' 'e2e-ok'
+fi
+MOCK
+	sed -i "s|__TARGET__|$TARGET|g" "$WEB/cgi-bin/mock"
+	chmod +x "$WEB/cgi-bin/mock"
+
+	httpd -f -p "127.0.0.1:$PORT" -h "$WEB" >/dev/null 2>&1 &
+	HTTPD_PID=$!
+	sleep 1
+
+	run_agent()
+	{
+		BA_HOME=$HOME_DIR busyagent -u "$BASE" -k test -m test "$@" 2>&1
+	}
+fi
+
+testing "busyagent e2e claude text stream" \
+	'run_agent -s text-e2e -p claude hello | grep -o "claude-e2e-ok"' \
+	"claude-e2e-ok\n" "" ""
+
+testing "busyagent stores text deltas once without aggregate duplicate" \
+	's=$(find "$HOME_DIR/projects" -type d -name text-e2e); grep "\"type\":\"text\"" "$s/events.jsonl"' \
+	'{"type":"text","content":"claude-"}\n{"type":"text","content":"e2e-ok"}\n' "" ""
+
+testing "busyagent e2e openai text stream" \
+	'run_agent -n -p openai hello | grep -o "openai-e2e-ok"' \
+	"openai-e2e-ok\n" "" ""
+
+testing "busyagent e2e responses text stream" \
+	'run_agent -n -p responses hello | grep -o "responses-e2e-ok"' \
+	"responses-e2e-ok\n" "" ""
+
+testing "busyagent e2e write tool loop" \
+	'rm -f "$TARGET"; run_agent -s write-e2e -p claude WRITE_E2E_MARKER >/dev/null; cat "$TARGET"' \
+	"written-by-agent" "" ""
+
+testing "busyagent e2e conversation event and stats persistence" \
+	's=$(find "$HOME_DIR/projects" -type d -name write-e2e); grep -q "\"name\":\"Write\"" "$s/events.jsonl" && grep -q "write-e2e-done" "$s/conversation.jsonl" && grep -q "\"agent_request_count\":2" "$s/stats.json" && echo persisted' \
+	"persisted\n" "" ""
+
+testing "busyagent e2e plan confirm lifecycle" \
+	'BA_HOME=$HOME_DIR busyagent -s plan-e2e -u "$BASE" -k test -m test -p claude seed >/dev/null 2>&1; s=$(find "$HOME_DIR/projects" -type d -name plan-e2e); printf "locked plan\n" > "$s/plan.draft"; BA_HOME=$HOME_DIR busyagent -s plan-e2e -u "$BASE" -k test -m test -p claude PLAN_E2E_MARKER >/dev/null 2>&1; test "$(cat "$s/plan.md")" = "locked plan" && test ! -s "$s/plan.draft" && echo confirmed' \
+	"confirmed\n" "" ""
+
+testing "busyagent e2e sub-agent result flows to parent" \
+	'out=$(run_agent -s sub-e2e -p claude SUB_E2E_MARKER); s=$(find "$HOME_DIR/projects" -type d -name sub-e2e); echo "$out" | grep -q "parent-e2e-done" && grep -q "sub_agent_start" "$s/events.jsonl" && grep -q "sub_agent_end" "$s/events.jsonl" && grep -q "claude-e2e-ok" "$s/events.jsonl" && echo sub-ok' \
+	"sub-ok\n" "" ""
 
 exit $FAILCOUNT

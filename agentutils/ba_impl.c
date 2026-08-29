@@ -2188,15 +2188,7 @@ int store_stats_get_file_int(const char *path, const char *key) {
  * Old versions missing fields get them on the next write; no backfill. */
 int store_stats_get_int_file(const char *path, const char *key)
 {
-	char *txt = store_stats_read(path);
-	JsonParse jp;
-	int v = 0;
-	if (!txt) return 0;
-	jp = json_parse_root(txt);
-	if (!jp.error)
-		v = store_stats_get_int(jp.val, key);
-	free(txt);
-	return v;
+	return store_stats_get_file_int(path, key);
 }
 
 void store_stats_set_int_file(const char *path, const char *key, int value) {
@@ -2363,13 +2355,6 @@ int store_plan_clear(const SessionPaths *p) {
 #include <stdio.h>
 
 /* ---- DisplayState (ported verbatim) ---- */
-static void ds_init(BaDisplay *ds) {
-    memset(ds, 0, sizeof(*ds));
-    ds->last_char[0] = '\n';
-    ds->last_char[1] = '\0';
-    ds->prev_was_thinking = 0;
-}
-
 static void ds_update_last_char(BaDisplay *ds, const char *text) {
     if (!text || !*text) return;
     {
@@ -2419,7 +2404,8 @@ static void ensure_newline(BaDisplay *ds) {
 
 void ba_disp_init(BaDisplay *d, BaDisplayFormat fmt)
 {
-    ds_init(d);
+    memset(d, 0, sizeof(*d));
+    d->last_char[0] = '\n';
     d->format = fmt;
     d->out = stdout;
 }
@@ -2486,17 +2472,12 @@ char *ba_tool_call_summary(const char *name, const char *input_json)
     return xstrdup("");
 }
 
-/* ---- main renderer: verbatim port of the render_message branches ---- */
-char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
+char *ba_display_event_json(const BaDisplayMsg *msg, int stream_output)
 {
     StrBuf buf;
 
-    if (ds->format == BA_FMT_NONE)
-        return NULL;
-
-    if (ds->format == BA_FMT_STREAM_JSON) {
-        sb_init(&buf);
-        switch (msg->type) {
+    sb_init(&buf);
+    switch (msg->type) {
         case BA_DM_TEXT:
             sb_append(&buf, "{\"type\":\"text\",\"content\":");
             sb_append_json_string(&buf, msg->content ? msg->content : "");
@@ -2513,7 +2494,8 @@ char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
             sb_append(&buf, ",\"id\":");
             sb_append_json_string(&buf, msg->tool_id ? msg->tool_id : "");
             sb_append(&buf, ",\"input\":");
-            sb_append(&buf, (msg->tool_input && msg->tool_input[0]) ? msg->tool_input : "{}");
+            sb_append(&buf, (msg->tool_input && (msg->tool_input[0] || !stream_output))
+                      ? msg->tool_input : "{}");
             sb_append_char(&buf, '}');
             break;
         case BA_DM_TOOL_RESULT:
@@ -2566,10 +2548,23 @@ char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
         default:
             sb_free(&buf);
             return NULL;
-        }
-        fprintf(ds->out, "%s\n", buf.data);
+    }
+    return buf.data;
+}
+
+/* ---- main renderer: verbatim port of the render_message branches ---- */
+char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
+{
+    if (ds->format == BA_FMT_NONE)
+        return NULL;
+
+    if (ds->format == BA_FMT_STREAM_JSON) {
+        char *event = ba_display_event_json(msg, 1);
+        if (!event)
+            return NULL;
+        fprintf(ds->out, "%s\n", event);
         fflush(ds->out);
-        return buf.data;
+        return event;
     }
 
     /* human mode (ANSI/truncation rules ported verbatim) */
@@ -3212,14 +3207,6 @@ static void emit_simple_event(sse_callback_fn callback, void *ctx,
     evt.content = (char *)content;  /* borrowed, not freed */
     callback(ctx, &evt);
 }
-
-/* helpers that copy strings inside the callback */
-/* kept for future use */
-#if 0
-static char *dup_and_free(char *s) {
-    return util_strdup(s);
-}
-#endif
 
 int sse_parse_event(const char *provider, const char *data, size_t data_len,
                     sse_callback_fn callback, void *ctx) {
