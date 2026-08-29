@@ -464,6 +464,7 @@ core-y		:= \
 		applets/ \
 
 libs-y		:= \
+		agentutils/ \
 		archival/ \
 		archival/libarchive/ \
 		console-tools/ \

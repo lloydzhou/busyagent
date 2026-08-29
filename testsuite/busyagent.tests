@@ -1,0 +1,362 @@
+#!/bin/sh
+# Copyright 2026 by Lloyd Zhou <lloydzhou@qq.com>
+# Licensed under GPLv2, see file LICENSE in this source tree.
+
+. ./testing.sh
+
+# testing "test name" "command(s)" "expected result" "file input" "stdin"
+
+# Most cases are offline: CLI contract, argument validation and the
+# cwd-bound session semantics (observed via -v diagnostics). The final
+# section exercises the main agent loop against a local BusyBox httpd CGI
+# endpoint when HTTPD and FEATURE_HTTPD_CGI are enabled.
+#
+# NOTE: command strings are single-quoted so double quotes inside grep
+# patterns survive; every invocation expected to fail ends in
+# "|| true" because the runner uses sh -e.
+
+# === argument validation ============================================
+
+testing "busyagent without base URL fails cleanly" \
+	'busyagent hi 2>&1; echo rc=$?' \
+	"busyagent: no base URL: use -u URL or \$BA_BASE_URL\nrc=1\n" \
+	"" ""
+
+testing "busyagent rejects unknown provider" \
+	'busyagent hi -u http://127.0.0.1:9/x -k k -m m -p foo 2>&1; echo rc=$?' \
+	"busyagent: bad provider 'foo' (claude|openai|responses)\nrc=1\n" \
+	"" ""
+
+testing "busyagent without api key fails" \
+	'busyagent hi -u http://127.0.0.1:9/x -m m 2>&1; echo rc=$?' \
+	"busyagent: no API key: use -k KEY or \$BA_API_KEY\nrc=1\n" \
+	"" ""
+
+testing "busyagent without model fails" \
+	'busyagent hi -u http://127.0.0.1:9/x -k k 2>&1; echo rc=$?' \
+	"busyagent: no model: use -m MODEL\nrc=1\n" \
+	"" ""
+
+# === usage ==========================================================
+
+testing "busyagent --help prints usage" \
+	'busyagent --help 2>&1 | grep -m1 "^Usage: busyagent"' \
+	"Usage: busyagent [OPTIONS] [PROMPT]\n" \
+	"" ""
+
+# === starter tools.json (-i) ========================================
+
+rm -rf ba.testhome
+testing "busyagent -i writes a starter tools.json" \
+	'BA_HOME=$PWD/ba.testhome busyagent -i 2>&1 | sed "s|^wrote .*/|wrote |" && test $(grep -c "\"input_schema\"" $PWD/ba.testhome/tools.json) -eq 12 && echo twelve-ok' \
+	"wrote tools.json\ntwelve-ok\n" \
+	"" ""
+
+testing "busyagent -i export lists the core tools" \
+	'rm -rf ba.tl; BA_HOME=$PWD/ba.tl busyagent -i >/dev/null 2>&1; for t in Bash Read Grep SubAgent; do grep -m1 -o "\"$t\"" ba.tl/tools.json || echo MISSING-$t; done' \
+	"\"Bash\"\n\"Read\"\n\"Grep\"\n\"SubAgent\"\n" \
+	"" ""
+
+testing "busyagent -i refuses to overwrite" \
+	'rm -rf ba.tw; BA_HOME=$PWD/ba.tw busyagent -i >/dev/null 2>&1; BA_HOME=$PWD/ba.tw busyagent -i 2>&1 | sed "s|.*/tools.json|tools.json|"' \
+	"tools.json already exists (delete it first to re-export)\n" \
+	"" ""
+
+# the exported example must be executable: it carries an exec mapping
+testing "busyagent -i export includes an exec mapping" \
+	'rm -rf ba.tx; BA_HOME=$PWD/ba.tx busyagent -i >/dev/null 2>&1; test $(grep -c "\"exec\"" $PWD/ba.tx/tools.json) -ge 1 && test $(grep -c "\"applet\"" $PWD/ba.tx/tools.json) -ge 1 && echo exec-ok' \
+	"exec-ok\n" \
+	"" ""
+
+# entries whose exec mapping is malformed are skipped, not crash fodder
+testing "tools.json entry without exec mapping is skipped" \
+	'rm -rf ba.tj; mkdir -p ba.tj; printf "[{\"name\": \"Broken\", \"description\": \"no exec\"}]" > ba.tj/tools.json; BA_HOME=$PWD/ba.tj busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -c "exec.applet missing"' \
+	"1\n" \
+	"" ""
+
+testing "tools.json entry with non-string argv is skipped" \
+	'rm -rf ba.tk; mkdir -p ba.tk; printf "[{\"name\": \"Bad\", \"description\": \"x\", \"exec\": {\"applet\": \"echo\", \"argv\": [1, 2]}}]" > ba.tk/tools.json; BA_HOME=$PWD/ba.tk busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -c "not a string"' \
+	"1\n" \
+	"" ""
+
+testing "busyagent -i PATH writes a custom location" \
+	'BA_HOME=$PWD/ba.testhome busyagent -i $PWD/ba.testhome/custom.json 2>&1 | sed "s|^wrote .*/|wrote |" && test -s $PWD/ba.testhome/custom.json && echo custom-ok' \
+	"wrote custom.json\ncustom-ok\n" \
+	"" ""
+
+# === transport error paths ==========================================
+
+# ftp:// is rejected by the URL parser before any socket is touched.
+testing "busyagent rejects non-http scheme" \
+	'busyagent hi -u ftp://127.0.0.1:9/x -k k -m m 2>&1 | grep -o "HTTP request failed"' \
+	"HTTP request failed\n" \
+	"" ""
+
+# no scheme at all is equally rejected
+testing "busyagent rejects schemeless URL" \
+	'busyagent hi -u 127.0.0.1:9/x -k k -m m 2>&1 | grep -o "HTTP request failed"' \
+	"HTTP request failed\n" \
+	"" ""
+
+# https works out of the box; the unauthenticated-TLS caveat is announced
+# on stderr before any connection is attempted.
+testing "busyagent https warns about unverified certificates" \
+	'busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -o "does not verify server certificates"' \
+	"does not verify server certificates\n" \
+	"" ""
+
+# port 1 on loopback: refused immediately by xconnect after the warning,
+# no retries burned; proves the https branch reaches the connect stage.
+testing "busyagent https connect failure is reported" \
+	'busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -o "can.t connect to remote host (127.0.0.1)"' \
+	"can't connect to remote host (127.0.0.1)\n" \
+	"" ""
+
+# empty piped prompt is refused before any request is attempted
+testing "busyagent refuses an empty piped prompt" \
+	'busyagent -u ftp://127.0.0.1:9/x -k k -m m 2>&1 | sed "s|.*busyagent: ||"' \
+	"empty prompt (no PROMPT arg and empty stdin)\n" \
+	"" ""
+
+# multi-line piped prompts are accepted (reach the transport, not the
+# empty-prompt guard)
+testing "busyagent accepts a multi-line piped prompt" \
+	'printf "line one\nline two\n" | busyagent -u ftp://127.0.0.1:9/x -k k -m m 2>&1 | grep -o "HTTP request failed"' \
+	"HTTP request failed\n" \
+	"" ""
+
+# === dynamic tools.json actually reaches the request =================
+# The request body size in -v diagnostics is the observation point:
+# a dynamic entry with a large description must grow the body; broken
+# JSON must fall back to builtins (same size as baseline).
+testing "dynamic tools.json is loaded into the request" \
+	'rm -rf ba.th; mkdir -p ba.th; printf "[{\"name\": \"MyProbe\", \"description\": \"%s\", \"input_schema\": {\"type\": \"object\", \"properties\": {}}, \"exec\": {\"applet\": \"echo\", \"argv\": [\"hi\"]}}]" "$(head -c 600 /dev/zero | tr "\\0" x)" > ba.th/tools.json; B1=$(BA_HOME=$PWD/ba.th busyagent -n q1 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); rm ba.th/tools.json; B2=$(BA_HOME=$PWD/ba.th busyagent -n q2 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$B1" -gt $((B2 + 500)) && echo dynamic-effective' \
+	"dynamic-effective\n" \
+	"" ""
+
+testing "broken tools.json falls back to builtins" \
+	'printf "not json at all" > ba.th/tools.json; BA_HOME=$PWD/ba.th busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -c "tools.json parse failed"' \
+	"1\n" \
+	"" ""
+
+# === thinking effort (-e) ============================================
+# the body-size observation point again: -e high must grow the request
+# (thinking + output_config / reasoning_effort), bad levels rejected.
+testing "thinking effort reaches the request" \
+	'rm -rf ba.ef; E1=$(BA_HOME=$PWD/ba.ef busyagent -n q1 -e high -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); E2=$(BA_HOME=$PWD/ba.ef busyagent -n q2 -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$E1" -gt $((E2 + 15)) && echo effort-in-request' \
+	"effort-in-request\n" \
+	"" ""
+
+testing "bad effort level is rejected" \
+	'busyagent hi -e turbo -u http://127.0.0.1:9/x -k k -m m 2>&1; echo rc=$?' \
+	"busyagent: bad effort 'turbo' (minimal|low|medium|high|xhigh|max)\nrc=1\n" \
+	"" ""
+
+# an extended level must pass through to the request verbatim: the body
+# for -e xhigh is exactly one byte longer than for -e high (same request
+# otherwise), whatever the backend eventually does with it
+testing "extended effort level passes through verbatim" \
+	'rm -rf ba.ex; XH=$(BA_HOME=$PWD/ba.ex busyagent -n x1 -e xhigh -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); HI=$(BA_HOME=$PWD/ba.ex busyagent -n x2 -e high -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "request body ([0-9]* bytes)" | grep -o "[0-9]*"); test "$XH" -eq $((HI + 1)) && echo effort-passthrough' \
+	"effort-passthrough\n" \
+	"" ""
+
+# === session semantics (offline, observed via -v) ===================
+
+rm -rf ba.h1
+testing "first call in a fresh home starts a new session" \
+	'BA_HOME=$PWD/ba.h1 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "(new)"' \
+	"(new)\n" \
+	"" ""
+
+testing "second call in the same cwd resumes it" \
+	'BA_HOME=$PWD/ba.h1 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m -v 2>&1 | grep -o "(resumed)"' \
+	"(resumed)\n" \
+	"" ""
+
+testing "default resolution creates exactly one session directory" \
+	'ls -d ba.h1/projects/*/*/ | wc -l' \
+	"1\n" \
+	"" ""
+
+testing "-n forces a fresh session each call" \
+	'BA_HOME=$PWD/ba.h1 busyagent -n first -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; BA_HOME=$PWD/ba.h1 busyagent -n second -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; ls -d ba.h1/projects/*/*/ | wc -l' \
+	"3\n" \
+	"" ""
+
+testing "--session pins the directory name" \
+	'BA_HOME=$PWD/ba.h2 busyagent -s mysession hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true; test -d ba.h2/projects/*/mysession && echo pinned-ok' \
+	"pinned-ok\n" \
+	"" ""
+
+testing "sessions are bound to the working directory" \
+	'mkdir -p ba.proj1 ba.proj2; (cd ba.proj1 && BA_HOME=$OLDPWD/ba.h3 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true); (cd ba.proj2 && BA_HOME=$OLDPWD/ba.h3 busyagent hi -u ftp://127.0.0.1:9/x -k k -m m >/dev/null 2>&1 || true); ls ba.h3/projects/ | wc -l' \
+	"2\n" \
+	"" ""
+
+# two resumed+new calls recorded their user_input turns in the trace
+testing "every turn records a user_input event" \
+	'cat ba.h1/projects/*/*/events.jsonl | grep -c "\"type\":\"user_input\""' \
+	"4\n" \
+	"" ""
+
+rm -rf ba.testhome ba.tl ba.tw ba.tx ba.tj ba.tk ba.th ba.ef ba.h1 ba.h2 ba.h3 ba.proj1 ba.proj2
+
+# === main agent loop (local httpd CGI) ===============================
+
+optional HTTPD FEATURE_HTTPD_CGI
+
+if [ -z "$SKIP" ]; then
+	ROOT=$PWD/ba.e2e
+	WEB=$ROOT/www
+	HOME_DIR=$ROOT/home
+	PORT=$((18000 + $$ % 20000))
+	BASE=http://127.0.0.1:$PORT/cgi-bin/mock
+	TARGET=$PWD/ba.e2e-written.txt
+	HTTPD_PID=
+
+	cleanup_e2e()
+	{
+		[ -n "$HTTPD_PID" ] && kill "$HTTPD_PID" 2>/dev/null
+		wait "$HTTPD_PID" 2>/dev/null
+		rm -rf "$ROOT" "$TARGET"
+	}
+	trap cleanup_e2e EXIT INT TERM
+
+	rm -rf "$ROOT" "$TARGET"
+	mkdir -p "$WEB/cgi-bin" "$HOME_DIR"
+	cat > "$WEB/cgi-bin/mock" <<'MOCK'
+#!/bin/sh
+body=$(cat)
+path=${PATH_INFO:-}
+
+has() { case $body in *"$1"*) return 0;; *) return 1;; esac; }
+header() { printf 'Content-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n'; }
+
+claude_text()
+{
+	text=$1 more=${2:-}
+	printf '%s\n\n' \
+		'event: message_start' \
+		'data: {"type":"message_start","message":{"id":"msg_mock","role":"assistant","content":[],"model":"test","usage":{"input_tokens":10,"output_tokens":0}}}' \
+		'event: content_block_start' \
+		'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'
+	printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"%s"}}\n\n' "$text"
+	[ -z "$more" ] || printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"%s"}}\n\n' "$more"
+	printf '%s\n\n' \
+		'event: content_block_stop' \
+		'data: {"type":"content_block_stop","index":0}' \
+		'event: message_delta' \
+		'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}' \
+		'event: message_stop' \
+		'data: {"type":"message_stop"}'
+}
+
+claude_tool()
+{
+	name=$1 id=$2 input=$3
+	printf '%s\n\n' \
+		'event: message_start' \
+		'data: {"type":"message_start","message":{"id":"msg_tool","role":"assistant","content":[],"model":"test","usage":{"input_tokens":10,"output_tokens":0}}}'
+	printf 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"%s","name":"%s","input":{}}}\n\n' "$id" "$name"
+	printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"%s"}}\n\n' "$input"
+	printf '%s\n\n' \
+		'event: content_block_stop' \
+		'data: {"type":"content_block_stop","index":0}' \
+		'event: message_delta' \
+		'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":6}}' \
+		'event: message_stop' \
+		'data: {"type":"message_stop"}'
+}
+
+openai_text()
+{
+	printf 'data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","model":"test","choices":[{"index":0,"delta":{"role":"assistant","content":"%s"},"finish_reason":null}]}\n\n' "$1"
+	printf '%s\n\n' \
+		'data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3}}' \
+		'data: [DONE]'
+}
+
+responses_text()
+{
+	printf 'event: response.output_text.delta\ndata: {"delta":"%s"}\n\n' "$1"
+	printf '%s\n\n' \
+		'event: response.completed' \
+		'data: {"response":{"usage":{"input_tokens":10,"output_tokens":3}}}'
+}
+
+header
+case $path in
+*/chat/completions) openai_text 'openai-e2e-ok'; exit;;
+*/responses) responses_text 'responses-e2e-ok'; exit;;
+esac
+
+if has 'WRITE_E2E_MARKER'; then
+	if has 'tool_result'; then
+		claude_text 'write-e2e-done'
+	else
+		claude_tool Write tool_write '{\"path\":\"__TARGET__\",\"content\":\"written-by-agent\"}'
+	fi
+elif has 'PLAN_E2E_MARKER'; then
+	if has 'tool_result'; then
+		claude_text 'plan-e2e-done'
+	else
+		claude_tool PlanConfirm tool_plan '{}'
+	fi
+elif has 'SUB_E2E_MARKER'; then
+	if has 'tool_result'; then
+		claude_text 'parent-e2e-done'
+	elif has 'SUB_CHILD_E2E'; then
+		claude_text 'child-e2e-result'
+	else
+		claude_tool SubAgent tool_sub '{\"prompt\":\"SUB_CHILD_E2E\",\"description\":\"e2e child\"}'
+	fi
+else
+	claude_text 'claude-' 'e2e-ok'
+fi
+MOCK
+	sed -i "s|__TARGET__|$TARGET|g" "$WEB/cgi-bin/mock"
+	chmod +x "$WEB/cgi-bin/mock"
+
+	httpd -f -p "127.0.0.1:$PORT" -h "$WEB" >/dev/null 2>&1 &
+	HTTPD_PID=$!
+	sleep 1
+
+	run_agent()
+	{
+		BA_HOME=$HOME_DIR busyagent -u "$BASE" -k test -m test "$@" 2>&1
+	}
+fi
+
+testing "busyagent e2e claude text stream" \
+	'run_agent -s text-e2e -p claude hello | grep -o "claude-e2e-ok"' \
+	"claude-e2e-ok\n" "" ""
+
+testing "busyagent stores text deltas once without aggregate duplicate" \
+	's=$(find "$HOME_DIR/projects" -type d -name text-e2e); grep "\"type\":\"text\"" "$s/events.jsonl"' \
+	'{"type":"text","content":"claude-"}\n{"type":"text","content":"e2e-ok"}\n' "" ""
+
+testing "busyagent e2e openai text stream" \
+	'run_agent -n -p openai hello | grep -o "openai-e2e-ok"' \
+	"openai-e2e-ok\n" "" ""
+
+testing "busyagent e2e responses text stream" \
+	'run_agent -n -p responses hello | grep -o "responses-e2e-ok"' \
+	"responses-e2e-ok\n" "" ""
+
+testing "busyagent e2e write tool loop" \
+	'rm -f "$TARGET"; run_agent -s write-e2e -p claude WRITE_E2E_MARKER >/dev/null; cat "$TARGET"' \
+	"written-by-agent" "" ""
+
+testing "busyagent e2e conversation event and stats persistence" \
+	's=$(find "$HOME_DIR/projects" -type d -name write-e2e); grep -q "\"name\":\"Write\"" "$s/events.jsonl" && grep -q "write-e2e-done" "$s/conversation.jsonl" && grep -q "\"agent_request_count\":2" "$s/stats.json" && echo persisted' \
+	"persisted\n" "" ""
+
+testing "busyagent e2e plan confirm lifecycle" \
+	'BA_HOME=$HOME_DIR busyagent -s plan-e2e -u "$BASE" -k test -m test -p claude seed >/dev/null 2>&1; s=$(find "$HOME_DIR/projects" -type d -name plan-e2e); printf "locked plan\n" > "$s/plan.draft"; BA_HOME=$HOME_DIR busyagent -s plan-e2e -u "$BASE" -k test -m test -p claude PLAN_E2E_MARKER >/dev/null 2>&1; test "$(cat "$s/plan.md")" = "locked plan" && test ! -s "$s/plan.draft" && echo confirmed' \
+	"confirmed\n" "" ""
+
+testing "busyagent e2e sub-agent result flows to parent" \
+	'out=$(run_agent -s sub-e2e -p claude SUB_E2E_MARKER); s=$(find "$HOME_DIR/projects" -type d -name sub-e2e); echo "$out" | grep -q "parent-e2e-done" && grep -q "sub_agent_start" "$s/events.jsonl" && grep -q "sub_agent_end" "$s/events.jsonl" && grep -q "claude-e2e-ok" "$s/events.jsonl" && echo sub-ok' \
+	"sub-ok\n" "" ""
+
+exit $FAILCOUNT
