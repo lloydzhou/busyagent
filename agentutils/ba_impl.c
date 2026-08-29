@@ -1296,33 +1296,39 @@ static int ba_body_read(BaResp *r, char *out, size_t outsz)
 	}
 }
 
-static void ba_send_request(tls_state_t *tls, int fd, const BaUrl *u, const char **headers,
+/* 0 on success, -1 if any send failed. The plaintext path surfaces
+ * write errors (EPIPE when the peer closed, ECONNRESET...); the TLS
+ * path uses xwrite(), which exits the process on failure (libbb
+ * semantics), so a short TLS write never returns here. */
+static int ba_send_request(tls_state_t *tls, int fd, const BaUrl *u, const char **headers,
 			    int header_count, const char *body, size_t body_len)
 {
-	char first[512];
+	char *first;
 	int i;
+	int rc = 0;
 
+	/* host and path are each up to ~1 KiB: too long for a stack buffer */
 	if (u->port != 80)
-		snprintf(first, sizeof(first),
-			"POST %s HTTP/1.1\r\n"
-			"Host: %s:%d\r\n"
-			"Content-Length: %lu\r\n"
-			"Connection: close\r\n",
-			u->path, u->host, u->port, (unsigned long)body_len);
+		first = xasprintf("POST %s HTTP/1.1\r\n"
+				  "Host: %s:%d\r\n"
+				  "Content-Length: %lu\r\n"
+				  "Connection: close\r\n",
+				  u->path, u->host, u->port, (unsigned long)body_len);
 	else
-		snprintf(first, sizeof(first),
-			"POST %s HTTP/1.1\r\n"
-			"Host: %s\r\n"
-			"Content-Length: %lu\r\n"
-			"Connection: close\r\n",
-			u->path, u->host, (unsigned long)body_len);
-	send_all_conn(tls, fd, first, strlen(first));
+		first = xasprintf("POST %s HTTP/1.1\r\n"
+				  "Host: %s\r\n"
+				  "Content-Length: %lu\r\n"
+				  "Connection: close\r\n",
+				  u->path, u->host, (unsigned long)body_len);
+	rc |= send_all_conn(tls, fd, first, strlen(first));
+	free(first);
 	for (i = 0; i < header_count; i++) {
-		send_all_conn(tls, fd, headers[i], strlen(headers[i]));
-		send_all_conn(tls, fd, "\r\n", 2);
+		rc |= send_all_conn(tls, fd, headers[i], strlen(headers[i]));
+		rc |= send_all_conn(tls, fd, "\r\n", 2);
 	}
-	send_all_conn(tls, fd, "\r\n", 2);
-	send_all_conn(tls, fd, body, body_len);
+	rc |= send_all_conn(tls, fd, "\r\n", 2);
+	rc |= send_all_conn(tls, fd, body, body_len);
+	return rc;
 }
 
 
@@ -1444,7 +1450,13 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 		r.tls = tls;
 		r.cancelled = cancelled;
 		(void)tls;
-		ba_send_request(tls, fd, &u, headers, header_count, body, body_len);
+		if (ba_send_request(tls, fd, &u, headers, header_count, body, body_len) != 0) {
+			io_err = 1;   /* request never left: no point reading a reply */
+			close(fd);
+			ba_tls_dispose(tls);
+			tls = NULL;
+			goto attempt_done;
+		}
 		if (ba_read_header(&r) != 0) {
 			io_err = 1;
 			close(fd);
@@ -3891,8 +3903,15 @@ static void responses_convert_messages(StrBuf *out, JsonVal messages_val) {
                 JsonVal block = json_array_get(content, j);
                 char *type = json_get_string(block, "type");
                 if (type && strcmp(type, "tool_result") == 0) {
-                    char *id = json_get_string(block, "tool_use_id"); char *value = json_get_string(block, "content");
-                    if (wrote++) sb_append_char(out, ','); sb_append(out, "{\"type\":\"function_call_output\",\"call_id\":"); sb_append_json_string(out, id ? id : ""); sb_append(out, ",\"output\":"); sb_append_json_string(out, value ? value : ""); sb_append_char(out, '}');
+                    char *id = json_get_string(block, "tool_use_id");
+                    char *value = json_get_string(block, "content");
+                    if (wrote++)
+                        sb_append_char(out, ',');
+                    sb_append(out, "{\"type\":\"function_call_output\",\"call_id\":");
+                    sb_append_json_string(out, id ? id : "");
+                    sb_append(out, ",\"output\":");
+                    sb_append_json_string(out, value ? value : "");
+                    sb_append_char(out, '}');
                     FREE_PTR(id); FREE_PTR(value);
                 } else if (type && strcmp(type, "text") == 0) {
                     char *value = json_get_string(block, "text"); if (wrote++) sb_append_char(out, ','); sb_append(out, "{\"role\":\"user\",\"content\":"); sb_append_json_string(out, value ? value : ""); sb_append_char(out, '}'); FREE_PTR(value);
@@ -5169,14 +5188,14 @@ char *ba_tool_execute(const char *name, const char *input_json, int timeout_ms)
 		 * Persistence lives in the conversation history (the full call record
 		 * IS the state); nothing hits disk or the system prompt. */
 		JsonVal todos = json_get(jp.val, "todos");
-		int total, i;
+		int total, t;
 		if (todos.type != JSON_ARRAY) {
 			sb_append(&sb, "OK");   /* bash-agent parity: no error on bad shapes */
 			return sb.data;
 		}
 		total = json_array_len(todos);
-		for (i = 0; i < total; i++) {
-			JsonVal item = json_array_get(todos, i);
+		for (t = 0; t < total; t++) {
+			JsonVal item = json_array_get(todos, t);
 			char *content = json_get_string(item, "content");
 			char *st = json_get_string(item, "status");
 			sb_append(&sb, "- [");

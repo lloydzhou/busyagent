@@ -1,11 +1,13 @@
 /*
- * busyagent - single user-turn LLM agent applet for busybox
+ * busyagent - LLM agent applet for busybox
  *
- * One invocation = one user turn: resolve session (cwd-bound by default,
- * --new/--session to override), rebuild history into the request prefix,
- * stream the reply over plain HTTP (SSE), execute tool calls with busybox
- * applets, feed results back until the model stops, append the turn's
- * events to the session trace, exit.
+ * Resolve the cwd-bound session (default resumes the latest,
+ * --new/--session to override), rebuild history into the request
+ * prefix, stream the reply over HTTP(S) (SSE), execute tool calls
+ * with busybox applets, feed results back until the model stops,
+ * append the turn's events to the session trace. With a PROMPT
+ * argument that loop runs once and exits; a tty on stdin starts an
+ * interactive REPL instead (sessions auto-resume per cwd).
  *
  * Copyright (C) 2026 by Lloyd Zhou <lloydzhou@qq.com>
  *
@@ -18,18 +20,19 @@
 //config:	select FEATURE_EDITING
 //config:	select TLS
 //config:	help
-//config:	Run exactly one user turn of an LLM agent loop: build a chat
-//config:	request, stream the reply over plain HTTP (SSE), execute any
-//config:	tool calls with busybox applets, feed results back until the
-//config:	model finishes, then exit. Session history is stored under
-//config:	$BA_HOME and restored automatically per working directory.
+//config:	Run an LLM agent loop: build a chat request, stream the reply
+//config:	over HTTP(S) (SSE), execute tool calls with busybox applets,
+//config:	feed the results back until the model finishes. Session history
+//config:	is stored under $BA_HOME and restored automatically per working
+//config:	directory; without a PROMPT argument on a tty an interactive
+//config:	REPL is started instead.
 //applet:IF_BUSYAGENT(APPLET(busyagent, BB_DIR_USR_BIN, BB_SUID_DROP))
 //kbuild:lib-$(CONFIG_BUSYAGENT) += busyagent.o ba_impl.o
 
 //usage:#define busyagent_trivial_usage
 //usage:       "[OPTIONS] [PROMPT]"
 //usage:#define busyagent_full_usage "\n\n"
-//usage:       "Run one user turn of an LLM agent loop\n"
+//usage:       "Run an LLM agent loop (one shot with PROMPT, REPL on a tty)\n"
 //usage:     "\n	-u URL	Base URL (default $BA_BASE_URL)"
 //usage:     "\n	-k KEY	API key (default $BA_API_KEY)"
 //usage:     "\n	-m MODEL	Model name"
@@ -65,14 +68,6 @@ typedef struct {
 	int verbose;
 	int usage_flushed;   /* one usage event per SSE round */
 } TurnCtx;
-
-static void ba_emit_json_str(StrBuf *sb, const char *key, const char *val)
-{
-	sb_append(sb, ",\"");
-	sb_append(sb, key);
-	sb_append(sb, "\":");
-	sb_append_json_string(sb, val ? val : "");
-}
 
 /* Render one logical event to stdout (text or stream-json) and to the
  * session trace (events.jsonl). Shapes follow bash-agent display.c. */
@@ -1503,4 +1498,3 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	free(prompt);
 	return rc;
 }
-

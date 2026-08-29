@@ -399,11 +399,11 @@ typedef enum {
 /* the bash-agent DisplayMessage field subset */
 typedef struct {
     int type;
-    char *content;      /* TEXT/THINKING/STOP(reason)/ERROR/TOOL_RESULT content/summary */
-    char *tool_name;
-    char *tool_id;
-    char *tool_input;   /* already JSON text */
-    char *session_id;   /* SubAgent/bg task id */
+    const char *content;    /* TEXT/THINKING/STOP(reason)/ERROR/TOOL_RESULT content/summary */
+    const char *tool_name;
+    const char *tool_id;
+    const char *tool_input; /* already JSON text */
+    const char *session_id; /* SubAgent/bg task id */
     int in_tokens, out_tokens, cache_read_tokens, cache_creation_tokens;
     int tool_exit_code;
 } BaDisplayMsg;
@@ -453,9 +453,9 @@ typedef enum {
 typedef struct {
     SseEventType type;
     char *content;           /* TEXT/THINKING/STOP/ERROR: text */
-    char *tool_id;           /* TOOL_CALL: call id */
-    char *tool_name;         /* TOOL_CALL: tool name */
-    char *tool_input;        /* TOOL_CALL: arguments JSON */
+    const char *tool_id;     /* TOOL_CALL: call id */
+    const char *tool_name;   /* TOOL_CALL: tool name */
+    const char *tool_input;  /* TOOL_CALL: arguments JSON */
     int in_tokens;           /* USAGE: input tokens */
     int out_tokens;          /* USAGE: output tokens */
     int cache_read_tokens;   /* USAGE: cache-read tokens */
