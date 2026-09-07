@@ -51,13 +51,21 @@
 #include "libbb.h"
 #include "busybox.h"
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include <sys/file.h>
 
 #define MCPC_MAX_HEADERS 8
 #define MCPC_MAX_SESSIONS 16
 #define MCPC_STDIO_TIMEOUT_MS 30000
+#define MCPC_CLIENT_TIMEOUT_MS 30000
+#define MCPC_MAX_LINE (16 * 1024)
+#define MCPC_DAEMON_START_MS 5000
+#define MCPC_LOCK_MODE 0600
 
 /* ============================================================
  * paths
@@ -86,6 +94,14 @@ static char *mcpc_pid_path(void)
 {
 	char *d = mcpc_dir();
 	char *p = xasprintf("%s/daemon.pid", d);
+	free(d);
+	return p;
+}
+
+static char *mcpc_lock_path(void)
+{
+	char *d = mcpc_dir();
+	char *p = xasprintf("%s/daemon.lock", d);
 	free(d);
 	return p;
 }
@@ -191,6 +207,10 @@ typedef struct {
 static McpSession *g_sessions[MCPC_MAX_SESSIONS];
 static int g_n_sessions;
 static volatile smallint g_stop;
+static void (*g_old_sigpipe)(int);
+static int g_sigpipe_saved;
+
+static void mcpc_close_fds_from(int first);
 
 static McpSession *mcpc_sess_find(const char *name)
 {
@@ -207,20 +227,30 @@ static void mcpc_sess_free(McpSession *s)
 {
 	int i;
 
+	/* Close the pipes first so a child blocked on stdio can exit; only then
+	 * signal its process group.  The pid is still owned by this daemon. */
+	if (s->in_fd >= 0) {
+		close(s->in_fd);
+		s->in_fd = -1;
+	}
+	if (s->out_fd >= 0) {
+		close(s->out_fd);
+		s->out_fd = -1;
+	}
 	if (s->transport == 1 && s->pid > 0) {
-		kill(s->pid, SIGTERM);
+		if (kill(-s->pid, SIGTERM) != 0 && errno != ESRCH)
+			kill(s->pid, SIGTERM);
 		for (i = 0; i < 20; i++) {
 			if (waitpid(s->pid, NULL, WNOHANG) == s->pid)
 				break;
 			usleep(50 * 1000);
 		}
-		kill(s->pid, SIGKILL);
+		if (waitpid(s->pid, NULL, WNOHANG) != s->pid) {
+			if (kill(-s->pid, SIGKILL) != 0 && errno != ESRCH)
+				kill(s->pid, SIGKILL);
+		}
 		waitpid(s->pid, NULL, 0);
 	}
-	if (s->in_fd >= 0)
-		close(s->in_fd);
-	if (s->out_fd >= 0)
-		close(s->out_fd);
 	free(s->name);
 	free(s->cmd);
 	free(s->session_id);
@@ -251,10 +281,14 @@ static int mcpc_stdio_spawn(McpSession *s, const char *cmd)
 		return -1;
 	}
 	if (pid == 0) {
+		signal(SIGPIPE, SIG_DFL);
 		close(in_pipe[1]);
 		close(out_pipe[0]);
+		if (setsid() < 0)
+			_exit(127);
 		xmove_fd(in_pipe[0], STDIN_FILENO);
 		xmove_fd(out_pipe[1], STDOUT_FILENO);
+		mcpc_close_fds_from(3);
 		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
 		_exit(127);
 	}
@@ -288,19 +322,24 @@ static char *mcpc_read_line_to(int fd, int timeout_ms)
 			goto fail;
 		}
 		if (pr == 0) {
-			if ((int64_t)monotonic_ms() > deadline)
+			if ((int64_t)monotonic_ms() >= deadline)
 				goto fail;
 			if (g_stop)
 				goto fail;
 			continue;
 		}
+		if (!(pfd.revents & (POLLIN | POLLHUP)))
+			goto fail;
 		n = safe_read(fd, &ch, 1);
 		if (n <= 0)
 			goto fail;
 		if (ch == '\n')
 			break;
-		if (ch != '\r')
+		if (ch != '\r') {
+			if (sb.len >= MCPC_MAX_LINE)
+				goto fail;
 			sb_append_char(&sb, ch);
+		}
 	}
 	if (!sb.data)
 		sb_append(&sb, "");
@@ -313,7 +352,6 @@ static char *mcpc_read_line_to(int fd, int timeout_ms)
 /* write the request, then read lines until the one carrying our id */
 static char *mcpc_stdio_roundtrip(McpSession *s, const char *req, int want_id)
 {
-	char pat[40];
 	char *resp = NULL;
 
 	if (full_write(s->in_fd, req, strlen(req)) != (ssize_t)strlen(req)
@@ -321,7 +359,6 @@ static char *mcpc_stdio_roundtrip(McpSession *s, const char *req, int want_id)
 		s->dead = 1;
 		return NULL;
 	}
-	snprintf(pat, sizeof(pat), "\"id\":%d", want_id);
 	for (;;) {
 		JsonParse jp;
 		char *line = mcpc_read_line_to(s->out_fd, MCPC_STDIO_TIMEOUT_MS);
@@ -338,7 +375,14 @@ static char *mcpc_stdio_roundtrip(McpSession *s, const char *req, int want_id)
 			JsonVal idv = json_get(jp.val, "id");
 			char *raw;
 			int match = 0;
+			char *version = json_get_string(jp.val, "jsonrpc");
 
+			if (!version || strcmp(version, "2.0") != 0) {
+				free(version);
+				free(line);
+				continue;
+			}
+			free(version);
 			if (idv.type == JSON_NUMBER && (int)json_number_val(idv) == want_id)
 				match = 1;
 			else {
@@ -361,30 +405,114 @@ static char *mcpc_stdio_roundtrip(McpSession *s, const char *req, int want_id)
 
 /* ---- HTTP (Streamable HTTP) transport ---- */
 
-/* SSE-wrapped JSON-RPC: return the first message-event data (malloc'd) */
+/* SSE-wrapped JSON-RPC: retain only the first matching message event. */
 typedef struct {
+	AgcSse sse;
 	char *json;
-} McpSseCtx;
+	StrBuf body;
+	AgcHttpResp *resp;
+	int want_id;
+} McpHttpSseCtx;
 
-static void mcpc_sse_event(void *ctx, const char *event,
-			   const char *data, size_t data_len)
+static int mcpc_json_id_matches(JsonVal root, int want_id)
 {
-	McpSseCtx *c = ctx;
+	JsonVal idv;
+	char *raw;
+	char idstr[32];
 
-	if (c->json)
-		return;   /* first wins */
-	if (strcmp(event, "message") != 0)
-		return;
-	c->json = xstrndup(data, data_len);
+	if (root.type != JSON_OBJECT)
+		return 0;
+	{
+		char *version = json_get_string(root, "jsonrpc");
+		int ok = version && strcmp(version, "2.0") == 0;
+		free(version);
+		if (!ok)
+			return 0;
+	}
+	idv = json_get(root, "id");
+	snprintf(idstr, sizeof(idstr), "%d", want_id);
+	if (idv.type == JSON_NUMBER) {
+		char *endp;
+		raw = json_as_string(idv);
+		if (!raw)
+			return 0;
+		endp = raw;
+		if (*endp == '-')
+			endp++;
+		if (!*endp)
+			return 0;
+		while (*endp >= '0' && *endp <= '9')
+			endp++;
+		if (*endp) {
+			free(raw);
+			return 0;
+		}
+		if (strcmp(raw, idstr) != 0) {
+			free(raw);
+			return 0;
+		}
+		free(raw);
+		return 1;
+	}
+	if (idv.type == JSON_STRING) {
+		raw = json_string_val(idv);
+		if (!raw)
+			return 0;
+		if (strcmp(raw, idstr) != 0) {
+			free(raw);
+			return 0;
+		}
+		free(raw);
+		return 1;
+	}
+	return 0;
 }
 
-static char *mcpc_http_roundtrip(McpSession *s, const char *req)
+static void mcpc_sse_event_match(void *ctx, const char *event,
+				 const char *data, size_t data_len)
+{
+	McpHttpSseCtx *c = ctx;
+	JsonParse jp;
+
+	if (c->json || strcmp(event, "message") != 0)
+		return;
+	c->json = xstrndup(data, data_len);
+	jp = json_parse_root(c->json);
+	if (jp.error || !mcpc_json_id_matches(jp.val, c->want_id)) {
+		free(c->json);
+		c->json = NULL;
+		return;
+	}
+}
+
+static int mcpc_http_chunk(void *ctx, const char *data, size_t len)
+{
+	McpHttpSseCtx *c = ctx;
+
+	if (c->json)
+		return 1;
+	if (c->want_id < 0 || !c->resp->content_type
+		|| strncasecmp(c->resp->content_type, "text/event-stream", 17) != 0) {
+		if (c->body.len > BA_MAX_BODY || len > BA_MAX_BODY - c->body.len)
+			return -1;
+		sb_appendn(&c->body, data, len);
+		return 0;
+	}
+	agc_sse_feed(&c->sse, data, len, mcpc_sse_event_match, c);
+	if (c->sse.error)
+		return -1;
+	return c->json ? 1 : 0;
+}
+
+static char *mcpc_http_roundtrip(McpSession *s, const char *req, int want_id)
 {
 	AgcHttpResp resp;
 	const char *hdrs[MCPC_MAX_HEADERS + 3];
+	McpHttpSseCtx ctx;
 	int nh = 0;
 	int i;
 	int sid_idx = -1;
+	AgcHttpReq hreq;
 	int rc;
 
 	for (i = 0; i < s->n_headers; i++)
@@ -395,46 +523,91 @@ static char *mcpc_http_roundtrip(McpSession *s, const char *req)
 		hdrs[nh++] = xasprintf("Mcp-Session-Id: %s", s->session_id);
 		sid_idx = nh - 1;
 	}
-
-	rc = agc_http_request("POST", s->url, hdrs, nh, req, strlen(req), &resp);
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.want_id = want_id;
+	ctx.resp = &resp;
+	sb_init(&ctx.body);
+	memset(&hreq, 0, sizeof(hreq));
+	hreq.method = "POST";
+	hreq.url = s->url;
+	hreq.headers = hdrs;
+	hreq.header_count = nh;
+	hreq.body = req ? req : "";
+	hreq.body_len = strlen(req ? req : "");
+	hreq.timeout_ms = MCPC_STDIO_TIMEOUT_MS;
+	rc = agc_http_request_stream(&hreq, mcpc_http_chunk, &ctx, &resp);
 	if (sid_idx >= 0)
 		free((void *)hdrs[sid_idx]);
-	if (rc != 0) {
+	if (rc < 0) {
 		s->dead = 1;
+		agc_sse_free(&ctx.sse);
+		free(ctx.json);
+		sb_free(&ctx.body);
 		return NULL;
 	}
 	if (resp.status < 200 || resp.status >= 300) {
 		bb_error_msg("HTTP %d", resp.status);
 		agc_http_resp_free(&resp);
+		agc_sse_free(&ctx.sse);
+		free(ctx.json);
+		sb_free(&ctx.body);
 		return NULL;
 	}
-	/* capture the session id whenever the server (re)sends it */
 	if (resp.session_id && !s->session_id)
 		s->session_id = xstrdup(resp.session_id);
-	if (resp.status == 202 || !resp.body || !resp.body[0]) {
-		agc_http_resp_free(&resp);
-		return xstrdup("{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}");
-	}
 	if (resp.content_type
-	 && strncasecmp(resp.content_type, "text/event-stream", 17) == 0) {
-		AgcSse sse;
-		McpSseCtx ctx;
-		memset(&ctx, 0, sizeof(ctx));
-		agc_sse_init(&sse);
-		agc_sse_feed(&sse, resp.body, resp.body_len, mcpc_sse_event, &ctx);
-		agc_sse_finish(&sse, mcpc_sse_event, &ctx);
-		agc_sse_free(&sse);
-		agc_http_resp_free(&resp);
+		&& strncasecmp(resp.content_type, "text/event-stream", 17) == 0) {
+		char *out;
+		/* The stream may end immediately after the final event delimiter. */
+		agc_sse_finish(&ctx.sse, mcpc_sse_event_match, &ctx);
+		if (ctx.sse.error)
+			ctx.json = NULL;
 		if (!ctx.json) {
-			bb_error_msg("SSE stream carried no message event");
+			agc_sse_free(&ctx.sse);
+			agc_http_resp_free(&resp);
+			bb_error_msg("SSE stream carried no matching message event");
 			return NULL;
 		}
-		return ctx.json;
+		out = ctx.json;
+		ctx.json = NULL;
+		agc_sse_free(&ctx.sse);
+		agc_http_resp_free(&resp);
+		sb_free(&ctx.body);
+		return out;
+	}
+	/* The stream callback owns body collection for ordinary HTTP replies. */
+	if (ctx.body.data) {
+		resp.body = ctx.body.data;
+		resp.body_len = ctx.body.len;
+		ctx.body.data = NULL;
+		ctx.body.len = 0;
+		ctx.body.cap = 0;
+	}
+	/* A notification may legally have no body. */
+	if (want_id < 0 && (resp.status == 202 || !resp.body || !resp.body[0])) {
+		agc_http_resp_free(&resp);
+		sb_free(&ctx.body);
+		return xstrdup("");
+	}
+	/* An RPC request must not manufacture a successful id=0 response from
+	 * HTTP 202/empty output. */
+	if (resp.status == 202 || !resp.body || !resp.body[0]) {
+		agc_http_resp_free(&resp);
+		sb_free(&ctx.body);
+		bb_error_msg("HTTP response has no JSON-RPC result");
+		return NULL;
 	}
 	{
-		char *body = xstrdup(resp.body);
+		char *out = xstrdup(resp.body);
+		JsonParse jp = json_parse_root(out);
+		if (jp.error || !mcpc_json_id_matches(jp.val, want_id)) {
+			free(out);
+			out = NULL;
+			bb_error_msg("HTTP response has wrong JSON-RPC id");
+		}
 		agc_http_resp_free(&resp);
-		return body;
+		sb_free(&ctx.body);
+		return out;
 	}
 }
 
@@ -455,25 +628,32 @@ static char *mcpc_rpc_call(McpSession *s, const char *method,
 	if (s->transport == 1)
 		resp = mcpc_stdio_roundtrip(s, req, s->next_id);
 	else
-		resp = mcpc_http_roundtrip(s, req);
+		resp = mcpc_http_roundtrip(s, req, s->next_id);
 	s->next_id++;
 	free(req);
 	return resp;
 }
 
-static void mcpc_notify(McpSession *s, const char *method)
+static int mcpc_notify(McpSession *s, const char *method)
 {
 	char *req = xasprintf("{\"jsonrpc\":\"2.0\",\"method\":\"%s\"}", method);
+	int rc = 0;
 
 	if (s->transport == 1) {
-		full_write(s->in_fd, req, strlen(req));
-		full_write(s->in_fd, "\n", 1);
+		if (full_write(s->in_fd, req, strlen(req)) != (ssize_t)strlen(req)
+			|| full_write(s->in_fd, "\n", 1) != 1) {
+			s->dead = 1;
+			rc = -1;
+		}
 	} else {
-		/* fire and forget: servers usually answer 202 */
-		char *r = mcpc_http_roundtrip(s, req);
+		/* Notifications do not carry an id; a 202/empty response is valid. */
+		char *r = mcpc_http_roundtrip(s, req, -1);
+		if (!r && s->dead)
+			rc = -1;
 		free(r);
 	}
 	free(req);
+	return rc;
 }
 
 /* initialize + initialized; 0 on success (fills server_info/tools) */
@@ -513,7 +693,8 @@ static int mcpc_handshake(McpSession *s)
 			s->server_info_json = xstrdup("{}");
 	}
 	free(resp);
-	mcpc_notify(s, "notifications/initialized");
+	if (mcpc_notify(s, "notifications/initialized") != 0)
+		return -1;
 
 	/* cache the tool list up front: tools-list/grep stay offline */
 	resp = mcpc_rpc_call(s, "tools/list", "");
@@ -555,6 +736,11 @@ static McpSession *mcpc_sess_open(const char *name, const char *target,
 	s->in_fd = s->out_fd = -1;
 	s->next_id = 1;
 
+	if (!name || !name[0] || strchr(name, '/') || strchr(name, '\\')
+		|| strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+		bb_error_msg("invalid session name '%s'", name ? name : "?");
+		goto fail;
+	}
 	if (strncmp(target, "cmd:", 4) == 0) {
 		s->transport = 1;
 		s->cmd = xstrdup(target + 4);
@@ -641,6 +827,8 @@ static char *mcpc_daemon_handle(const char *line)
 	if (strcmp(op, "ping") == 0) {
 		if (!name)
 			return mcpc_err("missing name", NULL);
+		if (!mcpc_sess_find(name))
+			return mcpc_err("no live session: %s", name);
 		return mcpc_ok("{\"alive\":true}");
 	}
 	if (strcmp(op, "list") == 0) {
@@ -714,7 +902,9 @@ static char *mcpc_daemon_handle(const char *line)
 		if (!s)
 			return mcpc_err("no live session: %s", name);
 		method = json_get_string(jp.val, "method");
-		params = json_get_string(jp.val, "params");
+		/* params may be any JSON type (object for tools/call arguments):
+		 * take the raw source slice, not just string values */
+		params = json_as_string(json_get(jp.val, "params"));
 		if (!method) {
 			free(params);
 			return mcpc_err("missing method", NULL);
@@ -757,39 +947,125 @@ static void mcpc_sighandler(int sig UNUSED_PARAM)
 	g_stop = 1;
 }
 
+static void mcpc_ignore_sigpipe(void)
+{
+	if (!g_sigpipe_saved) {
+		g_old_sigpipe = signal(SIGPIPE, SIG_IGN);
+		g_sigpipe_saved = 1;
+	}
+}
+
+static void mcpc_close_fds_from(int first)
+{
+	struct rlimit lim;
+	int fd;
+
+	if (getrlimit(RLIMIT_NOFILE, &lim) != 0 || lim.rlim_cur > 65536)
+		lim.rlim_cur = 65536;
+	for (fd = first; fd < (int)lim.rlim_cur; fd++)
+		close(fd);
+}
+
+static void mcpc_restore_sigpipe(void)
+{
+	if (g_sigpipe_saved) {
+		signal(SIGPIPE, g_old_sigpipe);
+		g_sigpipe_saved = 0;
+	}
+}
+
+static int mcpc_daemon_alive(void);
+
+static void mcpc_unlink_runtime(const char *sp, const char *pp)
+{
+	if (sp)
+		unlink(sp);
+	if (pp)
+		unlink(pp);
+}
+
 /* the daemon process: listen on the unix socket, serve line requests */
 static int mcpc_daemon_run(void)
 {
 	char *sp = mcpc_sock_path();
 	char *pp = mcpc_pid_path();
+	char *lp = mcpc_lock_path();
 	struct sockaddr_un addr;
 	int lfd;
+	int lockfd;
 	int i;
 
-	signal(SIGINT, mcpc_sighandler);
-	signal(SIGTERM, mcpc_sighandler);
-
+	mcpc_ignore_sigpipe();
 	{
 		char *d = mcpc_dir();
 		bb_make_directory(d, 0755, FILEUTILS_RECUR);
 		free(d);
 	}
-	unlink(sp);
+	lockfd = open(lp, O_RDWR | O_CREAT, MCPC_LOCK_MODE);
+	if (lockfd < 0 || flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
+		if (lockfd >= 0)
+			close(lockfd);
+		free(lp);
+		free(sp);
+		free(pp);
+		return 1;
+	}
+	free(lp);
+	signal(SIGINT, mcpc_sighandler);
+	signal(SIGTERM, mcpc_sighandler);
+
+	if (mcpc_daemon_alive()) {
+		close(lockfd);
+		free(sp);
+		free(pp);
+		return 1;
+	}
+	if (unlink(sp) != 0 && errno != ENOENT) {
+		bb_perror_msg("unlink %s", sp);
+		close(lockfd);
+		free(sp);
+		free(pp);
+		return 1;
+	}
 	lfd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (lfd < 0) {
-		bb_perror_msg_and_die("socket");
+		bb_perror_msg("socket");
+		close(lockfd);
+		free(sp);
+		free(pp);
+		return 1;
 	}
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	strncpy(addr.sun_path, sp, sizeof(addr.sun_path) - 1);
 	if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-		bb_perror_msg_and_die("bind %s", sp);
+		bb_perror_msg("bind %s", sp);
+		close(lfd);
+		close(lockfd);
+		free(sp);
+		free(pp);
+		return 1;
 	}
 	if (listen(lfd, 4) != 0) {
-		bb_perror_msg_and_die("listen");
+		bb_perror_msg("listen");
+		close(lfd);
+		mcpc_unlink_runtime(sp, pp);
+		close(lockfd);
+		free(sp);
+		free(pp);
+		return 1;
 	}
 	{
-		FILE *f = xfopen(pp, "w");
+		FILE *f = fopen(pp, "w");
+		if (!f) {
+			bb_perror_msg("open %s", pp);
+			close(lfd);
+			mcpc_unlink_runtime(sp, pp);
+			close(lockfd);
+			free(sp);
+			free(pp);
+			return 1;
+		}
 		fprintf(f, "%d\n", (int)getpid());
 		fclose(f);
 	}
@@ -812,16 +1088,35 @@ static int mcpc_daemon_run(void)
 			StrBuf sb;
 			char ch;
 			char *resp;
+			int64_t deadline = (int64_t)monotonic_ms() + MCPC_CLIENT_TIMEOUT_MS;
 
 			sb_init(&sb);
 			for (;;) {
-				ssize_t n = safe_read(cfd, &ch, 1);
-				if (n <= 0)
+				struct pollfd cpfd;
+				int pr;
+
+				cpfd.fd = cfd;
+				cpfd.events = POLLIN;
+				pr = safe_poll(&cpfd, 1, 250);
+				if (pr < 0) {
+					if (errno == EINTR)
+						continue;
+					break;
+				}
+				if (pr == 0) {
+					if ((int64_t)monotonic_ms() >= deadline)
+						break;
+					continue;
+				}
+				if (safe_read(cfd, &ch, 1) <= 0)
 					break;
 				if (ch == '\n')
 					break;
-				if (ch != '\r')
+				if (ch != '\r') {
+					if (sb.len >= MCPC_MAX_LINE)
+						break;
 					sb_append_char(&sb, ch);
+				}
 			}
 			if (sb.data) {
 				resp = mcpc_daemon_handle(sb.data);
@@ -840,8 +1135,10 @@ static int mcpc_daemon_run(void)
 		if (g_sessions[i])
 			mcpc_sess_free(g_sessions[i]);
 	close(lfd);
-	unlink(sp);
-	unlink(pp);
+	mcpc_unlink_runtime(sp, pp);
+	close(lockfd);
+	free(sp);
+	free(pp);
 	return 0;
 }
 
@@ -878,6 +1175,7 @@ static int mcpc_daemon_alive(void)
 	FILE *f = fopen(pp, "r");
 	long pid = 0;
 	char buf[64];
+	int alive;
 
 	free(pp);
 	if (!f)
@@ -887,9 +1185,8 @@ static int mcpc_daemon_alive(void)
 	fclose(f);
 	if (pid <= 0)
 		return 0;
-	if (kill((pid_t)pid, 0) != 0 && errno == ESRCH)
-		return 0;
-	return 1;
+	alive = kill((pid_t)pid, 0) == 0 || errno == EPERM;
+	return alive;
 }
 
 static int mcpc_spawn_daemon(void)
@@ -899,8 +1196,20 @@ static int mcpc_spawn_daemon(void)
 	pid_t pid;
 	int i;
 
-	if (!mcpc_daemon_alive())
-		unlink(sp);
+	if (mcpc_daemon_alive()) {
+		int fd = mcpc_dial();
+		if (fd >= 0) {
+			close(fd);
+			free(sp);
+			return 0;
+		}
+		free(sp);
+		return -1;
+	}
+	if (unlink(sp) != 0 && errno != ENOENT) {
+		free(sp);
+		return -1;
+	}
 	pid = fork();
 	if (pid < 0) {
 		bb_perror_msg("fork");
@@ -921,12 +1230,14 @@ static int mcpc_spawn_daemon(void)
 			}
 		}
 		setsid();
+		mcpc_close_fds_from(3);
+		mcpc_restore_sigpipe();
 		/* argv[0] must be the applet name: busybox dispatches on it
 		 * (same convention as the busyagent tool executor) */
 		execl(bb, "mcpc", "daemon", "run", (char *)NULL);
 		_exit(127);
 	}
-	for (i = 0; i < 30; i++) {
+	for (i = 0; i < MCPC_DAEMON_START_MS / 100; i++) {
 		int fd = mcpc_dial();
 		if (fd >= 0) {
 			close(fd);
@@ -968,15 +1279,42 @@ static char *mcpc_rpc(const char *line)
 	{
 		StrBuf sb;
 		char ch;
+		int64_t deadline = (int64_t)monotonic_ms() + MCPC_CLIENT_TIMEOUT_MS;
+
 		sb_init(&sb);
 		for (;;) {
-			ssize_t n = safe_read(fd, &ch, 1);
+			struct pollfd pfd;
+			int pr;
+			ssize_t n;
+
+			pfd.fd = fd;
+			pfd.events = POLLIN;
+			pr = safe_poll(&pfd, 1, 250);
+			if (pr < 0) {
+				if (errno == EINTR)
+					continue;
+				break;
+			}
+			if (pr == 0) {
+				if ((int64_t)monotonic_ms() >= deadline)
+					break;
+				continue;
+			}
+			if (!(pfd.revents & (POLLIN | POLLHUP)))
+				break;
+			n = safe_read(fd, &ch, 1);
 			if (n <= 0)
 				break;
 			if (ch == '\n')
 				break;
-			if (ch != '\r')
+			if (ch != '\r') {
+				if (sb.len >= MCPC_MAX_LINE) {
+					sb_free(&sb);
+					close(fd);
+					return NULL;
+				}
 				sb_append_char(&sb, ch);
+			}
 		}
 		close(fd);
 		if (sb.data)
@@ -990,13 +1328,7 @@ static char *mcpc_rpc(const char *line)
 /* json-escape a string into sb */
 static void mcpc_esc(StrBuf *sb, const char *s)
 {
-	sb_append_char(sb, '"');
-	for (; *s; s++) {
-		if (*s == '"' || *s == '\\')
-			sb_append_char(sb, '\\');
-		sb_append_char(sb, *s);
-	}
-	sb_append_char(sb, '"');
+	sb_append_json_string(sb, s ? s : "");
 }
 
 /* ---- CLI commands ---- */
@@ -1104,11 +1436,23 @@ static int mcpc_cmd_session(const char *name, char **argv, int argc,
 		bb_error_msg_and_die("no session command (tools-list|tools-get|tools-call|ping)");
 
 	if (strcmp(cmd, "ping") == 0) {
-		char *resp = mcpc_rpc("{\"op\":\"ping\"}");
+		char *req = xasprintf("{\"op\":\"ping\",\"name\":\"%s\"}", name);
+		char *resp = mcpc_rpc(req);
+		JsonParse jp;
+
+		free(req);
 		if (!resp)
 			return 1;
-		printf("pong @%s\n", name);
+		jp = json_parse_root(resp);
+		if (jp.error || !json_get_bool(jp.val, "ok", 0)) {
+			char *err = jp.error ? NULL : json_get_string(jp.val, "error");
+			bb_error_msg("@%s: %s", name, err ? err : "ping failed");
+			free(err);
+			free(resp);
+			return 1;
+		}
 		free(resp);
+		printf("pong @%s\n", name);
 		return 0;
 	}
 
@@ -1340,6 +1684,8 @@ int mcpc_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int mcpc_main(int argc UNUSED_PARAM, char **argv)
 {
 	const char *a1;
+
+	mcpc_ignore_sigpipe();
 	int json_out = 0;
 	int i;
 
@@ -1373,7 +1719,23 @@ int mcpc_main(int argc UNUSED_PARAM, char **argv)
 			return mcpc_daemon_run();
 		if (argv[2] && strcmp(argv[2], "stop") == 0) {
 			char *resp = mcpc_rpc("{\"op\":\"stop\"}");
+			char *sp;
+			int waited;
+
+			if (!resp)
+				return 1;
 			free(resp);
+			/* report success only after the daemon really took the
+			 * socket down: closing sessions can take a moment */
+			sp = mcpc_sock_path();
+			for (waited = 0; waited < MCPC_DAEMON_START_MS; waited += 100) {
+				struct stat st;
+
+				if (stat(sp, &st) != 0)
+					break;
+				usleep(100 * 1000);
+			}
+			free(sp);
 			printf("daemon stopped\n");
 			return 0;
 		}
@@ -1436,7 +1798,8 @@ int mcpc_main(int argc UNUSED_PARAM, char **argv)
 	if (strcmp(a1, "close") == 0) {
 		StrBuf req;
 		char *resp;
-		if (!argv[2])
+		JsonParse cp;
+		if (!argv[2] || argv[3])
 			bb_error_msg_and_die("usage: mcpc close @NAME");
 		sb_init(&req);
 		sb_append(&req, "{\"op\":\"close\",\"name\":");
@@ -1446,6 +1809,14 @@ int mcpc_main(int argc UNUSED_PARAM, char **argv)
 		sb_free(&req);
 		if (!resp)
 			return 1;
+		cp = json_parse_root(resp);
+		if (cp.error || !json_get_bool(cp.val, "ok", 0)) {
+			char *err = json_get_string(cp.val, "error");
+			bb_error_msg("close failed: %s", err ? err : "daemon error");
+			free(err);
+			free(resp);
+			return 1;
+		}
 		printf("closed @%s\n", mcpc_bare(argv[2]));
 		free(resp);
 		return 0;

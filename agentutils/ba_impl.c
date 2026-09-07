@@ -28,12 +28,12 @@
  * bb_http - plain-HTTP transport for busyagent
  *
  * Replaces the libcurl backend of bash-agent's transport.c using only
- * busybox/libbb primitives: xhost2sockaddr for DNS, non-blocking connect
- * with poll() timeout, safe_read/safe_poll for the body pump, and a wget
- * style chunked decoder feeding the provider-agnostic SSE pump
- * (sse_stream_feed) in ba_transport.c.
+ * busybox/libbb primitives and the shared httpx-style client in
+ * agent_common.c (agc_http_request_stream) feeding the provider-agnostic
+ * SSE pump in ba_transport.c.
  *
- * Only http:// is supported in phase 1. TLS is a later phase.
+ * TLS is provided by the in-tree client (networking/tls.c); the
+ * no-verification trade-off is announced once per process.
  *
  * Copyright (C) 2026 by Lloyd Zhou <lloydzhou@qq.com>
  *
@@ -41,124 +41,158 @@
  */
 #define BA_MAX_RETRIES        2
 #define BA_RETRY_MAX_TIME_MS  20000
+
+/* forward declarations - the provider parsers live below (ba_transport) */
+static void parse_openai_sse_event(StreamCtx *sctx, const char *data, size_t data_len);
+static void parse_responses_sse_event(StreamCtx *sctx, const char *event,
+				      const char *data, size_t data_len);
+static void process_residual_json(const char *residual, const char *provider,
+				  sse_callback_fn callback, void *ctx);
+static void emit_simple_event(sse_callback_fn callback, void *ctx,
+			      SseEventType type, const char *content);
+
+/* pump context: provider dispatch rides on the shared SSE splitter
+ * (agent_common.c) while a bounded raw copy catches non-SSE JSON bodies */
+typedef struct {
+	StreamCtx *sctx;
+	AgcSse sse;
+	StrBuf raw;         /* whole body while no SSE field was recognized */
+} BaSsePump;
+
+/* one complete SSE event: dispatch each data line separately, matching
+ * the historical per-"data:"-line parse of the providers (each line is
+ * an independent JSON document for claude/openai) */
+static void ba_sse_dispatch_event(void *vctx, const char *event,
+				  const char *data, size_t data_len)
+{
+	BaSsePump *p = vctx;
+	StreamCtx *sctx = p->sctx;
+	const char *line = data;
+	size_t remain = data_len;
+
+	while (remain > 0) {
+		const char *nl = memchr(line, '\n', remain);
+		size_t llen = nl ? (size_t)(nl - line) : remain;
+
+		if (llen > 0) {
+			/* the provider parsers need NUL-terminated input */
+			char *copy = xstrndup(line, llen);
+
+			if (strcmp(sctx->provider, "openai") == 0)
+				parse_openai_sse_event(sctx, copy, llen);
+			else if (strcmp(sctx->provider, "responses") == 0)
+				parse_responses_sse_event(sctx, event, copy, llen);
+			else
+				sse_parse_event(sctx->provider, copy, llen,
+						sctx->callback, sctx->ctx);
+			free(copy);
+		}
+		if (!nl)
+			break;
+		line = nl + 1;
+		remain -= llen + 1;
+	}
+}
+
+/* agc_http_request_stream chunk callback: 0 continue, <0 abort */
+static int ba_sse_pump_chunk(void *vctx, const char *buf, size_t len)
+{
+	BaSsePump *p = vctx;
+
+	if (p->sctx->cancelled && *(p->sctx->cancelled))
+		return -1;
+	agc_sse_feed(&p->sse, buf, len, ba_sse_dispatch_event, p);
+	if (p->sse.error)
+		return -1;
+	/* not a text/event-stream body so far: keep a copy for the
+	 * non-SSE JSON fallback (bounded like agc_http_request) */
+	if (!p->sse.saw_sse && p->raw.len <= BA_MAX_BODY
+	 && len <= BA_MAX_BODY - p->raw.len)
+		sb_appendn(&p->raw, buf, len);
+	return 0;
+}
+
 /* Streaming POST with SSE pump. Mirrors the old curl semantics:
- * up to 2 retries, 1s delay, 20s total retry window, retry on 5xx. */
+ * up to 2 retries, 1s delay, 20s total retry window, retry on 5xx.
+ * HTTP connect/send/read all go through the shared agc_http core
+ * (agent_common.c) - the same client mcpc and oapi use. */
 int http_post_sse(const char *url, const char **headers, int header_count,
 		  const char *body, size_t body_len,
 		  const char *provider,
 		  sse_callback_fn callback, void *ctx,
 		  volatile int *cancelled)
 {
-	BaUrl u;
-	char buf[4096];
 	unsigned start_ms = monotonic_ms();
 	int attempt;
 
-	if (ba_parse_url(url, &u) != 0)
-		return -1;
-
-	/* https:// works out of the box; the authentication trade-off of the
-	 * in-tree TLS client (see ba_tls_notice) is announced on stderr once.
-	 * This also covers the ENABLE_TLS=0 build, where an https URL would
-	 * otherwise fall through to a plaintext connect. */
-	if (u.is_https)
-		ba_tls_notice();
-
 	for (attempt = 0; attempt <= BA_MAX_RETRIES; attempt++) {
 		StreamCtx sctx;
-		BaResp r;
-		int fd = -1;
-		tls_state_t *tls = NULL;
-		int io_err = 0, http_code = 0;
-
-#if ENABLE_TLS
-		if (u.is_https) {
-			tls = ba_tls_connect(u.host, u.port);
-			if (!tls) {
-				io_err = 1;
-				goto attempt_done;
-			}
-			fd = tls->ifd;
-		} else
-#endif
-		{
-			fd = ba_connect(u.host, u.port);
-			if (fd < 0) {
-				io_err = 1;
-				goto attempt_done;
-			}
-		}
-		memset(&r, 0, sizeof(r));
-		r.fd = fd;
-		r.tls = tls;
-		r.cancelled = cancelled;
-		(void)tls;
-		if (ba_send_request(tls, fd, "POST", &u, headers, header_count, body, body_len) != 0) {
-			io_err = 1;   /* request never left: no point reading a reply */
-			close(fd);
-			ba_tls_dispose(tls);
-			tls = NULL;
-			goto attempt_done;
-		}
-		if (ba_read_header(&r) != 0) {
-			io_err = 1;
-			close(fd);
-			ba_tls_dispose(tls);
-			tls = NULL;
-			goto attempt_done;
-		}
-		http_code = r.status;
+		BaSsePump pump;
+		AgcHttpReq req;
+		AgcHttpResp resp;
+		int rc, io_err, http_code;
 
 		sse_stream_init(&sctx, provider, callback, ctx, cancelled);
-		for (;;) {
-			int n = ba_body_read(&r, buf, sizeof(buf));
-			if (n < 0) {
-				io_err = 1;
-				break;
+		memset(&pump, 0, sizeof(pump));
+		pump.sctx = &sctx;
+		sb_init(&pump.raw);
+		agc_sse_init(&pump.sse);
+
+		memset(&req, 0, sizeof(req));
+		req.method = "POST";
+		req.url = url;
+		req.headers = headers;
+		req.header_count = header_count;
+		req.body = body ? body : "";
+		req.body_len = body_len;
+		req.cancelled = cancelled;
+		req.timeout_ms = BA_READ_TIMEOUT_MS;
+
+		rc = agc_http_request_stream(&req, ba_sse_pump_chunk, &pump, &resp);
+		io_err = (rc != AGC_HTTP_COMPLETE && rc != AGC_HTTP_STOPPED);
+		http_code = resp.status;
+		agc_http_resp_free(&resp);
+
+		if (cancelled && *cancelled) {
+			sse_stream_free(&sctx);
+			agc_sse_free(&pump.sse);
+			sb_free(&pump.raw);
+			{
+				SseEvent st;
+				memset(&st, 0, sizeof(st));
+				st.type = SSE_STOP;
+				st.content = (char *)"interrupted";
+				callback(ctx, &st);
 			}
-			if (n == 0)
-				break;
-			if (sse_stream_feed(&sctx, buf, n) == 0) {
-				/* cancelled */
-				sse_stream_free(&sctx);
-				close(fd);
-				ba_tls_dispose(tls);
-				{
-					SseEvent st;
-					memset(&st, 0, sizeof(st));
-					st.type = SSE_STOP;
-					st.content = (char *)"interrupted";
-					callback(ctx, &st);
-				}
-				return 0;
-			}
+			return 0;
 		}
-		close(fd);
-		ba_tls_dispose(tls);
-		tls = NULL;
 
 		if (!io_err && http_code < 500) {
-			/* non-SSE JSON error bodies etc. */
-			sse_stream_finish(&sctx, provider, callback, ctx);
+			/* stream tail: a last unterminated event, the
+			 * responses termination check and - when nothing
+			 * looked like SSE at all - the plain JSON body */
+			agc_sse_finish(&pump.sse, ba_sse_dispatch_event, &pump);
+			if (!pump.sse.saw_sse)
+				process_residual_json(pump.raw.data ? pump.raw.data : "",
+						      provider, callback, ctx);
+			else if (strcmp(provider, "responses") == 0
+			 && !sctx.responses_terminal) {
+				emit_simple_event(callback, ctx, SSE_ERROR,
+					"Stream interrupted (no response.completed received)");
+				emit_simple_event(callback, ctx, SSE_STOP, "error");
+			}
 			sse_stream_free(&sctx);
+			agc_sse_free(&pump.sse);
+			sb_free(&pump.raw);
 			if (http_code >= 400)
 				return http_code;
 			return 0;
 		}
-		sse_stream_free(&sctx);
 		/* 5xx or io error: fall through to retry logic */
+		sse_stream_free(&sctx);
+		agc_sse_free(&pump.sse);
+		sb_free(&pump.raw);
 
-	attempt_done:
-		ba_tls_dispose(tls);
-		tls = NULL;
-		if (cancelled && *cancelled) {
-			SseEvent st;
-			memset(&st, 0, sizeof(st));
-			st.type = SSE_STOP;
-			st.content = (char *)"interrupted";
-			callback(ctx, &st);
-			return 0;
-		}
 		if (attempt >= BA_MAX_RETRIES)
 			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
 		(void)0;
@@ -1357,8 +1391,6 @@ char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
 static void emit_simple_event(sse_callback_fn callback, void *ctx,
                               SseEventType type, const char *content);
 static void fill_openai_usage_event(SseEvent *evt, JsonVal usage);
-static void process_residual_json(StreamCtx *sctx, const char *provider,
-                              sse_callback_fn callback, void *ctx);
 
 static void streamctx_free_openai_tools(StreamCtx *sctx) {
     for (int i = 0; i < sctx->responses_item_count; i++) FREE_PTR(sctx->responses_item_ids[i]);
@@ -1627,45 +1659,6 @@ static void parse_responses_sse_event(StreamCtx *sctx, const char *event, const 
     }
 }
 
-/* Feed one decoded chunk of body; splits SSE events internally.
- * Called by the http pump; returns 0 when cancelled. */
-int sse_stream_feed(StreamCtx *sctx, const char *ptr, size_t total) {
-    if (sctx->cancelled && *(sctx->cancelled)) return 0;
-
-    for (size_t i = 0; i < total; i++) {
-        if (sctx->cancelled && *(sctx->cancelled)) return 0;
-        if (ptr[i] == '\n') {
-            char *line = sctx->line_buf.data;
-            size_t llen;
-            if (!line) {   /* empty line before any data (SSE allows it) */
-                continue;
-            }
-            llen = strlen(line);
-            if (llen > 0 && line[llen-1] == '\r') line[--llen] = '\0';
-
-            if (strncmp(line, "event: ", 7) == 0 && strcmp(sctx->provider, "responses") == 0) {
-                FREE_PTR(sctx->event);
-                sctx->event = util_strdup(line + 7);
-            } else if (strncmp(line, "data: ", 6) == 0) {
-                const char *data = line + 6;
-                if (strcmp(sctx->provider, "openai") == 0) parse_openai_sse_event(sctx, data, strlen(data));
-                else if (strcmp(sctx->provider, "responses") == 0) parse_responses_sse_event(sctx, sctx->event ? sctx->event : "", data, strlen(data));
-                else sse_parse_event(sctx->provider, data, strlen(data), sctx->callback, sctx->ctx);
-            } else if (strncmp(line, "data:", 5) == 0) {
-                const char *data = line + 5;
-                while (*data == ' ') data++;
-                if (strcmp(sctx->provider, "openai") == 0) parse_openai_sse_event(sctx, data, strlen(data));
-                else if (strcmp(sctx->provider, "responses") == 0) parse_responses_sse_event(sctx, sctx->event ? sctx->event : "", data, strlen(data));
-                else sse_parse_event(sctx->provider, data, strlen(data), sctx->callback, sctx->ctx);
-            }
-            sb_truncate(&sctx->line_buf, 0);
-        } else {
-            sb_append_char(&sctx->line_buf, ptr[i]);
-        }
-    }
-    return 1;
-}
-
 /* init/free StreamCtx (extracted from the old inline init) */
 void sse_stream_init(StreamCtx *sctx, const char *provider,
                      sse_callback_fn callback, void *ctx,
@@ -1673,27 +1666,16 @@ void sse_stream_init(StreamCtx *sctx, const char *provider,
     memset(sctx, 0, sizeof(*sctx));
     sctx->callback = callback;
     sctx->ctx = ctx;
-    sb_init(&sctx->line_buf);
     sctx->cancelled = cancelled;
     sctx->provider = (char *)provider;
 }
 
-
-/* After the stream: handle leftover non-SSE JSON, check responses termination.
- * Mirrors the success tail of the old curl-based http_post_sse. */
-void sse_stream_finish(StreamCtx *sctx, const char *provider,
-                       sse_callback_fn callback, void *ctx) {
-    process_residual_json(sctx, provider, callback, ctx);
-    if (strcmp(provider, "responses") == 0 && !sctx->responses_terminal) {
-        emit_simple_event(callback, ctx, SSE_ERROR, "Stream interrupted (no response.completed received)");
-        emit_simple_event(callback, ctx, SSE_STOP, "error");
-    }
-}
-
 void sse_stream_free(StreamCtx *sctx) {
-    sb_free(&sctx->line_buf);
-    FREE_PTR(sctx->event);
     streamctx_free_openai_tools(sctx);
+    sctx->callback = NULL;
+    sctx->ctx = NULL;
+    sctx->provider = NULL;
+    sctx->cancelled = NULL;
 }
 
 /* ============================================================
@@ -1723,11 +1705,10 @@ static void fill_openai_usage_event(SseEvent *evt, JsonVal usage) {
     }
 }
 
-/* handle non-SSE responses: parse leftover JSON in line_buf as a full reply */
-static void process_residual_json(StreamCtx *sctx, const char *provider,
+/* handle non-SSE responses: parse the whole JSON body as a full reply */
+static void process_residual_json(const char *residual, const char *provider,
                                   sse_callback_fn callback, void *ctx) {
-    if (!sctx->line_buf.data || sctx->line_buf.len == 0) return;
-    char *residual = sctx->line_buf.data;
+    if (!residual || !residual[0]) return;
     while (*residual == ' ' || *residual == '\t' || *residual == '\r' || *residual == '\n') residual++;
     if (*residual != '{') return;
 
@@ -1736,6 +1717,12 @@ static void process_residual_json(StreamCtx *sctx, const char *provider,
     if (jp.error) return;
 
     char *err_msg = json_get_string(jp.val, "error");
+    if (!err_msg) {
+        /* provider error objects: {"error":{"message":...}} (claude) */
+        JsonVal ev = json_get(jp.val, "error");
+        if (ev.type == JSON_OBJECT)
+            err_msg = json_get_string(ev, "message");
+    }
     if (err_msg) {
         emit_simple_event(callback, ctx, SSE_ERROR, err_msg);
         free(err_msg);

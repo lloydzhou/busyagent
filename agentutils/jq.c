@@ -102,6 +102,7 @@ int jq_main(int argc UNUSED_PARAM, char **argv)
 			printed = 1;
 		}
 	}
+	free(m.v);
 	free(data);
 	return (opts & 2 && !printed) ? 1 : 0;
 }

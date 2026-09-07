@@ -85,14 +85,92 @@ static char *oapi_home(void)
 	return xstrdup("/tmp/busyagent/oapi/apis");
 }
 
+static int oapi_valid_name(const char *name)
+{
+	const unsigned char *p;
+
+	if (!name || !name[0] || strlen(name) > 64)
+		return 0;
+	if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+		return 0;
+	p = (const unsigned char *)name;
+	for (; *p; p++)
+		if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')
+		 || (*p >= '0' && *p <= '9') || *p == '_' || *p == '-'))
+			return 0;
+	return 1;
+}
+
+/* HTTP method and request-target validation is deliberately strict: values
+ * eventually become part of the request line, not JSON data. */
+static int oapi_method_valid(const char *method)
+{
+	const unsigned char *p = (const unsigned char *)method;
+
+	if (!method || !method[0])
+		return 0;
+	for (; *p; p++) {
+		if (*p <= 0x20 || *p == 0x7f)
+			return 0;
+		if (strchr("()<>@,;:\\\"/[]?={}", *p))
+			return 0;
+	}
+	return 1;
+}
+
+static int oapi_path_valid(const char *path)
+{
+	const unsigned char *p = (const unsigned char *)path;
+
+	if (!path || path[0] != '/')
+		return 0;
+	for (; *p; p++)
+		if (*p < 0x20 || *p == 0x7f)
+			return 0;
+	return 1;
+}
+
+static int oapi_timeout_valid(const char *s)
+{
+	const unsigned char *p = (const unsigned char *)s;
+	unsigned long n = 0;
+
+	if (!s || !s[0])
+		return 0;
+	for (; *p; p++) {
+		if (*p < '0' || *p > '9' || n > 2147483647UL / 10)
+			return 0;
+		n = n * 10 + (*p - '0');
+		if (n > 2147483647UL)
+			return 0;
+	}
+	return 1;
+}
+
+static int oapi_timeout_parse(const char *s)
+{
+	unsigned long n = 0;
+	const unsigned char *p = (const unsigned char *)s;
+
+	for (; *p; p++)
+		n = n * 10 + (*p - '0');
+	return n > 2147483647UL ? 0 : (int)n;
+}
+
+static int oapi_option_token(const char *s)
+{
+	return s && (strncmp(s, "--", 2) == 0
+		|| strcmp(s, "-F") == 0 || strcmp(s, "-o") == 0);
+}
+
 static char *oapi_reg_path(const char *name)
 {
-	char *dir = oapi_home();
+	char *dir;
 	char *p;
 
-	if (!name[0] || strchr(name, '/') || strcmp(name, ".") == 0
-	 || strcmp(name, "..") == 0)
+	if (!oapi_valid_name(name))
 		return NULL;
+	dir = oapi_home();
 	p = xasprintf("%s/%s.json", dir, name);
 	free(dir);
 	return p;
@@ -152,13 +230,18 @@ static void oapi_free(OapiRegistry *r)
 
 static int oapi_save(const char *name, const char *source, const char *spec_json)
 {
-	char *dir = oapi_home();
+	char *dir;
 	char *tmp;
 	FILE *f;
 	int rc;
 
+	if (!oapi_valid_name(name)) {
+		bb_error_msg("bad API name '%s'", name ? name : "?");
+		return -1;
+	}
+	dir = oapi_home();
 	bb_make_directory(dir, 0755, FILEUTILS_RECUR);
-	tmp = xasprintf("%s/%s.json.tmp", dir, name);
+	tmp = xasprintf("%s/.%s.json.tmp", dir, name);
 	f = xfopen(tmp, "w");
 	fprintf(f, "{\"source\":");
 	{
@@ -174,13 +257,15 @@ static int oapi_save(const char *name, const char *source, const char *spec_json
 	fclose(f);
 	rc = 0;
 	{
-		char *dst = xasprintf("%s/%s.json", dir, name);
-		if (rename(tmp, dst) != 0) {
-			bb_perror_msg("rename %s", dst);
+		char *dst = oapi_reg_path(name);
+		if (!dst || rename(tmp, dst) != 0) {
+			bb_perror_msg("rename %s", dst ? dst : name);
 			rc = -1;
 		}
 		free(dst);
 	}
+	if (rc != 0)
+		unlink(tmp);
 	free(tmp);
 	free(dir);
 	return rc;
@@ -291,7 +376,9 @@ typedef struct {
 	char *method;        /* GET/POST/... */
 	char *path;          /* URL template */
 	char *summary;
-	JsonVal params;      /* array view (may be JSON_NULL) */
+	JsonVal *params;     /* merged path + operation parameters */
+	int n_params;
+	int cap_params;
 	int has_body;
 } OapiOp;
 
@@ -307,8 +394,57 @@ static const char *const http_methods[] = {
 	"get", "put", "post", "delete", "options", "head", "patch", "trace",
 };
 
-static void oapi_ops_add(OapiOps *ops, const char *method, const char *path,
-			 JsonVal op)
+static int oapi_param_same(JsonVal a, JsonVal b)
+{
+	char *an = json_get_string(a, "name");
+	char *ai = json_get_string(a, "in");
+	char *bn = json_get_string(b, "name");
+	char *bi = json_get_string(b, "in");
+	int same = an && ai && bn && bi && strcmp(an, bn) == 0 && strcmp(ai, bi) == 0;
+
+	free(an); free(ai); free(bn); free(bi);
+	return same;
+}
+
+static void oapi_param_add(OapiOp *o, JsonVal spec, JsonVal p)
+{
+	int i;
+
+	p = oapi_param_ref(spec, p);
+	if (p.type != JSON_OBJECT)
+		return;
+	for (i = 0; i < o->n_params; i++) {
+		if (oapi_param_same(o->params[i], p)) {
+			o->params[i] = p;
+			return;
+		}
+	}
+	if (o->n_params == o->cap_params) {
+		o->cap_params = o->cap_params ? o->cap_params * 2 : 8;
+		o->params = xrealloc(o->params,
+				o->cap_params * sizeof(o->params[0]));
+	}
+	o->params[o->n_params++] = p;
+}
+
+static void oapi_params_merge(OapiOp *o, JsonVal spec, JsonVal pathobj,
+				JsonVal op)
+{
+	JsonVal a;
+	int i;
+
+	a = json_get(pathobj, "parameters");
+	if (a.type == JSON_ARRAY)
+		for (i = 0; i < json_array_len(a); i++)
+			oapi_param_add(o, spec, json_array_get(a, i));
+	a = json_get(op, "parameters");
+	if (a.type == JSON_ARRAY)
+		for (i = 0; i < json_array_len(a); i++)
+			oapi_param_add(o, spec, json_array_get(a, i));
+}
+
+static void oapi_ops_add(OapiOps *ops, JsonVal spec, JsonVal pathobj,
+			 const char *method, const char *path, JsonVal op)
 {
 	char *id = json_get_string(op, "operationId");
 	OapiOp *o;
@@ -335,7 +471,7 @@ static void oapi_ops_add(OapiOps *ops, const char *method, const char *path,
 	}
 	o->path = xstrdup(path);
 	o->summary = json_get_string(op, "summary");
-	o->params = json_get(op, "parameters");
+	oapi_params_merge(o, spec, pathobj, op);
 	o->has_body = (json_get(op, "requestBody").type == JSON_OBJECT);
 }
 
@@ -357,7 +493,7 @@ static void oapi_ops_build(OapiOps *ops, JsonVal spec)
 		for (mi = 0; mi < (int)(sizeof(http_methods)/sizeof(http_methods[0])); mi++) {
 			JsonVal op = json_get(pathobj, http_methods[mi]);
 			if (op.type == JSON_OBJECT)
-				oapi_ops_add(ops, http_methods[mi], it.key, op);
+				oapi_ops_add(ops, spec, pathobj, http_methods[mi], it.key, op);
 		}
 	}
 	json_obj_iter_cleanup(&it);
@@ -373,6 +509,7 @@ static void oapi_ops_free(OapiOps *ops)
 		free(ops->v[i].method);
 		free(ops->v[i].path);
 		free(ops->v[i].summary);
+		free(ops->v[i].params);
 	}
 	free(ops->v);
 }
@@ -393,7 +530,8 @@ static OapiOp *oapi_ops_find(OapiOps *ops, const char *cmd)
  * request building
  * ============================================================ */
 
-/* percent-encode anything outside unreserved/slash for path segments */
+/* Percent-encode a single path/query component.  A path parameter is
+ * one resource segment: '/' must never escape it. */
 static void oapi_encode(StrBuf *sb, const char *s)
 {
 	static const char hex[] = "0123456789ABCDEF";
@@ -402,7 +540,7 @@ static void oapi_encode(StrBuf *sb, const char *s)
 		unsigned char c = (unsigned char)*s;
 		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 		 || (c >= '0' && c <= '9') || c == '-' || c == '_'
-		 || c == '.' || c == '~' || c == '/')
+		 || c == '.' || c == '~')
 			sb_append_char(sb, (char)c);
 		else {
 			sb_append_char(sb, '%');
@@ -474,6 +612,7 @@ static int oapi_jq_print(JsonVal v, const char *path)
 			       el.src + el.start);
 		}
 	}
+	free(m.v);
 	return m.n ? 0 : 1;
 }
 
@@ -519,22 +658,7 @@ static void oapi_append_typed(StrBuf *sb, const char *val)
 		sb_append(sb, val);   /* valid json literal/array/object */
 		return;
 	}
-	/* plain strings need quoting */
-	sb_append_char(sb, '"');
-	{
-		const char *p;
-		for (p = val; *p; p++) {
-			switch (*p) {
-			case '"': sb_append(sb, "\\\""); break;
-			case '\\': sb_append(sb, "\\\\"); break;
-			case '\n': sb_append(sb, "\\n"); break;
-			case '\r': sb_append(sb, "\\r"); break;
-			case '\t': sb_append(sb, "\\t"); break;
-			default: sb_append_char(sb, *p);
-			}
-		}
-	}
-	sb_append_char(sb, '"');
+	sb_append_json_string(sb, val);
 }
 
 /* ============================================================
@@ -544,9 +668,15 @@ static void oapi_append_typed(StrBuf *sb, const char *val)
 static char *oapi_fetch_spec(const char *source)
 {
 	if (strncmp(source, "http://", 7) == 0 || strncmp(source, "https://", 8) == 0) {
+		AgcHttpReq req;
 		AgcHttpResp resp;
 		const char *accept = "Accept: application/json";
-		int rc = agc_http_request("GET", source, &accept, 1, "", 0, &resp);
+		memset(&req, 0, sizeof(req));
+		req.method = "GET";
+		req.url = source;
+		req.headers = &accept;
+		req.header_count = 1;
+		int rc = agc_http_request(&req, &resp);
 		if (rc != 0) {
 			bb_error_msg("fetch %s: transport error", source);
 			return NULL;
@@ -568,9 +698,14 @@ static char *oapi_fetch_spec(const char *source)
 
 static int oapi_cmd_connect(const char *name, const char *source)
 {
-	char *spec = oapi_fetch_spec(source);
+	char *spec;
 	JsonParse jp;
 
+	if (!oapi_valid_name(name)) {
+		bb_error_msg("bad name '%s'", name);
+		return 1;
+	}
+	spec = oapi_fetch_spec(source);
 	if (!spec)
 		return 1;
 	jp = json_parse_root(spec);
@@ -673,22 +808,22 @@ static int oapi_cmd_schema(OapiRegistry *r, const char *opname)
 		printf("%s %s  (%s)\n", o->method, o->path, o->op_id);
 		if (o->summary && o->summary[0])
 			printf("  %s\n", o->summary);
-		if (o->params.type == JSON_ARRAY) {
-			for (pi = 0; pi < json_array_len(o->params); pi++) {
-				JsonVal p = oapi_param_ref(r->spec, json_array_get(o->params, pi));
-				char *nm = json_get_string(p, "name");
-				char *in = json_get_string(p, "in");
-				int req = json_get_bool(p, "required", 0);
-				char *typ = NULL;
-				JsonVal schema = json_get(p, "schema");
-				if (schema.type == JSON_OBJECT)
-					typ = json_get_string(schema, "type");
-				printf("  --%s  in:%s%s%s%s\n",
-				       nm ? oapi_kebab(nm) : "?", in ? in : "?",
-				       typ ? " type:" : "", typ ? typ : "",
-				       req ? "  (required)" : "");
-				free(nm); free(in); free(typ);
-			}
+		for (pi = 0; pi < o->n_params; pi++) {
+			JsonVal p = o->params[pi];
+			char *nm = json_get_string(p, "name");
+			char *in = json_get_string(p, "in");
+			int req = json_get_bool(p, "required", 0);
+			char *typ = NULL;
+			JsonVal schema = json_get(p, "schema");
+			if (schema.type == JSON_OBJECT)
+				typ = json_get_string(schema, "type");
+			if (!typ)
+				typ = json_get_string(p, "type");
+			printf("  --%s  in:%s%s%s%s\n",
+			       nm ? oapi_kebab(nm) : "?", in ? in : "?",
+			       typ ? " type:" : "", typ ? typ : "",
+			       req ? "  (required)" : "");
+			free(nm); free(in); free(typ);
 		}
 		if (o->has_body)
 			printf("  body: --body JSON | -F key=value\n");
@@ -714,12 +849,37 @@ typedef struct {
 	const char *jq;
 	int text_out;
 	int dry_run;
+	int timeout_ms;
 } OapiOpts;
 
-static void oapi_header_add(OapiOpts *o, const char *h)
+static int oapi_header_valid(const char *h)
 {
-	if (o->n_headers < OAPI_MAX_HEADERS)
-		o->headers[o->n_headers++] = h;
+	const unsigned char *p;
+	const char *colon;
+
+	if (!h || !h[0])
+		return 0;
+	colon = strchr(h, ':');
+	if (!colon || colon == h)
+		return 0;
+	for (p = (const unsigned char *)h; *p; p++) {
+		if (*p < 0x20 || *p == 0x7f)
+			return 0;
+		if (p < (const unsigned char *)colon
+		 && (*p == ' ' || *p == '\t'))
+			return 0;
+	}
+	return 1;
+}
+
+static int oapi_header_add(OapiOpts *o, const char *h)
+{
+	if (!oapi_header_valid(h))
+		return -1;
+	if (o->n_headers >= OAPI_MAX_HEADERS)
+		return -1;
+	o->headers[o->n_headers++] = h;
+	return 0;
 }
 
 static int oapi_cmd_call(OapiRegistry *r, const char *opname,
@@ -727,8 +887,6 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 {
 	OapiOps ops;
 	OapiOp *op;
-	JsonVal params[64];
-	int n_params = 0;
 	char *flags[64];
 	char *flag_vals[64];
 	int n_flags = 0;
@@ -738,7 +896,7 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 	StrBuf url;
 	StrBuf query;
 	StrBuf body;
-	char *base;
+	char *base = NULL;
 	int rc = 1;
 	int need_pos = 0;
 
@@ -755,73 +913,113 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 		char *a = argv[i];
 		if (a[0] == '-' && a[1] == '-' && a[2]) {
 			if (strcmp(a, "--dry-run") == 0) { opts->dry_run = 1; continue; }
-			if (strcmp(a, "--body") == 0 && argv[i+1]) { opts->body = argv[++i]; continue; }
-			if (strcmp(a, "--jq") == 0 && argv[i+1]) { opts->jq = argv[++i]; continue; }
-			if (strcmp(a, "--header") == 0 && argv[i+1]) { oapi_header_add(opts, argv[++i]); continue; }
-			if (strcmp(a, "--timeout") == 0 && argv[i+1]) { i++; continue; }
+			if (strcmp(a, "--body") == 0) {
+				if (!argv[i + 1])
+					bb_error_msg_and_die("missing value for --body");
+				opts->body = argv[++i];
+				continue;
+			}
+			if (strncmp(a, "--body=", 7) == 0) {
+				opts->body = a + 7;
+				continue;
+			}
+			if (strcmp(a, "--jq") == 0) {
+				if (!argv[i + 1])
+					bb_error_msg_and_die("missing value for --jq");
+				opts->jq = argv[++i];
+				continue;
+			}
+			if (strncmp(a, "--jq=", 5) == 0) {
+				opts->jq = a + 5;
+				continue;
+			}
+			if (strcmp(a, "--header") == 0) {
+				if (!argv[i + 1])
+					bb_error_msg_and_die("missing value for --header");
+				if (oapi_header_add(opts, argv[++i]) != 0)
+					bb_error_msg_and_die("invalid or too many headers");
+				continue;
+			}
+			if (strcmp(a, "--timeout") == 0) {
+				if (!argv[i + 1] || !oapi_timeout_valid(argv[i + 1]))
+					bb_error_msg_and_die("invalid value for --timeout");
+				opts->timeout_ms = oapi_timeout_parse(argv[++i]);
+				continue;
+			}
+			if (strncmp(a, "--timeout=", 10) == 0) {
+				if (!oapi_timeout_valid(a + 10))
+					bb_error_msg_and_die("invalid value for --timeout");
+				opts->timeout_ms = oapi_timeout_parse(a + 10);
+				continue;
+			}
 			if (strcmp(a, "--insecure") == 0) { continue; }
 			if (strcmp(a, "--text") == 0) { opts->text_out = 1; continue; }
-			if (strncmp(a, "--header=", 9) == 0) { oapi_header_add(opts, a + 9); continue; }
-			if (strncmp(a, "--jq=", 5) == 0) { opts->jq = a + 5; continue; }
+			if (strncmp(a, "--header=", 9) == 0) {
+				if (oapi_header_add(opts, a + 9) != 0)
+					bb_error_msg_and_die("invalid or too many headers");
+				continue;
+			}
 			/* operation flag: --name or --name=value */
 			{
 				char *eq = strchr(a + 2, '=');
-				if (n_flags < 64) {
-					if (eq) {
-						flags[n_flags] = xstrndup(a + 2, eq - a - 2);
-						flag_vals[n_flags] = xstrdup(eq + 1);
-					} else {
-						flags[n_flags] = xstrdup(a + 2);
-						flag_vals[n_flags] = NULL;
-					}
-					n_flags++;
-					/* consume the next argv as value unless it looks
-					 * like another flag; boolean flags (no value)
-					 * match spec type=boolean */
-					if (!eq && argv[i+1] && !(argv[i+1][0] == '-' && argv[i+1][1]))
-						flag_vals[n_flags-1] = xstrdup(argv[++i]);
+				if (n_flags >= 64)
+					bb_error_msg_and_die("too many operation flags");
+				if (eq) {
+					flags[n_flags] = xstrndup(a + 2, eq - a - 2);
+					flag_vals[n_flags] = xstrdup(eq + 1);
+				} else {
+					flags[n_flags] = xstrdup(a + 2);
+					flag_vals[n_flags] = NULL;
 				}
+				n_flags++;
+				/* consume the next argv as value unless it is another option;
+				 * a missing value is left for schema validation below. */
+				if (!eq && argv[i+1] && !oapi_option_token(argv[i+1]))
+					flag_vals[n_flags-1] = xstrdup(argv[++i]);
 				continue;
 			}
 		}
 		if (a[0] == '-' && a[1] == 'F' && a[2]) {
 			char *eq = strchr(a + 2, '=');
-			if (eq && opts->n_f < 32) {
-				opts->f_keys[opts->n_f] = xstrndup(a + 2, eq - a - 2);
-				opts->f_vals[opts->n_f] = xstrdup(eq + 1);
-				opts->n_f++;
-			}
+			if (!eq || eq == a + 2)
+				bb_error_msg_and_die("bad -F argument '%s' (want K=V)", a);
+			if (opts->n_f >= 32)
+				bb_error_msg_and_die("too many -F fields");
+			opts->f_keys[opts->n_f] = xstrndup(a + 2, eq - a - 2);
+			opts->f_vals[opts->n_f] = xstrdup(eq + 1);
+			opts->n_f++;
 			continue;
 		}
-		if (strcmp(a, "-F") == 0 && argv[i+1]) {
-			char *nxt = argv[++i];
+		if (strcmp(a, "-F") == 0) {
+			char *nxt;
+			if (!argv[i + 1])
+				bb_error_msg_and_die("missing value for -F");
+			nxt = argv[++i];
 			char *eq = strchr(nxt, '=');
-			if (eq && opts->n_f < 32) {
-				opts->f_keys[opts->n_f] = xstrndup(nxt, eq - nxt);
-				opts->f_vals[opts->n_f] = xstrdup(eq + 1);
-				opts->n_f++;
-			}
+			if (!eq || eq == nxt)
+				bb_error_msg_and_die("bad -F argument '%s' (want K=V)", nxt);
+			if (opts->n_f >= 32)
+				bb_error_msg_and_die("too many -F fields");
+			opts->f_keys[opts->n_f] = xstrndup(nxt, eq - nxt);
+			opts->f_vals[opts->n_f] = xstrdup(eq + 1);
+			opts->n_f++;
 			continue;
 		}
-		if (strcmp(a, "-o") == 0 && argv[i+1]) {
+		if (strcmp(a, "-o") == 0) {
+			if (!argv[i + 1])
+				bb_error_msg_and_die("missing value for -o");
 			opts->text_out = (strcmp(argv[++i], "text") == 0);
 			continue;
 		}
-		if (n_pos < 16)
-			positional[n_pos++] = a;
+		if (n_pos >= 16)
+			bb_error_msg_and_die("too many positional arguments");
+		positional[n_pos++] = a;
 	}
 
-	/* flatten parameters (path-level + operation-level, refs folded) */
-	if (op->params.type == JSON_ARRAY) {
-		for (i = 0; i < json_array_len(op->params) && n_params < 64; i++) {
-			JsonVal p = oapi_param_ref(r->spec, json_array_get(op->params, i));
-			if (p.type == JSON_OBJECT)
-				params[n_params++] = p;
-		}
-	}
+	/* Parameters are merged while the operation table is built. */
 	need_pos = 0;
-	for (i = 0; i < n_params; i++) {
-		char *in = json_get_string(params[i], "in");
+	for (i = 0; i < op->n_params; i++) {
+		char *in = json_get_string(op->params[i], "in");
 		int is_path = (in && strcmp(in, "path") == 0);
 		free(in);
 		if (is_path)
@@ -829,6 +1027,11 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 	}
 	if (n_pos < need_pos) {
 		bb_error_msg("%s needs %d positional path parameter(s), got %d",
+			     opname, need_pos, n_pos);
+		goto out_free;
+	}
+	if (n_pos > need_pos) {
+		bb_error_msg("%s accepts %d positional path parameter(s), got %d",
 			     opname, need_pos, n_pos);
 		goto out_free;
 	}
@@ -852,14 +1055,15 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 		const char *p = op->path;
 		while (*p) {
 			if (*p == '{') {
-				const char *e = strchr(p, '}');
+				const char *e = strchr(p + 1, '}');
 				char name[128];
 				size_t nl;
-				if (!e)
-					break;
-				nl = e - p - 1;
-				if (nl >= sizeof(name))
-					nl = sizeof(name) - 1;
+				if (!e || e == p + 1 || e - p - 1 >= sizeof(name)) {
+					bb_error_msg("invalid path template '%s'", op->path);
+					sb_free(&url);
+					goto out_free;
+				}
+				nl = (size_t)(e - p - 1);
 				memcpy(name, p + 1, nl);
 				name[nl] = '\0';
 				/* path params are positional, in template order */
@@ -873,9 +1077,19 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 				}
 				p = e + 1;
 			} else {
+				if ((unsigned char)*p < 0x20 || *p == 0x7f) {
+					bb_error_msg("invalid control character in path");
+					sb_free(&url);
+					goto out_free;
+				}
 				sb_append_char(&url, *p);
 				p++;
 			}
+		}
+		if (pi != need_pos) {
+			bb_error_msg("path template and parameters disagree for %s", opname);
+			sb_free(&url);
+			goto out_free;
 		}
 	}
 
@@ -884,9 +1098,9 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 	for (i = 0; i < n_flags; i++) {
 		int j;
 		int matched = 0;
-		for (j = 0; j < n_params; j++) {
-			char *nm = json_get_string(params[j], "name");
-			char *in = json_get_string(params[j], "in");
+		for (j = 0; j < op->n_params; j++) {
+			char *nm = json_get_string(op->params[j], "name");
+			char *in = json_get_string(op->params[j], "in");
 			char *kb;
 			int hit;
 			if (!nm) { free(in); continue; }
@@ -894,10 +1108,22 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 			hit = (strcmp(kb, flags[i]) == 0 || strcmp(nm, flags[i]) == 0);
 			free(kb);
 			if (!hit) { free(nm); free(in); continue; }
+			if (in && strcmp(in, "path") == 0) {
+				free(nm); free(in);
+				continue;
+			}
 			if (in && strcmp(in, "header") == 0) {
 				char *h = xasprintf("%s: %s", nm,
 						    flag_vals[i] ? flag_vals[i] : "");
-				oapi_header_add(opts, h);   /* leaks until exit: fine for a CLI */
+				if (oapi_header_add(opts, h) != 0) {
+					free(h);
+					bb_error_msg("invalid or too many headers");
+					free(nm);
+					free(in);
+					sb_free(&url);
+					sb_free(&query);
+					goto out_free;
+				}
 				matched = 1;
 			} else {
 				/* query (default) */
@@ -905,7 +1131,7 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 					sb_append_char(&query, '&');
 				oapi_encode(&query, nm);
 				sb_append_char(&query, '=');
-				oapi_encode(&query, flag_vals[i] ? flag_vals[i] : "");
+				oapi_encode(&query, flag_vals[i] ? flag_vals[i] : "true");
 				matched = 1;
 			}
 			free(nm);
@@ -919,6 +1145,31 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 			sb_free(&url);
 			sb_free(&query);
 			goto out_free;
+		}
+		if (!flag_vals[i]) {
+			int is_bool = 0;
+			for (j = 0; j < op->n_params; j++) {
+				char *nm = json_get_string(op->params[j], "name");
+				char *kb = nm ? oapi_kebab(nm) : NULL;
+				char *in = json_get_string(op->params[j], "in");
+				JsonVal schema = json_get(op->params[j], "schema");
+				char *typ = schema.type == JSON_OBJECT
+					? json_get_string(schema, "type") : NULL;
+				if (nm && ((kb && strcmp(kb, flags[i]) == 0)
+					|| strcmp(nm, flags[i]) == 0)
+					&& (!in || strcmp(in, "query") == 0)
+					&& typ && strcmp(typ, "boolean") == 0)
+					is_bool = 1;
+				free(nm); free(kb); free(in); free(typ);
+				if (is_bool)
+					break;
+			}
+			if (!is_bool) {
+				bb_error_msg("missing value for --%s", flags[i]);
+				sb_free(&url);
+				sb_free(&query);
+				goto out_free;
+			}
 		}
 	}
 
@@ -946,9 +1197,8 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 		for (i = 0; i < opts->n_f; i++) {
 			if (i)
 				sb_append_char(&body, ',');
-			sb_append_char(&body, '"');
-			sb_append(&body, opts->f_keys[i]);
-			sb_append(&body, "\":");
+			sb_append_json_string(&body, opts->f_keys[i]);
+			sb_append_char(&body, ':');
 			oapi_append_typed(&body, opts->f_vals[i]);
 		}
 		sb_append_char(&body, '}');
@@ -959,8 +1209,10 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 		sb_append(&url, query.data);
 	}
 
-	if (body.len)
-		oapi_header_add(opts, "Content-Type: application/json");
+	if (body.len && oapi_header_add(opts, "Content-Type: application/json") != 0) {
+		bb_error_msg("invalid or too many headers");
+		goto out_send;
+	}
 
 	/* send */
 	if (opts->dry_run) {
@@ -971,11 +1223,17 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 			printf("  body: %s\n", body.data);
 		rc = 0;
 	} else {
+		AgcHttpReq req;
 		AgcHttpResp resp;
-		int irc = agc_http_request(op->method, url.data,
-					   opts->headers, opts->n_headers,
-					   body.data ? body.data : "",
-					   body.len, &resp);
+		memset(&req, 0, sizeof(req));
+		req.method = op->method;
+		req.url = url.data;
+		req.headers = opts->headers;
+		req.header_count = opts->n_headers;
+		req.body = body.data ? body.data : "";
+		req.body_len = body.len;
+		req.timeout_ms = opts->timeout_ms;
+		int irc = agc_http_request(&req, &resp);
 		if (irc != 0) {
 			bb_error_msg("request failed (transport error)");
 			goto out_send;
@@ -1040,6 +1298,7 @@ static int oapi_cmd_api(OapiRegistry *r, const char *method, const char *path,
 	StrBuf url;
 	const char *params = NULL;
 	const char *data = NULL;
+	AgcHttpReq req;
 	AgcHttpResp resp;
 	int i;
 	int irc;
@@ -1048,11 +1307,71 @@ static int oapi_cmd_api(OapiRegistry *r, const char *method, const char *path,
 		bb_error_msg("spec has no usable server url");
 		return 1;
 	}
+	if (!oapi_method_valid(method) || !oapi_path_valid(path)) {
+		bb_error_msg("invalid HTTP method or path");
+		free(base);
+		return 1;
+	}
 	for (i = 0; i < argc; i++) {
-		if (strcmp(argv[i], "--params") == 0 && argv[i+1])
+		if (strcmp(argv[i], "--params") == 0) {
+			if (!argv[i + 1] || oapi_option_token(argv[i + 1])) {
+				bb_error_msg("missing value for --params");
+				free(base);
+				return 1;
+			}
 			params = argv[++i];
-		else if (strcmp(argv[i], "--data") == 0 && argv[i+1])
+		} else if (strncmp(argv[i], "--params=", 9) == 0) {
+			params = argv[i] + 9;
+		} else if (strcmp(argv[i], "--data") == 0) {
+			if (!argv[i + 1] || oapi_option_token(argv[i + 1])) {
+				bb_error_msg("missing value for --data");
+				free(base);
+				return 1;
+			}
 			data = argv[++i];
+		} else if (strncmp(argv[i], "--data=", 7) == 0) {
+			data = argv[i] + 7;
+		} else if (strcmp(argv[i], "--dry-run") == 0) {
+			opts->dry_run = 1;
+		} else if (strcmp(argv[i], "--insecure") == 0) {
+			continue;
+		} else if (strcmp(argv[i], "--header") == 0) {
+			if (!argv[i + 1] || oapi_option_token(argv[i + 1])) {
+				bb_error_msg("missing value for --header");
+				free(base);
+				return 1;
+			}
+			if (oapi_header_add(opts, argv[++i]) != 0) {
+				bb_error_msg("invalid or too many headers");
+				free(base);
+				return 1;
+			}
+		} else if (strncmp(argv[i], "--header=", 9) == 0) {
+			if (oapi_header_add(opts, argv[i] + 9) != 0) {
+				bb_error_msg("invalid or too many headers");
+				free(base);
+				return 1;
+			}
+		} else if (strcmp(argv[i], "--timeout") == 0) {
+			if (!argv[i + 1] || oapi_option_token(argv[i + 1])
+				|| !oapi_timeout_valid(argv[i + 1])) {
+				bb_error_msg("invalid value for --timeout");
+				free(base);
+				return 1;
+			}
+			opts->timeout_ms = oapi_timeout_parse(argv[++i]);
+		} else if (strncmp(argv[i], "--timeout=", 10) == 0) {
+			if (!oapi_timeout_valid(argv[i] + 10)) {
+				bb_error_msg("invalid value for --timeout");
+				free(base);
+				return 1;
+			}
+			opts->timeout_ms = oapi_timeout_parse(argv[i] + 10);
+		} else {
+			bb_error_msg("unknown api option '%s'", argv[i]);
+			free(base);
+			return 1;
+		}
 	}
 	sb_init(&url);
 	sb_append(&url, base);
@@ -1065,11 +1384,25 @@ static int oapi_cmd_api(OapiRegistry *r, const char *method, const char *path,
 		sb_append(&url, p2);
 	}
 	if (params && params[0]) {
+		/* raw query is an escape hatch, but must not inject a second request
+		 * line or headers. */
+		const char *q;
+		for (q = params; *q; q++)
+			if (*q == '\r' || *q == '\n') {
+				bb_error_msg("invalid raw query");
+				sb_free(&url);
+				free(base);
+				return 1;
+			}
 		sb_append_char(&url, '?');
 		sb_append(&url, params);
 	}
-	if (data && data[0])
-		oapi_header_add(opts, "Content-Type: application/json");
+	if (data && data[0] && oapi_header_add(opts, "Content-Type: application/json") != 0) {
+		bb_error_msg("invalid or too many headers");
+		sb_free(&url);
+		free(base);
+		return 1;
+	}
 	if (opts->dry_run) {
 		printf("%s %s\n", method, url.data);
 		for (i = 0; i < opts->n_headers; i++)
@@ -1080,8 +1413,15 @@ static int oapi_cmd_api(OapiRegistry *r, const char *method, const char *path,
 		free(base);
 		return 0;
 	}
-	irc = agc_http_request(method, url.data, opts->headers, opts->n_headers,
-			       data ? data : "", data ? strlen(data) : 0, &resp);
+	memset(&req, 0, sizeof(req));
+	req.method = method;
+	req.url = url.data;
+	req.headers = opts->headers;
+	req.header_count = opts->n_headers;
+	req.body = data ? data : "";
+	req.body_len = data ? strlen(data) : 0;
+	req.timeout_ms = opts->timeout_ms;
+	irc = agc_http_request(&req, &resp);
 	sb_free(&url);
 	free(base);
 	if (irc != 0) {
@@ -1125,11 +1465,21 @@ int oapi_main(int argc UNUSED_PARAM, char **argv)
 			} else if (strcmp(argv[i], "--insecure") == 0) {
 				i++;
 			} else if (strncmp(argv[i], "--header=", 9) == 0) {
-				oapi_header_add(&opts, argv[i] + 9);
+				if (oapi_header_add(&opts, argv[i] + 9) != 0)
+					bb_error_msg_and_die("invalid or too many headers");
 				i++;
 			} else if (strcmp(argv[i], "--header") == 0 && argv[i+1]) {
-				oapi_header_add(&opts, argv[i+1]);
+				if (oapi_header_add(&opts, argv[i+1]) != 0)
+					bb_error_msg_and_die("invalid or too many headers");
 				i += 2;
+			} else if (strcmp(argv[i], "--timeout") == 0 && argv[i+1]
+				&& oapi_timeout_valid(argv[i+1])) {
+				opts.timeout_ms = oapi_timeout_parse(argv[i+1]);
+				i += 2;
+			} else if (strncmp(argv[i], "--timeout=", 10) == 0
+				&& oapi_timeout_valid(argv[i] + 10)) {
+				opts.timeout_ms = oapi_timeout_parse(argv[i] + 10);
+				i++;
 			} else {
 				break;
 			}
@@ -1137,6 +1487,10 @@ int oapi_main(int argc UNUSED_PARAM, char **argv)
 		argv += i - 1;   /* argv[1] is now the subcommand or API name */
 		argc -= i - 1;
 	}
+	if (!argv[1])
+		bb_show_usage();
+	if (argv[1][0] == '-')
+		bb_error_msg_and_die("invalid global option '%s'", argv[1]);
 
 	if (strcmp(argv[1], "connect") == 0) {
 		if (!argv[2] || !argv[3] || argv[4])

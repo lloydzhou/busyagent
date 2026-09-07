@@ -271,7 +271,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
                   sse_callback_fn callback, void *ctx,
                   volatile int *cancelled);
 
-/* streaming callback context (line split + provider dispatch) */
+/* streaming callback context (provider dispatch over shared SSE splitter) */
 typedef struct {
     int index;
     char *id;
@@ -282,8 +282,6 @@ typedef struct {
 typedef struct {
     sse_callback_fn callback;
     void *ctx;
-    StrBuf line_buf;        /* accumulating SSE line */
-    char *event;            /* Responses SSE event name */
     char *provider;         /* "claude", "openai" or "responses" */
     volatile int *cancelled;
     OpenAIToolAccum *openai_tools;
@@ -305,11 +303,6 @@ void sse_stream_init(StreamCtx *sctx, const char *provider,
                      sse_callback_fn callback, void *ctx,
                      volatile int *cancelled);
 void sse_stream_free(StreamCtx *sctx);
-/* stream tail: leftover JSON + responses termination check */
-void sse_stream_finish(StreamCtx *sctx, const char *provider,
-                       sse_callback_fn callback, void *ctx);
-/* feed one decoded body chunk; 0 means cancelled */
-int sse_stream_feed(StreamCtx *sctx, const char *ptr, size_t len);
 
 /* parse an SSE event line (from "data: ..." lines) */
 int sse_parse_event(const char *provider, const char *data, size_t data_len,

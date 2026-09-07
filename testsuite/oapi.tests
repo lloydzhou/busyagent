@@ -130,6 +130,28 @@ testing "oapi dry-run prints the request" \
 	"GET /cgi-bin/store/pets?status=sold\n" \
 	"" ""
 
+testing "oapi percent-encodes slashes in path parameters" \
+	'BA_HOME=$PWD/oa.home oapi pet get-pet-by-id 1/2 --dry-run 2>&1' \
+	"GET /cgi-bin/store/pets/1%2F2\n" \
+	"" ""
+
+testing "oapi trailing --header reaches the request" \
+	'BA_HOME=$PWD/oa.home oapi pet find-pets --header "X-Trace: abc" --dry-run 2>&1' \
+	"GET /cgi-bin/store/pets
+  X-Trace: abc\n" \
+	"" ""
+
+testing "oapi trailing --timeout is accepted" \
+	'BA_HOME=$PWD/oa.home oapi pet find-pets --timeout 1500 --dry-run 2>&1' \
+	"GET /cgi-bin/store/pets\n" \
+	"" ""
+
+testing "oapi connect rejects traversal names" \
+	'BA_HOME=$PWD/oa.home oapi connect ../evil $PWD/petstore.tmp.json 2>&1; echo rc=$?' \
+	"oapi: bad name '../evil'
+rc=1\n" \
+	"" ""
+
 testing "oapi rm removes the entry" \
 	'BA_HOME=$PWD/oa.home oapi rm pet && BA_HOME=$PWD/oa.home oapi ls 2>&1' \
 	"no APIs registered (oapi connect NAME SPEC)\n" \

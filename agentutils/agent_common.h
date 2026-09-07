@@ -13,22 +13,9 @@
 
 #include "libbb.h"
 
-/* ---- tuning constants (shared with the original ba_impl.c code) ---- */
-#define BA_CONNECT_TIMEOUT_MS  5000
+/* ---- tuning constants ---- */
 #define BA_READ_TIMEOUT_MS    300000   /* idle timeout for SSE streams */
-#define BA_MAX_HEADER         (64 * 1024)
-#define BA_TLS_RECHDR_LEN     5     /* TLS record header (networking/tls.c) */
-#define BA_TLS_APPDATA        23    /* RECORD_TYPE_APPLICATION_DATA */
-/* RFC 5246: a TLSPlaintext fragment carries at most 2^14 bytes, and the
- * record layer may add up to 2^10 of compression overhead + cipher block
- * padding. 18 KiB covers every legal decrypted application-data record:
- * records larger than this are refused, never silently truncated. */
-#define BA_TLS_PLAIN_MAX      (18 * 1024)
-/* chunked transfer: sane upper bound for a single chunk size line value */
-#define BA_MAX_CHUNK_SIZE     (16 * 1024 * 1024)
-/* ba_read() polls in short slices so the cancelled flag is checked
- * promptly instead of blocking for the full idle timeout */
-#define BA_POLL_SLICE_MS      250
+#define BA_MAX_BODY           (16 * 1024 * 1024)
 
 /* strdup, NULL-safe */
 char *util_strdup(const char *s);
@@ -270,74 +257,25 @@ typedef struct {
 int ba_parse_url(const char *url, BaUrl *u);
 
 /* ============================================================
- * Connect / TLS
+ * HTTP client (busyagent SSE pump, mcpc, oapi)
  * ============================================================ */
-/* TCP connect with a bounded non-blocking handshake. fd or -1. */
-int ba_connect(const char *host, int port);
-
-/* In-tree TLS session (networking/tls.c). The daemon/client owns it and
- * releases it with ba_tls_dispose(). See ba_tls_notice(): no cert check. */
-tls_state_t *ba_tls_connect(const char *host, int port);
-void ba_tls_dispose(tls_state_t *tls);
-/* one-time stderr warning about the unverified TLS client */
-void ba_tls_notice(void);
-
-/* ============================================================
- * Request send (any method)
- * ============================================================ */
-/* Send "<method> <path> HTTP/1.1" + Host + Content-Length + headers
- * ("Name: value" lines, no trailing CRLF) + body. 0 on success. */
-int ba_send_request(tls_state_t *tls, int fd, const char *method,
-		    const BaUrl *u, const char **headers, int header_count,
-		    const char *body, size_t body_len);
-
-/* write buf to the TLS session (chunked through the record layer) or
- * the plain socket; 0 on success (-1 only on plain-socket errors:
- * the TLS path uses libbb xwrite semantics). */
-int send_all_conn(tls_state_t *tls, int fd, const char *buf, size_t len);
-
-/* ============================================================
- * Response reading (header + decoded body, chunked-aware)
- * ============================================================ */
+/* A deliberately small httpx-like request object.  It covers the common
+ * needs of busyagent, mcpc and oapi without pretending to be a full HTTP
+ * library: no redirects, cookies, pooling or multipart support. */
 typedef struct {
-	int fd;
-	int chunked;              /* Transfer-Encoding: chunked */
-	long content_length;      /* -1 if unknown */
-	long body_left;           /* for content_length mode */
-	long chunk_left;          /* for chunked mode */
-	int chunk_state;          /* 0=size line, 1=data, 2=data CRLF, 3=trailers, 4=done */
-	int eof;
-	tls_state_t *tls;
-	char tls_plain[BA_TLS_PLAIN_MAX];
-	int tls_plain_len;
-	int tls_plain_pos;
-	char hdr[BA_MAX_HEADER];
-	size_t hdr_len;
-	int status;
-	int got_header;
-	char pending[4096];
-	size_t pending_len;
-	volatile int *cancelled;  /* checked between poll slices */
-} BaResp;
+	const char *method;
+	const char *url;
+	const char **headers;
+	int header_count;
+	const char *body;
+	size_t body_len;
+	int timeout_ms;              /* <= 0 => BA_READ_TIMEOUT_MS */
+	volatile int *cancelled;     /* optional; checked while reading */
+} AgcHttpReq;
 
-/* Read + parse the response header into r (status, chunked, lengths).
- * 0 on success. */
-int ba_read_header(BaResp *r);
-
-/* Read the next piece of the decoded body. n>0 data, 0 end of body,
- * -1 error/timeout/cancel. Handles content-length and chunked. */
-int ba_body_read(BaResp *r, char *out, size_t outsz);
-
-/* close(fd) + ba_tls_dispose(tls); safe on partial/zeroed BaResp. */
-void ba_resp_close(BaResp *r);
-
-/* ============================================================
- * One-shot request with full-body response (mcpc / oapi)
- * ============================================================ */
 typedef struct {
 	int status;           /* HTTP status code (set even for 4xx/5xx) */
-	char *content_type;   /* lowercased value or NULL */
-	char *location;       /* value of location: or NULL */
+	char *content_type;   /* value of content-type: or NULL */
 	char *session_id;     /* value of mcp-session-id: or NULL (MCP) */
 	char *body;           /* NUL-terminated, malloc'd (may be NULL) */
 	size_t body_len;
@@ -348,10 +286,23 @@ typedef struct {
  * received (resp->status carries 4xx/5xx too), -1 on transport error
  * (connect/send/header parse/body error). Caller frees with
  * agc_http_resp_free(). */
-int agc_http_request(const char *method, const char *url,
-		     const char **headers, int header_count,
-		     const char *body, size_t body_len,
-		     AgcHttpResp *resp);
+#define AGC_HTTP_ERROR    (-1)
+#define AGC_HTTP_COMPLETE 0
+#define AGC_HTTP_STOPPED  1
+
+/* Execute a request and collect the complete decoded body (up to
+ * BA_MAX_BODY). HTTP 4xx/5xx still complete normally; inspect status. */
+int agc_http_request(const AgcHttpReq *req, AgcHttpResp *resp);
+
+/* Streaming variant. The callback receives decoded body chunks after the
+ * response header. A positive callback result stops reading early and is a
+ * successful request; zero continues; a negative result fails the request.
+ * The response body is not accumulated, so this is suitable for long-lived
+ * SSE responses. read_timeout_ms <= 0 uses BA_READ_TIMEOUT_MS. */
+typedef int (*agc_http_chunk_fn)(void *ctx, const char *data, size_t len);
+int agc_http_request_stream(const AgcHttpReq *req,
+			    agc_http_chunk_fn callback, void *ctx,
+			    AgcHttpResp *resp);
 void agc_http_resp_free(AgcHttpResp *resp);
 
 /* ============================================================
@@ -366,6 +317,9 @@ typedef struct {
 	size_t data_len;
 	size_t data_cap;
 	int has_field;     /* any field line seen in the current event */
+	int saw_sse;       /* at least one recognized SSE field was seen */
+	int skip_lf;       /* CR already terminated this line (CRLF pair) */
+	int error;         /* input exceeded an SSE safety limit */
 } AgcSse;
 
 /* called once per complete event; event defaults to "message"; data is
@@ -386,11 +340,12 @@ void agc_sse_finish(AgcSse *s, agc_sse_event_fn fn, void *ctx);
 /* ============================================================
  * jq-style path evaluation (jq applet, oapi --jq)
  * ============================================================ */
-#define AGC_JQ_MAX_MATCHES 64
+#define AGC_JQ_INITIAL_MATCHES 64
 
 typedef struct {
-	JsonVal v[AGC_JQ_MAX_MATCHES];
+	JsonVal *v;
 	int n;
+	int cap;
 } AgcJqMatches;
 
 /* Evaluate a jq-style path against root: ".a.b[0].c", ".items[].id",

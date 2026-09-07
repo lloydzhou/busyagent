@@ -14,6 +14,28 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+
+/* ============================================================
+ * internal tuning constants (private to the HTTP core below)
+ * ============================================================ */
+#define BA_CONNECT_TIMEOUT_MS  5000
+#define BA_MAX_HEADER          (64 * 1024)
+#define BA_MAX_SSE_LINE        (64 * 1024)
+#define BA_MAX_SSE_DATA        (4 * 1024 * 1024)
+#define BA_MAX_HEADERS         64
+#define BA_TLS_RECHDR_LEN      5     /* TLS record header (networking/tls.c) */
+#define BA_TLS_APPDATA         23    /* RECORD_TYPE_APPLICATION_DATA */
+/* RFC 5246: a TLSPlaintext fragment carries at most 2^14 bytes, and the
+ * record layer may add up to 2^10 of compression overhead + cipher block
+ * padding. 18 KiB covers every legal decrypted application-data record:
+ * records larger than this are refused, never silently truncated. */
+#define BA_TLS_PLAIN_MAX       (18 * 1024)
+/* chunked transfer: sane upper bound for a single chunk size line value */
+#define BA_MAX_CHUNK_SIZE      (16 * 1024 * 1024)
+/* ba_read() polls in short slices so the cancelled flag is checked
+ * promptly instead of blocking for the full idle timeout */
+#define BA_POLL_SLICE_MS       250
 
 /* ============================================================
  * URL parsing
@@ -23,6 +45,8 @@ int ba_parse_url(const char *url, BaUrl *u)
 	char *colon;
 	const char *p, *slash;
 
+	if (!url || !u)
+		return -1;
 	memset(u, 0, sizeof(*u));
 	if (strncmp(url, "https://", 8) == 0) {
 		u->is_https = 1;
@@ -42,25 +66,68 @@ int ba_parse_url(const char *url, BaUrl *u)
 			return -1;
 		memcpy(u->host, p, hlen);
 		u->host[hlen] = '\0';
+		if (strlen(slash) >= sizeof(u->path))
+			return -1;
 		snprintf(u->path, sizeof(u->path), "%s", slash);
 	}
 	colon = strchr(u->host, ':');
 	if (colon) {
-		u->port = atoi(colon + 1);
+		const char *q = colon + 1;
+		unsigned long port = 0;
+		if (!*q)
+			return -1;
+		for (; *q; q++) {
+			if (*q < '0' || *q > '9' || port > 65535 / 10)
+				return -1;
+			port = port * 10 + (*q - '0');
+			if (port > 65535)
+				return -1;
+		}
+		u->port = (int)port;
 		*colon = '\0';
 	} else {
 		u->port = u->is_https ? 443 : 80;
 	}
 	if (!u->host[0] || u->port <= 0)
 		return -1;
+	if (strchr(u->host, '\r') || strchr(u->host, '\n'))
+		return -1;
 	return 0;
 }
 
 /* ============================================================
- * TCP connect
+ * TCP connect (private)
  * ============================================================ */
+/* connection state shared by the header/body decoders below; owned by
+ * agc_http_request_stream() and released with ba_resp_close(). */
+typedef struct {
+	int fd;
+	int chunked;              /* Transfer-Encoding: chunked */
+	long content_length;      /* -1 if unknown */
+	long body_left;           /* for content_length mode */
+	long chunk_left;          /* for chunked mode */
+	int chunk_state;          /* 0=size line, 1=data, 2=data CRLF, 3=trailers, 4=done */
+	int eof;
+	int fd_owned;
+	tls_state_t *tls;
+	char tls_plain[BA_TLS_PLAIN_MAX];
+	int tls_plain_len;
+	int tls_plain_pos;
+	char hdr[BA_MAX_HEADER];
+	size_t hdr_len;
+	int status;
+	int got_header;
+	char *pending;
+	size_t pending_len;
+	size_t pending_cap;
+volatile int *cancelled;  /* checked between poll slices */
+	int read_timeout_ms;       /* 0 => BA_READ_TIMEOUT_MS */
+} BaResp;
+
+static void ba_tls_dispose(tls_state_t *tls);
+
 /* Connect with timeout (non-blocking connect + POLLOUT). -1 on error. */
-int ba_connect(const char *host, int port)
+static int ba_connect(const char *host, int port)
 {
 	len_and_sockaddr *lsa;
 	int fd, flags, rc;
@@ -111,14 +178,32 @@ int ba_connect(const char *host, int port)
  * ============================================================ */
 static int send_all(int fd, const char *buf, size_t len)
 {
-	return full_write(fd, buf, len) == (ssize_t)len ? 0 : -1;
+	ssize_t n;
+
+	if (len && !buf)
+		return -1;
+	while (len) {
+		n = safe_write(fd, buf, len);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (n == 0)
+			return -1;
+		buf += n;
+		len -= n;
+	}
+	return 0;
 }
 
 /* 0 on success, -1 if any send failed. The plaintext path surfaces
  * write errors (EPIPE when the peer closed, ECONNRESET...); the TLS
  * path uses xwrite(), which exits the process on failure (libbb
  * semantics), so a short TLS write never returns here. */
-int ba_send_request(tls_state_t *tls, int fd, const char *method,
+static int send_all_conn(tls_state_t *tls, int fd, const char *buf, size_t len);
+
+static int ba_send_request(tls_state_t *tls, int fd, const char *method,
 		    const BaUrl *u, const char **headers,
 		    int header_count, const char *body, size_t body_len)
 {
@@ -126,8 +211,17 @@ int ba_send_request(tls_state_t *tls, int fd, const char *method,
 	int i;
 	int rc = 0;
 
+	if (!method || !u || header_count < 0
+	 || (header_count && !headers) || (body_len && !body))
+		return -1;
 	/* host and path are each up to ~1 KiB: too long for a stack buffer */
-	if (u->port != 80)
+	if (!method[0])
+		return -1;
+	for (i = 0; method[i]; i++)
+		if ((unsigned char)method[i] <= 0x20 || method[i] == 0x7f
+		 || strchr("()<>@,;:\\\"/[]?={}", method[i]))
+			return -1;
+	if (u->is_https ? u->port != 443 : u->port != 80)
 		first = xasprintf("%s %s HTTP/1.1\r\n"
 				  "Host: %s:%d\r\n"
 				  "Content-Length: %lu\r\n"
@@ -144,6 +238,8 @@ int ba_send_request(tls_state_t *tls, int fd, const char *method,
 	rc |= send_all_conn(tls, fd, first, strlen(first));
 	free(first);
 	for (i = 0; i < header_count; i++) {
+		if (!headers[i] || strchr(headers[i], '\r') || strchr(headers[i], '\n'))
+			return -1;
 		rc |= send_all_conn(tls, fd, headers[i], strlen(headers[i]));
 		rc |= send_all_conn(tls, fd, "\r\n", 2);
 	}
@@ -152,8 +248,10 @@ int ba_send_request(tls_state_t *tls, int fd, const char *method,
 	return rc;
 }
 
-int send_all_conn(tls_state_t *tls, int fd, const char *buf, size_t len)
+static int send_all_conn(tls_state_t *tls, int fd, const char *buf, size_t len)
 {
+	if (len && !buf)
+		return -1;
 #if ENABLE_TLS
 	if (tls) {
 		while (len) {
@@ -172,13 +270,15 @@ int send_all_conn(tls_state_t *tls, int fd, const char *buf, size_t len)
 }
 
 /* ============================================================
- * Response reading
+ * Response reading (private)
  * ============================================================ */
 /* Read more bytes into buf, honoring idle timeout and the cancelled flag.
  * Returns n>0, 0 on EOF, -1 on error/timeout/cancel. */
 static int ba_read(BaResp *r, char *buf, size_t bufsz)
 {
-	int64_t deadline = (int64_t)monotonic_ms() + BA_READ_TIMEOUT_MS;
+	int timeout_ms = r->read_timeout_ms > 0
+		? r->read_timeout_ms : BA_READ_TIMEOUT_MS;
+	int64_t deadline = (int64_t)monotonic_ms() + timeout_ms;
 	int fd;
 
 #if ENABLE_TLS
@@ -194,6 +294,13 @@ static int ba_read(BaResp *r, char *buf, size_t bufsz)
 
 		if (r->cancelled && *(r->cancelled))
 			return -1;
+#if ENABLE_TLS
+		/* buffered TLS plaintext or a whole buffered record must not
+		 * wait for socket readability again (they are already here) */
+		if (r->tls && (r->tls_plain_len > r->tls_plain_pos
+			       || tls_has_buffered_record(r->tls)))
+			break;
+#endif
 		pfd.fd = fd;
 		pfd.events = POLLIN;
 		pr = safe_poll(&pfd, 1, BA_POLL_SLICE_MS);
@@ -229,8 +336,17 @@ static int ba_read(BaResp *r, char *buf, size_t bufsz)
 			int give = r->tls_plain_len - r->tls_plain_pos;
 			if (give > (int)bufsz)
 				give = bufsz;
+			if (give <= 0) {
+				r->tls_plain_len = 0;
+				r->tls_plain_pos = 0;
+				return 0;
+			}
 			memcpy(buf, r->tls_plain + r->tls_plain_pos, give);
 			r->tls_plain_pos += give;
+			if (r->tls_plain_pos == r->tls_plain_len) {
+				r->tls_plain_len = 0;
+				r->tls_plain_pos = 0;
+			}
 			return give;
 		}
 	}
@@ -262,7 +378,7 @@ static char *ba_hdr_end(BaResp *r, size_t *body_off)
 }
 
 /* Read and parse the response header. Returns 0 on success. */
-int ba_read_header(BaResp *r)
+static int ba_read_header(BaResp *r)
 {
 	char *p, *end;
 	size_t body_start;
@@ -295,14 +411,17 @@ int ba_read_header(BaResp *r)
 	if (!end)
 		return -1;
 
-	/* the read that completed the header may have consumed body bytes:
-	 * keep them for ba_body_read (first SSE chunk lives here) */
+	/* The read that completed the header may have consumed body bytes.
+	 * Keep the complete remainder: truncating it would silently drop the
+	 * beginning of an SSE event or a chunk-size line. */
 	{
 		size_t avail = r->hdr_len - body_start;
-		if (avail > sizeof(r->pending))
-			avail = sizeof(r->pending);
-		memcpy(r->pending, r->hdr + body_start, avail);
-		r->pending_len = avail;
+		if (avail) {
+			r->pending = xmalloc(avail);
+			memcpy(r->pending, r->hdr + body_start, avail);
+			r->pending_len = avail;
+			r->pending_cap = avail;
+		}
 	}
 
 	/* status code from first line */
@@ -329,12 +448,19 @@ int ba_read_header(BaResp *r)
 				r->chunked = 1;
 			else if (strncasecmp(line, "Content-Length:", 15) == 0) {
 				const char *v = line + 15;
+				char *endp;
+				unsigned long long n;
 				while (*v == ' ' || *v == '\t')
 					v++;
-				/* digits only: junk or a negative value must not
-				 * drive body_left below zero */
-				if (*v >= '0' && *v <= '9')
-					r->content_length = atol(v);
+				if (*v < '0' || *v > '9')
+					return -1;
+				errno = 0;
+				n = bb_strtoull(v, &endp, 10);
+				while (*endp == ' ' || *endp == '\t')
+					endp++;
+				if (errno || *endp || n > LONG_MAX)
+					return -1;
+				r->content_length = (long)n;
 			}
 			line = strtok_r(NULL, "\r\n", &save);
 		}
@@ -355,9 +481,12 @@ static int resp_raw_read(BaResp *r, char *out, size_t outsz)
 {
 	if (r->pending_len > 0) {
 		size_t n = r->pending_len < outsz ? r->pending_len : outsz;
+		if (!r->pending)
+			return -1;
 		memcpy(out, r->pending, n);
 		r->pending_len -= n;
-		memmove(r->pending, r->pending + n, r->pending_len);
+		if (r->pending_len)
+			memmove(r->pending, r->pending + n, r->pending_len);
 		return (int)n;
 	}
 	if (r->eof)
@@ -392,8 +521,10 @@ static int parse_chunk_size_hex(const char *s, long *out)
 
 /* Decode next piece of body into out (already de-chunked).
  * Returns n>0 data, 0 end of body, -1 error. */
-int ba_body_read(BaResp *r, char *out, size_t outsz)
+static int ba_body_read(BaResp *r, char *out, size_t outsz)
 {
+	if (outsz == 0)
+		return 0;
 	if (!r->chunked) {
 		int n;
 		size_t want = outsz;
@@ -489,16 +620,21 @@ int ba_body_read(BaResp *r, char *out, size_t outsz)
 }
 
 /* close(fd) + release TLS state; safe on a zeroed/partial BaResp. */
-void ba_resp_close(BaResp *r)
+static void ba_resp_close(BaResp *r)
 {
-	if (r->fd >= 0) {
+	if (!r)
+		return;
+	if (r->fd >= 0 && r->fd_owned)
 		close(r->fd);
-		r->fd = -1;
-	}
+	r->fd = -1;
 	if (r->tls) {
 		ba_tls_dispose(r->tls);
 		r->tls = NULL;
 	}
+	free(r->pending);
+	r->pending = NULL;
+	r->pending_len = 0;
+	r->pending_cap = 0;
 }
 
 /* ============================================================
@@ -515,7 +651,7 @@ void ba_resp_close(BaResp *r)
  * A machine-in-the-middle can therefore finish a handshake with any
  * self-signed certificate and read/inject traffic, including API keys.
  * ba_tls_notice() prints a one-time warning so the trade-off is explicit. */
-tls_state_t *ba_tls_connect(const char *host, int port)
+static tls_state_t *ba_tls_connect(const char *host, int port)
 {
 	len_and_sockaddr *lsa;
 	int fd;
@@ -539,7 +675,7 @@ tls_state_t *ba_tls_connect(const char *host, int port)
 /* release the per-request TLS state (inbuf/outbuf/hsd allocations);
  * the socket itself stays owned by the caller.  Compiled regardless of
  * ENABLE_TLS so the pump can call it unconditionally (no-op there). */
-void ba_tls_dispose(tls_state_t *tls)
+static void ba_tls_dispose(tls_state_t *tls)
 {
 	if (!tls)
 		return;
@@ -558,7 +694,7 @@ void ba_tls_dispose(tls_state_t *tls)
  * the network can impersonate the endpoint. We make that trade-off explicit:
  * the connection is allowed, with a one-time warning on stderr. Point -u at
  * a TLS-terminating gateway or a trusted network for API credentials. */
-void ba_tls_notice(void)
+static void ba_tls_notice(void)
 {
 	static int warned;
 
@@ -578,7 +714,6 @@ void agc_http_resp_free(AgcHttpResp *resp)
 	if (!resp)
 		return;
 	free(resp->content_type);
-	free(resp->location);
 	free(resp->session_id);
 	free(resp->body);
 	memset(resp, 0, sizeof(*resp));
@@ -591,6 +726,10 @@ void agc_http_resp_free(AgcHttpResp *resp)
  * output) leave lone NULs. Walk defensively: skip runs of NUL/CR/LF
  * between lines instead of assuming one NUL per separator. Field names
  * match case-insensitively; values keep their original case. */
+/* Extract interesting header values into resp. Must run after
+ * ba_read_header(): it relies on strtok_r() having turned the header
+ * separators into NUL bytes, so each line is a NUL-terminated string.
+ * LF-only separators work the same way. */
 static void agc_hdr_pick(BaResp *r, AgcHttpResp *resp)
 {
 	const char *p = r->hdr;
@@ -607,18 +746,13 @@ static void agc_hdr_pick(BaResp *r, AgcHttpResp *resp)
 			const char *v = p + 13;
 			while (*v == ' ' || *v == '\t')
 				v++;
-			resp->content_type = xstrdup(v);
-		} else if (strncasecmp(p, "Location:", 9) == 0 && !resp->location) {
-			const char *v = p + 9;
-			while (*v == ' ' || *v == '\t')
-				v++;
-			resp->location = xstrdup(v);
+			resp->content_type = xstrndup(v, strcspn(v, "\r\n"));
 		} else if (strncasecmp(p, "Mcp-Session-Id:", 15) == 0
 			&& !resp->session_id) {
 			const char *v = p + 15;
 			while (*v == ' ' || *v == '\t')
 				v++;
-			resp->session_id = xstrdup(v);
+			resp->session_id = xstrndup(v, strcspn(v, "\r\n"));
 		}
 		p += ll;
 		while (p < end && (*p == '\0' || *p == '\r' || *p == '\n'))
@@ -626,22 +760,33 @@ static void agc_hdr_pick(BaResp *r, AgcHttpResp *resp)
 	}
 }
 
-int agc_http_request(const char *method, const char *url,
-		     const char **headers, int header_count,
-		     const char *body, size_t body_len,
-		     AgcHttpResp *resp)
+int agc_http_request_stream(const AgcHttpReq *req,
+			    agc_http_chunk_fn callback, void *ctx,
+			    AgcHttpResp *resp)
 {
 	BaUrl u;
 	BaResp r;
 	tls_state_t *tls = NULL;
 	int fd = -1;
 	char buf[4096];
+	int stopped = 0;
+	int rc;
 
+	if (!req || !resp || !req->method || !req->url)
+		return AGC_HTTP_ERROR;
 	memset(resp, 0, sizeof(*resp));
-	if (ba_parse_url(url, &u) != 0)
-		return -1;
-
-	/* same one-time TLS trade-off notice as the busyagent pump */
+	if (req->header_count < 0 || req->header_count > BA_MAX_HEADERS
+	 || (req->header_count && !req->headers)
+	 || (req->body_len && !req->body))
+		return AGC_HTTP_ERROR;
+	if (req->headers) {
+		int i;
+		for (i = 0; i < req->header_count; i++)
+			if (!req->headers[i])
+				return AGC_HTTP_ERROR;
+	}
+	if (ba_parse_url(req->url, &u) != 0)
+		return AGC_HTTP_ERROR;
 	if (u.is_https)
 		ba_tls_notice();
 
@@ -649,49 +794,82 @@ int agc_http_request(const char *method, const char *url,
 	if (u.is_https) {
 		tls = ba_tls_connect(u.host, u.port);
 		if (!tls)
-			return -1;
+			return AGC_HTTP_ERROR;
 		fd = tls->ifd;
 	} else
 #endif
 	{
 		fd = ba_connect(u.host, u.port);
 		if (fd < 0)
-			return -1;
+			return AGC_HTTP_ERROR;
 	}
 
 	memset(&r, 0, sizeof(r));
 	r.fd = fd;
+	r.fd_owned = 1;
 	r.tls = tls;
-
-	if (ba_send_request(tls, fd, method, &u, headers, header_count,
-			    body, body_len) != 0)
+	r.cancelled = req->cancelled;
+	r.read_timeout_ms = req->timeout_ms > 0 ? req->timeout_ms : BA_READ_TIMEOUT_MS;
+	if (ba_send_request(tls, fd, req->method, &u, req->headers,
+			    req->header_count, req->body ? req->body : "",
+			    req->body_len) != 0)
 		goto fail;
 	if (ba_read_header(&r) != 0)
 		goto fail;
-
 	resp->status = r.status;
 	agc_hdr_pick(&r, resp);
 
 	for (;;) {
 		int n = ba_body_read(&r, buf, sizeof(buf));
+		int cb;
 		if (n < 0)
 			goto fail;
 		if (n == 0)
 			break;
-		resp->body = xrealloc(resp->body, resp->body_len + n + 1);
-		memcpy(resp->body + resp->body_len, buf, n);
-		resp->body_len += n;
+		if (!callback)
+			continue;
+		cb = callback(ctx, buf, (size_t)n);
+		if (cb < 0)
+			goto fail;
+		if (cb > 0) {
+			stopped = 1;
+			break;
+		}
 	}
-	if (resp->body)
-		resp->body[resp->body_len] = '\0';
-
 	ba_resp_close(&r);
-	return 0;
+	rc = stopped ? AGC_HTTP_STOPPED : AGC_HTTP_COMPLETE;
+	return rc;
 
-	fail:
+fail:
 	ba_resp_close(&r);
 	agc_http_resp_free(resp);
-	return -1;
+	return AGC_HTTP_ERROR;
+}
+
+static int agc_collect_body(void *ctx, const char *data, size_t len)
+{
+	StrBuf *sb = ctx;
+
+	if (sb->len > BA_MAX_BODY || len > BA_MAX_BODY - sb->len)
+		return AGC_HTTP_ERROR;
+	sb_appendn(sb, data, len);
+	return AGC_HTTP_COMPLETE;
+}
+
+int agc_http_request(const AgcHttpReq *req, AgcHttpResp *resp)
+{
+	StrBuf bodybuf;
+	int rc;
+
+	sb_init(&bodybuf);
+	rc = agc_http_request_stream(req, agc_collect_body, &bodybuf, resp);
+	if (rc < 0) {
+		sb_free(&bodybuf);
+		return AGC_HTTP_ERROR;
+	}
+	resp->body = bodybuf.data ? bodybuf.data : xstrdup("");
+	resp->body_len = bodybuf.len;
+	return rc;
 }
 
 /* ============================================================
@@ -712,11 +890,21 @@ void agc_sse_free(AgcSse *s)
 
 static void agc_sse_line_putc(AgcSse *s, char c)
 {
+	if (s->error)
+		return;
+	if (s->line_len >= BA_MAX_SSE_LINE) {
+		s->error = 1;
+		return;
+	}
 	if (s->line_len + 2 > s->line_cap) {
-		s->line_cap = s->line_cap ? s->line_cap * 2 : 256;
+		size_t cap = s->line_cap ? s->line_cap * 2 : 256;
+		if (cap > BA_MAX_SSE_LINE + 1)
+			cap = BA_MAX_SSE_LINE + 1;
+		s->line_cap = cap;
 		s->line = xrealloc(s->line, s->line_cap);
 	}
 	s->line[s->line_len++] = c;
+	s->line[s->line_len] = '\0';
 }
 
 /* append one data-line payload; join multiple data: lines with '\n' */
@@ -724,16 +912,28 @@ static void agc_sse_data_append(AgcSse *s, const char *str, size_t n)
 {
 	int need_nl = (s->data_len > 0);
 
-	if (s->data_len + n + 2 > s->data_cap) {
+	if (s->error || n > BA_MAX_SSE_DATA
+	 || (need_nl && s->data_len > BA_MAX_SSE_DATA - 1)
+	 || s->data_len + (need_nl ? 1 : 0) > BA_MAX_SSE_DATA - n) {
+		s->error = 1;
+		return;
+	}
+	if (s->data_len + n + (need_nl ? 1 : 0) + 1 > s->data_cap) {
 		s->data_cap = s->data_cap ? s->data_cap : 256;
-		while (s->data_len + n + 2 > s->data_cap)
+		while (s->data_len + n + (need_nl ? 1 : 0) + 1 > s->data_cap) {
+			if (s->data_cap > (BA_MAX_SSE_DATA + 1) / 2) {
+				s->data_cap = BA_MAX_SSE_DATA + 1;
+				break;
+			}
 			s->data_cap *= 2;
+		}
 		s->data = xrealloc(s->data, s->data_cap);
 	}
 	if (need_nl)
 		s->data[s->data_len++] = '\n';
 	memcpy(s->data + s->data_len, str, n);
 	s->data_len += n;
+	s->data[s->data_len] = '\0';
 }
 
 /* one complete field line was accumulated: fold it into the event */
@@ -741,11 +941,14 @@ static void agc_sse_field(AgcSse *s)
 {
 	const char *line = s->line;
 
+	if (s->error)
+		return;
 	s->line[s->line_len] = '\0';
 
 	if (line[0] == ':') {
 		/* comment line: part of the event, carries no data */
 		s->has_field = 1;
+		s->saw_sse = 1;
 	} else if (strncmp(line, "event:", 6) == 0) {
 		const char *v = line + 6;
 		while (*v == ' ' || *v == '\t')
@@ -753,15 +956,18 @@ static void agc_sse_field(AgcSse *s)
 		free(s->event);
 		s->event = xstrdup(v);
 		s->has_field = 1;
+		s->saw_sse = 1;
 	} else if (strncmp(line, "data:", 5) == 0) {
 		const char *v = line + 5;
 		while (*v == ' ' || *v == '\t')
 			v++;
 		agc_sse_data_append(s, v, strlen(v));
 		s->has_field = 1;
+		s->saw_sse = 1;
 	} else if (strncmp(line, "id:", 3) == 0
 		|| strncmp(line, "retry:", 6) == 0) {
 		s->has_field = 1;   /* recognized, ignored */
+		s->saw_sse = 1;
 	}
 	/* unknown field names: ignored, do not mark the event */
 	s->line_len = 0;
@@ -780,7 +986,11 @@ static void agc_sse_dispatch(AgcSse *s, agc_sse_event_fn fn, void *ctx)
 	free(s->data);
 	s->data = NULL;
 	s->data_len = 0;
+	s->data_cap = 0;
 	s->has_field = 0;
+	/* saw_sse stays set: it marks "this stream speaks SSE" so callers
+	 * can tell an event-stream apart from a plain JSON body even after
+	 * the last event was dispatched */
 }
 
 void agc_sse_feed(AgcSse *s, const char *ptr, size_t len,
@@ -788,24 +998,35 @@ void agc_sse_feed(AgcSse *s, const char *ptr, size_t len,
 {
 	size_t i;
 
+	if (s->error)
+		return;
 	for (i = 0; i < len; i++) {
 		char c = ptr[i];
 
-		if (c == '\r')
-			continue;   /* CRLF or bare CR: treat as line end at LF */
-		if (c == '\n') {
+		if (s->skip_lf) {
+			s->skip_lf = 0;
+			if (c == '\n')
+				continue;
+		}
+		if (c == '\r' || c == '\n') {
 			if (s->line_len > 0)
 				agc_sse_field(s);
 			else
 				agc_sse_dispatch(s, fn, ctx);
+			if (c == '\r')
+				s->skip_lf = 1;
 		} else {
 			agc_sse_line_putc(s, c);
 		}
+		if (s->error)
+			return;
 	}
 }
 
 void agc_sse_finish(AgcSse *s, agc_sse_event_fn fn, void *ctx)
 {
+	if (s->error)
+		return;
 	if (s->line_len > 0)
 		agc_sse_field(s);
 	agc_sse_dispatch(s, fn, ctx);
@@ -832,13 +1053,27 @@ void sb_free(StrBuf *sb) {
 }
 
 void sb_ensure(StrBuf *sb, size_t extra) {
-    if (sb->len + extra + 1 <= sb->cap) return;
-    size_t newcap = sb->cap ? sb->cap : 256;
-    while (newcap < sb->len + extra + 1) newcap *= 2;
-    char *p = realloc(sb->data, newcap);
-    if (!p) { fprintf(stderr, "out of memory\n"); abort(); }
-    sb->data = p;
-    sb->cap = newcap;
+    size_t need;
+    size_t newcap;
+
+    if (extra > SIZE_MAX - sb->len - 1)
+        bb_error_msg_and_die("string buffer too large");
+    need = sb->len + extra + 1;
+    if (need <= sb->cap) return;
+    newcap = sb->cap ? sb->cap : 256;
+    while (newcap < need) {
+        if (newcap > SIZE_MAX / 2) {
+            newcap = need;
+            break;
+        }
+        newcap *= 2;
+    }
+    {
+        char *p = realloc(sb->data, newcap);
+        if (!p) { fprintf(stderr, "out of memory\n"); abort(); }
+        sb->data = p;
+        sb->cap = newcap;
+    }
 }
 
 void sb_append(StrBuf *sb, const char *s) {
@@ -1691,48 +1926,76 @@ static int agc_jq_parse(const char *path, AgcJqSeg *segs, int *n_segs)
 	return 0;
 }
 
+static int agc_jq_push(JsonVal **v, int *n, int *cap, JsonVal value)
+{
+	if (*n == *cap) {
+		int next = *cap ? *cap * 2 : AGC_JQ_INITIAL_MATCHES;
+		if (next < *cap || next > 1048576)
+			return -1;
+		*v = xrealloc(*v, (size_t)next * sizeof((*v)[0]));
+		*cap = next;
+	}
+	(*v)[(*n)++] = value;
+	return 0;
+}
+
 int agc_json_path(JsonVal root, const char *path, AgcJqMatches *m)
 {
 	AgcJqSeg segs[16];
 	int n_segs;
-	JsonVal work[AGC_JQ_MAX_MATCHES];
-	int n_work;
+	JsonVal *work = NULL;
+	int n_work = 0;
+	int cap_work = 0;
 	int i;
 
 	memset(m, 0, sizeof(*m));
-	if (agc_jq_parse(path, segs, &n_segs) != 0)
-		return -1;
-	work[0] = root;
-	n_work = 1;
+	if (agc_jq_parse(path, segs, &n_segs) != 0
+		|| agc_jq_push(&work, &n_work, &cap_work, root) != 0)
+		goto fail;
 	for (i = 0; i < n_segs; i++) {
 		AgcJqSeg *s = &segs[i];
-		JsonVal next[AGC_JQ_MAX_MATCHES];
+		JsonVal *next = NULL;
 		int n_next = 0;
+		int cap_next = 0;
 		int k;
 
-		for (k = 0; k < n_work && n_next < AGC_JQ_MAX_MATCHES; k++) {
+		for (k = 0; k < n_work; k++) {
 			JsonVal v = work[k];
 
 			if (s->has_name) {
-				JsonVal r = json_get(v, s->name);
-				next[n_next++] = r;   /* JSON_NULL when absent */
+				if (agc_jq_push(&next, &n_next, &cap_next,
+						json_get(v, s->name)) != 0)
+					goto step_fail;
 			} else if (s->is_index) {
-				JsonVal r = json_array_get(v, (int)s->index);
-				next[n_next++] = r;   /* JSON_NULL when out of range */
+				if (agc_jq_push(&next, &n_next, &cap_next,
+						json_array_get(v, (int)s->index)) != 0)
+					goto step_fail;
 			} else {
-				/* spread: non-arrays (incl. NULL) yield nothing */
 				int j;
 				int len = v.type == JSON_ARRAY ? json_array_len(v) : 0;
-				for (j = 0; j < len && n_next < AGC_JQ_MAX_MATCHES; j++)
-					next[n_next++] = json_array_get(v, j);
+				for (j = 0; j < len; j++)
+					if (agc_jq_push(&next, &n_next, &cap_next,
+							json_array_get(v, j)) != 0)
+						goto step_fail;
 			}
 		}
-		memcpy(work, next, sizeof(next[0]) * n_next);
+		free(work);
+		work = next;
 		n_work = n_next;
+		cap_work = cap_next;
 		if (!n_work)
 			break;
+		continue;
+step_fail:
+		free(next);
+		goto fail;
 	}
-	memcpy(m->v, work, sizeof(work[0]) * n_work);
+	m->v = work;
 	m->n = n_work;
+	m->cap = cap_work;
 	return 0;
+fail:
+	free(work);
+	memset(m, 0, sizeof(*m));
+	return -1;
 }

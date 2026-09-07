@@ -88,4 +88,11 @@ testing "jq reads a file argument" \
 	"file-val\n" \
 	"" ""
 
+# the match list grows dynamically: more than the initial 64 matches
+# must all be printed (previously truncated silently at 64)
+testing "jq .[] over a 100-element array prints every element" \
+	"awk 'BEGIN{s=\"[\";for(i=1;i<=100;i++){if(i>1)s=s \",\";s=s i};s=s \"]\";print s}' | jq '.[]' | wc -l" \
+	"100\n" \
+	"" ""
+
 echo "jq: done"
