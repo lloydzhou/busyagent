@@ -11,5 +11,6 @@ lib-y:=
 # (-D_GNU_SOURCE and -std=gnu99 already come from Makefile.flags).
 CFLAGS_ba_impl.o = -Wno-declaration-after-statement
 CFLAGS_busyagent.o = -Wno-declaration-after-statement
+CFLAGS_agent_common.o = -Wno-declaration-after-statement
 
 INSERT

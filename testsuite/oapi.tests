@@ -1,0 +1,230 @@
+#!/bin/sh
+# Copyright 2026 by Lloyd Zhou <lloydzhou@qq.com>
+# Licensed under GPLv2, see file LICENSE in this source tree.
+
+. ./testing.sh
+
+# oapi tests: offline CLI contract first, then real requests against a
+# local BusyBox httpd CGI mock (petstore.tmp.json served over HTTP so the
+# relative servers[0].url resolution is exercised too).
+
+# === offline: registry lifecycle =====================================
+
+# self-contained spec (same content as testsuite/petstore.tmp.json)
+cat > petstore.tmp.json <<'SPEC'
+{
+  "openapi": "3.0.0",
+  "info": { "title": "petstore", "version": "1.0.0" },
+  "servers": [{ "url": "/cgi-bin/store" }],
+  "paths": {
+    "/pets": {
+      "get": {
+        "operationId": "findPets",
+        "summary": "list pets by status",
+        "parameters": [
+          {"$ref": "#/components/parameters/Status"},
+          {"name": "tags", "in": "query",
+           "schema": {"type": "array", "items": {"type": "string"}}}
+        ],
+        "responses": {"200": {"description": "ok"}}
+      },
+      "post": {
+        "operationId": "createPet",
+        "summary": "add a pet",
+        "requestBody": {
+          "content": {"application/json": {"schema": {"type": "object"}}}
+        },
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/pets/{id}": {
+      "get": {
+        "operationId": "getPetById",
+        "summary": "one pet",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true,
+           "schema": {"type": "integer", "format": "int64"}}
+        ],
+        "responses": {"200": {"description": "ok"}}
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "Status": {
+        "name": "status", "in": "query",
+        "schema": {"type": "string",
+                   "enum": ["available", "pending", "sold"]}
+      }
+    }
+  }
+}
+SPEC
+
+rm -rf oa.home
+testing "oapi without arguments shows usage" \
+	'oapi 2>&1 | grep -c "Usage: oapi" || true' \
+	"1\n" \
+	"" ""
+
+testing "oapi connect from a local spec file" \
+	'BA_HOME=$PWD/oa.home oapi connect pet $PWD/petstore.tmp.json 2>&1 | sed "s| (source .*| (source SPEC)|"' \
+	"connected pet: 3 operations (source SPEC)\n" \
+	"" ""
+
+testing "oapi ls lists the registry" \
+	'BA_HOME=$PWD/oa.home oapi ls 2>&1 | sed "s|/.*petstore.tmp.json|SPEC|"' \
+	"pet              3 operations  SPEC\n" \
+	"" ""
+
+testing "oapi ls with an empty registry" \
+	'BA_HOME=$PWD/oa.none oapi ls 2>&1' \
+	"no APIs registered (oapi connect NAME SPEC)\n" \
+	"" ""
+
+testing "oapi schema lists operations" \
+	'BA_HOME=$PWD/oa.home oapi schema pet 2>&1 | tr -s " "' \
+	"find-pets GET /pets list pets by status
+create-pet POST /pets add a pet
+get-pet-by-id GET /pets/{id} one pet\n" \
+	"" ""
+
+testing "oapi schema shows operation parameters" \
+	'BA_HOME=$PWD/oa.home oapi schema pet get-pet-by-id 2>&1 | tr -s " " | sed "s|^ ||"' \
+	"GET /pets/{id} (getPetById)
+one pet
+--id in:path type:integer (required)\n" \
+	"" ""
+
+testing "oapi schema folds \$ref parameters" \
+	'BA_HOME=$PWD/oa.home oapi schema pet find-pets 2>&1 | grep -c -- "--status  in:query"' \
+	"1\n" \
+	"" ""
+
+testing "oapi schema unknown operation fails" \
+	'BA_HOME=$PWD/oa.home oapi schema pet nope 2>&1; echo rc=$?' \
+	"oapi: operation 'nope' not found (see: oapi schema)
+rc=1\n" \
+	"" ""
+
+testing "oapi unknown api fails" \
+	'BA_HOME=$PWD/oa.home oapi nope find-pets 2>&1; echo rc=$?' \
+	"oapi: unknown API 'nope' (connect first: oapi connect NAME SPEC)
+rc=1\n" \
+	"" ""
+
+testing "oapi missing path parameter is rejected" \
+	'BA_HOME=$PWD/oa.home oapi pet get-pet-by-id 2>&1; echo rc=$?' \
+	"oapi: get-pet-by-id needs 1 positional path parameter(s), got 0
+rc=1\n" \
+	"" ""
+
+testing "oapi unknown operation flag is rejected" \
+	'BA_HOME=$PWD/oa.home oapi pet find-pets --bogus x 2>&1; echo rc=$?' \
+	"oapi: unknown flag --bogus (see: oapi schema for parameters)
+rc=1\n" \
+	"" ""
+
+testing "oapi dry-run prints the request" \
+	'BA_HOME=$PWD/oa.home oapi pet find-pets --status sold --dry-run 2>&1' \
+	"GET /cgi-bin/store/pets?status=sold\n" \
+	"" ""
+
+testing "oapi rm removes the entry" \
+	'BA_HOME=$PWD/oa.home oapi rm pet && BA_HOME=$PWD/oa.home oapi ls 2>&1' \
+	"no APIs registered (oapi connect NAME SPEC)\n" \
+	"" ""
+
+# === e2e: local httpd CGI petstore ===================================
+
+optional HTTPD FEATURE_HTTPD_CGI
+
+if [ -z "$SKIP" ]; then
+	ROOT=$PWD/oa.e2e
+	WEB=$ROOT/www
+	PORT=$((20000 + $$ % 20000))
+	BASE="http://127.0.0.1:$PORT"
+
+	rm -rf "$ROOT"
+	mkdir -p "$WEB/cgi-bin"
+	cp "$PWD/petstore.tmp.json" "$WEB/petstore.tmp.json"
+
+	cat > "$WEB/cgi-bin/store" <<'MOCK'
+#!/bin/sh
+# petstore mock: PATH_INFO routing, request line logged for assertions
+echo "Content-type: application/json"
+echo ""
+echo "$REQUEST_METHOD $PATH_INFO?$QUERY_STRING" >> "__LOG__"
+if [ "$REQUEST_METHOD" = GET ] && [ "$PATH_INFO" = "/pets" ]; then
+	echo '[{"id":1,"name":"fido","status":"available"},{"id":2,"name":"rex","status":"sold"}]'
+elif [ "$REQUEST_METHOD" = GET ] && [ "$PATH_INFO" = "/pets/7" ]; then
+	echo '{"id":7,"name":"lassie"}'
+elif [ "$REQUEST_METHOD" = POST ] && [ "$PATH_INFO" = "/pets" ]; then
+	cat
+else
+	echo '{"error":"not found"}'
+fi
+MOCK
+	sed -i "s|__LOG__|$ROOT/requests.log|" "$WEB/cgi-bin/store"
+	chmod +x "$WEB/cgi-bin/store"
+
+	httpd -f -p "127.0.0.1:$PORT" -h "$WEB" >/dev/null 2>&1 &
+	HTTPD_PID=$!
+	sleep 1
+
+	OAPI="BA_HOME=$ROOT/home oapi"
+
+	testing "oapi connect fetches the spec over http" \
+		"$OAPI connect store $BASE/petstore.tmp.json 2>&1" \
+		"connected store: 3 operations (source $BASE/petstore.tmp.json)\n" \
+		"" ""
+
+	testing "oapi find-pets passes query flags" \
+		"$OAPI store find-pets --status available 2>&1" \
+		'[{"id":1,"name":"fido","status":"available"},{"id":2,"name":"rex","status":"sold"}]\n' \
+		"" ""
+
+	testing "oapi get-pet-by-id takes a positional path arg" \
+		"$OAPI store get-pet-by-id 7 2>&1" \
+		'{"id":7,"name":"lassie"}\n' \
+		"" ""
+
+	testing "oapi --jq filters the response" \
+		"$OAPI store find-pets --jq '[].name' 2>&1" \
+		'fido
+rex\n' \
+		"" ""
+
+	testing "oapi --jq walks objects" \
+		"$OAPI store get-pet-by-id 7 --jq '.name' 2>&1" \
+		'lassie\n' \
+		"" ""
+
+	testing "oapi create-pet sends --body verbatim" \
+		"$OAPI store create-pet --body '{\"name\":\"milou\"}' 2>&1" \
+		'{"name":"milou"}\n' \
+		"" ""
+
+	testing "oapi -F builds a typed json body" \
+		"$OAPI store create-pet -F name=milou -F vaccinated=true 2>&1" \
+		'{"name":"milou","vaccinated":true}\n' \
+		"" ""
+
+	testing "oapi api escape hatch sends a raw request" \
+		"$OAPI api store GET /pets 2>&1" \
+		'[{"id":1,"name":"fido","status":"available"},{"id":2,"name":"rex","status":"sold"}]\n' \
+		"" ""
+
+	testing "oapi requests hit the mock with the right line" \
+		"grep -c '^GET /pets?status=available$' $ROOT/requests.log; grep -c '^GET /pets/7?$' $ROOT/requests.log" \
+		"1
+2\n" \
+		"" ""
+
+	kill $HTTPD_PID 2>/dev/null
+	rm -rf "$ROOT"
+else
+	echo "SKIPPED: oapi e2e (httpd/CGI not enabled)"
+fi
+
+rm -rf oa.home oa.none petstore.tmp.json

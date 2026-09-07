@@ -1,0 +1,91 @@
+#!/bin/sh
+# testsuite/jq.tests - the tiny jq applet
+#
+# pure offline coverage of the path evaluator shared with oapi --jq.
+
+. ./testing.sh
+
+J='{"name":"fido","id":7,"alive":true,"tags":["a","b"],
+"items":[{"id":1,"kind":"x"},{"id":2,"kind":"y"}],"meta":{"deep":{"v":"z"}}}'
+
+testing "jq .field extracts a string" \
+	"echo '$J' | jq '.name'" \
+	'"fido"\n' \
+	"" ""
+
+testing "jq -r strips quotes" \
+	"echo '$J' | jq -r '.name'" \
+	"fido\n" \
+	"" ""
+
+testing "jq .field on a number" \
+	"echo '$J' | jq '.id'" \
+	"7\n" \
+	"" ""
+
+testing "jq nested path" \
+	"echo '$J' | jq -r '.meta.deep.v'" \
+	"z\n" \
+	"" ""
+
+testing "jq missing key yields null" \
+	"echo '$J' | jq '.nope'" \
+	"null\n" \
+	"" ""
+
+testing "jq array index" \
+	"echo '$J' | jq -r '.tags[1]'" \
+	"b\n" \
+	"" ""
+
+testing "jq array index out of range yields null" \
+	"echo '$J' | jq '.tags[9]'" \
+	"null\n" \
+	"" ""
+
+testing "jq .[] spreads an array" \
+	"echo '$J' | jq -r '.tags[]'" \
+	"a
+b\n" \
+	"" ""
+
+testing "jq .a[].b walks array elements" \
+	"echo '$J' | jq '.items[].id'" \
+	"1
+2\n" \
+	"" ""
+
+testing "jq [] over a non-array yields nothing" \
+	"echo '{\"a\":1}' | jq -e '.a[]'; echo rc=\$?" \
+	"rc=1\n" \
+	"" ""
+
+testing "jq . selects the root" \
+	"echo '{\"a\":1}' | jq -e '.'; echo rc=\$?" \
+	'{"a":1}
+rc=0\n' \
+	"" ""
+
+testing "jq -e exits 1 on no output" \
+	"echo '{\"a\":1}' | jq -e '.missing[]'; echo rc=\$?" \
+	"rc=1\n" \
+	"" ""
+
+testing "jq invalid json fails" \
+	"echo 'nope' | jq '.a' 2>&1 | grep -c 'invalid JSON'; echo rc=\$?" \
+	"1
+rc=0\n" \
+	"" ""
+
+testing "jq bad path fails" \
+	"echo '{\"a\":1}' | jq '.a[' 2>&1; echo rc=\$?" \
+	"jq: bad path '.a['
+rc=1\n" \
+	"" ""
+
+testing "jq reads a file argument" \
+	"echo '{\"a\":\"file-val\"}' > jqt.json && jq -r '.a' jqt.json && rm -f jqt.json" \
+	"file-val\n" \
+	"" ""
+
+echo "jq: done"

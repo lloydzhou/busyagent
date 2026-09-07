@@ -1,0 +1,174 @@
+#!/bin/sh
+# testsuite/mcpc.tests - mcpc applet tests
+#
+# stdio transport runs a local echo MCP server (echo-mcp.tmp.sh); the HTTP
+# transport runs a busybox httpd CGI endpoint that speaks the same
+# JSON-RPC and returns a fixed Mcp-Session-Id so cross-invocation
+# session reuse can be asserted from the request log.
+
+. ./testing.sh
+
+HOME_FILTER='s|/[^ ]*mcpc[^ ]*|MCPC_HOME|g'
+
+# === stdio transport ================================================
+
+# self-contained stdio server (heredoc: no dependency on the source
+# tree - the runner executes us with the testsuite as cwd)
+cat > echo-mcp.tmp.sh <<'ECHO'
+#!/bin/sh
+while IFS= read -r line; do
+	method=$(printf '%s' "$line" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+	id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+	case "$method" in
+	initialize)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"echo-mcp","version":"1.0"}}}\n' "$id"
+		;;
+	notifications/*)
+		:   # notifications get no response
+		;;
+	tools/list)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back its arguments","inputSchema":{"type":"object","properties":{"msg":{"type":"string"}}}},{"name":"add","description":"add two numbers","inputSchema":{"type":"object"}}]}}\n' "$id"
+		;;
+	tools/call)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echo-called"}],"isError":false}}\n' "$id"
+		;;
+	ping)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+		;;
+	esac
+done
+ECHO
+chmod +x echo-mcp.tmp.sh
+
+rm -rf mc.home
+
+testing "mcpc without arguments shows usage" \
+	'mcpc 2>&1 | grep -c "Usage: mcpc" || true' \
+	"1\n" \
+	"" ""
+
+testing "mcpc connect spawns a stdio session (and the daemon)" \
+	'BA_HOME=$PWD/mc.home mcpc connect cmd:$PWD/echo-mcp.tmp.sh @echo 2>&1' \
+	"connected @echo\n" \
+	"" ""
+
+testing "mcpc ls shows the live session" \
+	'BA_HOME=$PWD/mc.home mcpc ls 2>&1 | grep -c "@echo.*stdio.*live"' \
+	"1\n" \
+	"" ""
+
+testing "mcpc tools-list lists cached tools" \
+	'BA_HOME=$PWD/mc.home mcpc @echo tools-list 2>&1 | tr -s " "' \
+	"echo echo back its arguments
+add add two numbers\n" \
+	"" ""
+
+testing "mcpc tools-get shows one schema" \
+	'BA_HOME=$PWD/mc.home mcpc @echo tools-get echo 2>&1 | grep -c "\"name\":\"echo\""' \
+	"1\n" \
+	"" ""
+
+testing "mcpc tools-call works over stdio" \
+	'BA_HOME=$PWD/mc.home mcpc @echo tools-call echo msg:=42 2>&1' \
+	'{"content":[{"type":"text","text":"echo-called"}],"isError":false}\n' \
+	"" ""
+
+testing "mcpc ping answers" \
+	'BA_HOME=$PWD/mc.home mcpc @echo ping 2>&1' \
+	"pong @echo\n" \
+	"" ""
+
+testing "mcpc grep searches cached tools" \
+	'BA_HOME=$PWD/mc.home mcpc grep numbers 2>&1 | tr -s " "' \
+	"echo add\n" \
+	"" ""
+
+testing "mcpc close drops the session, cache survives" \
+	'BA_HOME=$PWD/mc.home mcpc close @echo && BA_HOME=$PWD/mc.home mcpc @echo tools-list 2>&1 | head -1 | tr -s " "; BA_HOME=$PWD/mc.home mcpc @echo tools-call echo 2>&1 | grep -c "no live session" || true' \
+	"closed @echo
+echo echo back its arguments
+1\n" \
+	"" ""
+
+# === HTTP transport =================================================
+
+optional HTTPD FEATURE_HTTPD_CGI
+
+if [ -z "$SKIP" ]; then
+	ROOT=$PWD/mc.e2e
+	WEB=$ROOT/www
+	PORT=$((21000 + $$ % 20000))
+
+	rm -rf "$ROOT"
+	mkdir -p "$WEB/cgi-bin"
+
+	cat > "$WEB/cgi-bin/mcp" <<'CGI'
+#!/bin/sh
+# Streamable-HTTP MCP endpoint: reads one JSON-RPC body from stdin,
+# answers with a fixed session id header. Every request line is logged
+# with the session header the client sent.
+body=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
+method=$(printf '%s' "$body" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+echo "REQUEST method=$method sid=$HTTP_MCP_SESSION_ID" >> "__LOG__"
+printf 'Mcp-Session-Id: fixed-session-777\r\n'
+printf 'Content-Type: application/json\r\n\r\n'
+case "$method" in
+	initialize)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"web-mcp","version":"1.0"}}}' "$id"
+		;;
+	tools/list)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"web_search","description":"search the web","inputSchema":{"type":"object"}}]}}' "$id"
+		;;
+	tools/call)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"web-result"}]}}' "$id"
+		;;
+	*)
+		printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"nope"}}' "$id"
+		;;
+esac
+CGI
+	sed -i "s|__LOG__|$ROOT/requests.log|" "$WEB/cgi-bin/mcp"
+	chmod +x "$WEB/cgi-bin/mcp"
+
+	httpd -f -p "127.0.0.1:$PORT" -h "$WEB" >/dev/null 2>&1 &
+	HTTPD_PID=$!
+	sleep 1
+
+	testing "mcpc connect over streamable http" \
+		"BA_HOME=$PWD/mc.home mcpc connect http://127.0.0.1:$PORT/cgi-bin/mcp @web 2>&1" \
+		"connected @web\n" \
+		"" ""
+
+	testing "mcpc tools-call over http" \
+		"BA_HOME=$PWD/mc.home mcpc @web tools-call web_search q=hello 2>&1" \
+		'{"content":[{"type":"text","text":"web-result"}]}\n' \
+		"" ""
+
+	testing "mcpc keeps one session id across calls (daemon-held)" \
+		"grep -c 'sid=fixed-session-777' $ROOT/requests.log" \
+		"3\n" \
+		"" ""
+
+	kill $HTTPD_PID 2>/dev/null
+	rm -rf "$ROOT"
+else
+	echo "SKIPPED: mcpc http e2e (httpd/CGI not enabled)"
+fi
+
+# === daemon lifecycle ===============================================
+
+testing "mcpc daemon stop leaves no socket" \
+	'BA_HOME=$PWD/mc.home mcpc daemon stop 2>&1; ls $PWD/mc.home/mcpc/daemon.sock 2>&1 | grep -c "No such" || true' \
+	"daemon stopped
+1\n" \
+	"" ""
+
+testing "mcpc works again after a restart (implicit spawn)" \
+	'BA_HOME=$PWD/mc.home mcpc connect cmd:$PWD/echo-mcp.tmp.sh @echo2 2>&1 && BA_HOME=$PWD/mc.home mcpc daemon stop >/dev/null' \
+	"connected @echo2\n" \
+	"" ""
+
+rm -rf mc.home mc.e2e echo-mcp.tmp.sh
+
+echo "mcpc: done"

@@ -16,6 +16,7 @@
 //config:config BUSYAGENT
 //config:	bool "busyagent (223 kb)"
 //config:	default y
+//config:	select AGENTUTILS_COMMON
 //config:	select FEATURE_PREFER_APPLETS
 //config:	select FEATURE_EDITING
 //config:	select TLS

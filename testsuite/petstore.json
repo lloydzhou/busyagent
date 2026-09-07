@@ -1,0 +1,66 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "petstore",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "/cgi-bin/store"
+    }
+  ],
+  "paths": {
+    "/pets": {
+      "get": {
+        "operationId": "findPets",
+        "summary": "list pets by status",
+        "parameters": [
+          {"$ref": "#/components/parameters/Status"},
+          {
+            "name": "tags",
+            "in": "query",
+            "schema": {"type": "array", "items": {"type": "string"}}
+          }
+        ],
+        "responses": {"200": {"description": "ok"}}
+      },
+      "post": {
+        "operationId": "createPet",
+        "summary": "add a pet",
+        "requestBody": {
+          "content": {
+            "application/json": {"schema": {"type": "object"}}
+          }
+        },
+        "responses": {"200": {"description": "ok"}}
+      }
+    },
+    "/pets/{id}": {
+      "get": {
+        "operationId": "getPetById",
+        "summary": "one pet",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer", "format": "int64"}
+          }
+        ],
+        "responses": {"200": {"description": "ok"}}
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "Status": {
+        "name": "status",
+        "in": "query",
+        "schema": {
+          "type": "string",
+          "enum": ["available", "pending", "sold"]
+        }
+      }
+    }
+  }
+}
