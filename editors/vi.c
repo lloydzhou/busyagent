@@ -2685,21 +2685,25 @@ static void setops(char *args, int flg_no)
 static char *expand_args(char *args)
 {
 	char *s;
-	const char *replace;
 
 	args = xstrdup(args);
 	for (s = args; *s; s++) {
+		const char *replace;
 		unsigned n;
 
+//NB: vim 9.2 replaces "\%" with "%" _over entire string_,
+//then replaces "\c" with "c". Result:
+// "\%" is "%" (ok),
+// "\\" is "\" (ok),
+// "\\%" is "\%" (!!!), not "\CURFILE" as you would think.
+//We don't do that. Should we?
 		if (*s == '%') {
 			replace = current_filename;
 		} else if (*s == '#') {
 			replace = alt_filename;
 		} else {
 			if (*s == '\\' && s[1] != '\0') {
-				char *t;
-				for (t = s; *t; t++)
-					*t = t[1];
+				overlapping_strcpy(s, s + 1);
 				s++;
 			}
 			continue;

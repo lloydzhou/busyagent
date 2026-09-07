@@ -80,7 +80,7 @@ int matchpathcon_main(int argc UNUSED_PARAM, char **argv)
 	}
 
 	while ((path = *argv++) != NULL) {
-		security_context_t con;
+		char *con;
 		int rc;
 
 		if (!(opts & OPT_VERIFY)) {

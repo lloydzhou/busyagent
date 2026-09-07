@@ -3295,7 +3295,7 @@ static void o_addqchr(o_string *o, int ch)
 	/* '-' is included because of this case:
 	 * >filename0 >filename1 >filename9; v='-'; echo filename[0"$v"9]
 	 */
-	char *found = strchr("*?[-\\" MAYBE_BRACES, ch);
+	const char *found = strchr("*?[-\\" MAYBE_BRACES, ch);
 	if (found)
 		sz++;
 	o_grow_by(o, sz);
@@ -7183,9 +7183,9 @@ static NOINLINE int expand_one_var(o_string *output, int n, char *arg, char **pp
 	char *p;
 	char *var;
 	char exp_op;
-	char exp_save = exp_save; /* for compiler */
+	char UNINITIALIZED_VAR(exp_savech, exp_savech); /* for compiler */
 	char *exp_saveptr; /* points to expansion operator */
-	char *exp_word = exp_word; /* for compiler */
+	char *UNINITIALIZED_VAR(exp_word, NULL);  /* for compiler */
 	char arg0;
 
 	val = NULL;
@@ -7193,13 +7193,13 @@ static NOINLINE int expand_one_var(o_string *output, int n, char *arg, char **pp
 	p = *pp;
 	*p = '\0'; /* replace trailing SPECIAL_VAR_SYMBOL */
 	var = arg;
-	exp_saveptr = arg[1] ? strchr(VAR_ENCODED_SUBST_OPS, arg[1]) : NULL;
+	exp_saveptr = arg[1] ? (char*)strchr(VAR_ENCODED_SUBST_OPS, arg[1]) : NULL;
 	arg0 = arg[0];
 	arg[0] = (arg0 & 0x7f);
 	exp_op = 0;
 
 	if (arg[0] == '#' && arg[1] /* ${#...} but not ${#} */
-	 && (!exp_saveptr               /* and ( not(${#<op_char>...}) */
+	 && (!exp_saveptr               /* and ( not ${#<op_char>...} */
 	    || (arg[2] == '\0' && strchr(SPECIAL_VARS_STR, arg[1])) /* or ${#C} "len of $C" ) */
 	    )		/* NB: skipping ^^^specvar check mishandles ${#::2} */
 	) {
@@ -7217,7 +7217,7 @@ static NOINLINE int expand_one_var(o_string *output, int n, char *arg, char **pp
 			/* ${?}, ${var}, ${var:0}, ${var[:]%0} etc */
 			exp_saveptr = var+1 + strcspn(var+1, VAR_ENCODED_SUBST_OPS);
 		}
-		exp_op = exp_save = *exp_saveptr;
+		exp_op = exp_savech = *exp_saveptr;
 		if (exp_op) {
 			exp_word = exp_saveptr + 1;
 			if (exp_op == ':') {
@@ -7514,11 +7514,11 @@ static NOINLINE int expand_one_var(o_string *output, int n, char *arg, char **pp
 			 * $ x=; f "${x:-'x y' z}"
 			 * |'x y' z|
 			 */
-			int use_word = (!val || ((exp_save == ':') && !val[0]));
+			int use_word = (!val || ((exp_savech == ':') && !val[0]));
 			if (exp_op == '+')
 				use_word = !use_word;
 			debug_printf_expand("expand: op:%c (null:%s) test:%i\n", exp_op,
-					(exp_save == ':') ? "true" : "false", use_word);
+					(exp_savech == ':') ? "true" : "false", use_word);
 			if (use_word) {
 				if (exp_op == '+' || exp_op == '-') {
 					/* ${var+word} - use alternative value */
@@ -7545,7 +7545,7 @@ static NOINLINE int expand_one_var(o_string *output, int n, char *arg, char **pp
 							? exp_word
 							: "parameter null or not set"
 							/* ash has more specific messages, a-la: */
-							/*: (exp_save == ':' ? "parameter null or not set" : "parameter not set")*/
+							/*: (exp_savech == ':' ? "parameter null or not set" : "parameter not set")*/
 						);
 //TODO: how interactive bash aborts expansion mid-command?
 //It aborts the entire line, returns to prompt:
@@ -7571,7 +7571,7 @@ static NOINLINE int expand_one_var(o_string *output, int n, char *arg, char **pp
 			}
 		} /* one of "-=+?" */
 
-		*exp_saveptr = exp_save;
+		*exp_saveptr = exp_savech;
 	} /* if (exp_op) */
 
 	arg[0] = arg0;

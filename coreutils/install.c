@@ -73,7 +73,7 @@ static const char install_longopts[] ALIGN1 =
 static void setdefaultfilecon(const char *path)
 {
 	struct stat s;
-	security_context_t scontext = NULL;
+	char *scontext = NULL;
 
 	if (!is_selinux_enabled()) {
 		return;
@@ -119,7 +119,7 @@ int install_main(int argc, char **argv)
 	int ret = EXIT_SUCCESS;
 	int isdir;
 #if ENABLE_SELINUX
-	security_context_t scontext;
+	char *scontext;
 	bool use_default_selinux_context = 1;
 #endif
 	enum {

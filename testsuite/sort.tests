@@ -114,6 +114,16 @@ aa.2
 ab.1
 " ""
 
+testing "sort with ENDCHAR on a later field" "sort -t: -k2.1,2.1 input" "\
+a:aa
+b:aa
+a:ba
+" "\
+b:aa
+a:ba
+a:aa
+" ""
+
 testing "glibc build sort" "sort -t. -k 1,1 -k 2n,2n -k 3 input" "\
 GLIBC_2.1
 GLIBC_2.1.1

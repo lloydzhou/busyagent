@@ -428,7 +428,7 @@ static int writeTarHeader(struct TarBallInfo *tbInfo,
 		/* GNU "tar cvvf" prints "extended" listing a-la "ls -l" */
 		/* We don't have such excesses here: for us "v" == "vv" */
 		/* '/' is probably a GNUism */
-		fprintf(vbFd, "%s%s\n", header_name,
+		fprintf(vbFd, "%s%s\n", printable_string(header_name),
 				S_ISDIR(statbuf->st_mode) ? "/" : "");
 	}
 

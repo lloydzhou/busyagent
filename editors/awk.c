@@ -967,20 +967,64 @@ static double my_strtod_or_hexoct(char **pp)
 
 /* -------- working with variables (set/get/copy/etc) -------- */
 
+/* Perform OFMT or CONVFMT float-to-string conversion.
+ * According to POSIX, awk's behavior is undefined if OFMT
+ * contains anything but a floating-point conversion specification.
+ * However, GNU awk 5.3.0 allows prefix and suffix: "N:%.1f!"
+ * integer formats (%d et al), %s formats.
+ * It even allows %c, but we don't implement this.
+ * GNU awk also supports %ld, %lx, we don't (yet). GNU awk doesn't support %lld.
+ */
 static const char *fmt_num(const char *format, double n)
 {
-	if (n == (long long)n) {
-		snprintf(g_buf, MAXVARFMT, "%lld", (long long)n);
+	if (n == trunc(n)) {
+		/* No fractionals? Try: awk -v OFMT='R:%d!' 'BEGIN { print 2**128 }' */
+		snprintf(g_buf, MAXVARFMT, "%.0f", n);
 	} else {
 		const char *s = format;
 		char c;
 
-		do { c = *s; } while (c && *++s);
+		/* Find %SPEC in format string */
+		for (;;) {
+			s = strchr(s, '%');
+			if (!s)
+				goto print_verbatim;
+			if (s[1] != '%')
+				break;
+			s += 2;  /* skip "%%" */
+		}
+		if (strchr(s + 1, '%') != NULL)
+//TODO: allow "%%"s in the suffix too?
+			goto INV_FMT; /* more than one %SPEC */
+
+//TODO: factor out awk_printf machinery to make %d print large numbers too. Example:
+// awk -v OFMT='R:%d!' 'BEGIN { print 184467440737095.1 }'
+// R:184467440737095!
+		/* Find the format letter */
+		for (;;) {
+			c = *++s;
+			if (!c) /* unterminated "....%SPEC" */
+				goto print_verbatim;
+			if (c == '*')
+				goto INV_FMT; /* CONVFMT/OFMT='%*f' is not allowed */
+			if (isalpha(c))
+				break;
+		}
+
 		if (strchr("diouxX", c)) {
 			snprintf(g_buf, MAXVARFMT, format, (int)n);
 		} else if (strchr("eEfFgGaA", c)) {
+ print_verbatim:
 			snprintf(g_buf, MAXVARFMT, format, n);
+		} else if (c == 's') {
+			/* GNU awk OFMT="%..s" formats number through "%.6g",
+			 * then prints string through %s:
+			 */
+			char nbuf[sizeof(n)*3 + 12]; /* +5 should do? +12 is paranoia */
+			sprintf(nbuf, "%.6g", n);
+			snprintf(g_buf, MAXVARFMT, format, nbuf);
 		} else {
+ INV_FMT:
 			syntax_error(EMSG_INV_FMT);
 		}
 	}
@@ -2507,6 +2551,7 @@ static char *awk_printf(node *n, size_t *len)
 				}
 				goto tail; /* append remaining string, exit loop */
 			}
+//TODO: GNU awk 5.3.0 also supports %ld, %lx, we don't (yet). It does not support %lld.
 			if (isalpha(c))
 				break;
 			starred |= (c == '*');
@@ -3307,8 +3352,7 @@ static var *evaluate(node *op, var *res)
 					for (;;) {
 						var *v = evaluate(nextarg(&op1), TMPVAR0);
 						if (v->type & VF_NUMBER) {
-							fputs(fmt_num(getvar_s(intvar[OFMT]), getvar_i(v)),
-								F);
+							fputs(fmt_num(getvar_s(intvar[OFMT]), getvar_i(v)), F);
 						} else {
 							fputs(getvar_s(v), F);
 						}

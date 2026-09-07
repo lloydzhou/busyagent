@@ -62,13 +62,13 @@ static context_t runcon_compute_new_context(char *user, char *role, char *type, 
 			char *command, int compute_trans)
 {
 	context_t con;
-	security_context_t cur_context;
+	char *cur_context;
 
 	if (getcon(&cur_context))
 		bb_simple_error_msg_and_die("can't get current context");
 
 	if (compute_trans) {
-		security_context_t file_context, new_context;
+		char *file_context, *new_context;
 
 		if (getfilecon(command, &file_context) < 0)
 			bb_error_msg_and_die("can't retrieve attributes of '%s'",

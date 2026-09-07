@@ -156,7 +156,7 @@ int id_main(int argc UNUSED_PARAM, char **argv)
 	const char *prefix;
 	const char *username;
 #if ENABLE_SELINUX
-	security_context_t scontext = NULL;
+	char *scontext = NULL;
 #endif
 
 	if (ENABLE_GROUPS && (!ENABLE_ID || applet_name[0] == 'g')) {

@@ -469,7 +469,8 @@ static int at_end(void)
  */
 static void read_lines(void)
 {
-	int ndelay_set, eagain, fdflags;
+	int ndelay_set, eagain;
+	int UNINITIALIZED_VAR(fdflags, fdflags);
 	char *current_line, *p;
 	int w = width;
 	char last_terminated = terminated;
@@ -501,16 +502,16 @@ static void read_lines(void)
 	// Consider these cases:
 	// "less FILE": can set O_NONBLOCK on open.
 	// "true | less": can't.
-	// " { less; cat; } <FILE": can't. And must not confuse cat.
+	// "{ less; cat; } <FILE": can't. And must not confuse cat.
 	ndelay_set = -1; // "don't know whether stdin is nonblocking"
 	eagain = 0;
 
-	while (1) { /* read lines until we reach cur_fline or wanted_match */
+	while (1) { // read lines until we reach cur_fline or wanted_match
 		*p = '\0';
 		terminated = 0;
-		while (1) { /* read chars until we have a line */
+		while (1) { // read chars until we have a line
 			char c;
-			/* if no unprocessed chars left, eat more */
+			// if no unprocessed chars left, eat more
 			if (readpos >= read_size) {
 				// Read stdin, temporarily make it nonblocking (if it's not already)
 				if (ndelay_set < 0) {

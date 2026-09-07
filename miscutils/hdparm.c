@@ -552,7 +552,7 @@ static void print_ascii(const char *p, int length)
 
 	length *= 2;
 	/* find first non-space & print it */
-	while (length && p[ofs] != ' ') {
+	while (length && p[ofs] == ' ') {
 		p++;
 		LE_ONLY(ofs = -ofs;)
 		length--;
