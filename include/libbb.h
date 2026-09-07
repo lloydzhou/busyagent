@@ -1886,10 +1886,10 @@ void getcaps(void *caps) FAST_FUNC;
 
 #if ENABLE_SELINUX
 extern void renew_current_security_context(void) FAST_FUNC;
-extern void set_current_security_context(security_context_t sid) FAST_FUNC;
-extern context_t set_security_context_component(security_context_t cur_context,
+extern void set_current_security_context(char *sid) FAST_FUNC;
+extern context_t set_security_context_component(char *cur_context,
 						char *user, char *role, char *type, char *range) FAST_FUNC;
-extern void setfscreatecon_or_die(security_context_t scontext) FAST_FUNC;
+extern void setfscreatecon_or_die(char *scontext) FAST_FUNC;
 extern void selinux_preserve_fcontext(int fdesc) FAST_FUNC;
 #else
 #define selinux_preserve_fcontext(fdesc) ((void)0)

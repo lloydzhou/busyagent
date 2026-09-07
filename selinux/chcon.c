@@ -67,8 +67,8 @@ static int FAST_FUNC change_filedir_context(struct recursive_state *state UNUSED
 		struct stat *stbuf UNUSED_PARAM)
 {
 	context_t context = NULL;
-	security_context_t file_context = NULL;
-	security_context_t context_string;
+	char *file_context = NULL;
+	const char *context_string;
 	int rc = FALSE;
 	int status = 0;
 

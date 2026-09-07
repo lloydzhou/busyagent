@@ -18,7 +18,7 @@
 #if ENABLE_SELINUX
 static void check_selinux_update_passwd(const char *username)
 {
-	security_context_t seuser;
+	char *seuser;
 	char *p;
 
 	if (getuid() != (uid_t)0 || is_selinux_enabled() == 0)

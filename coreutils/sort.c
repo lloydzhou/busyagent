@@ -163,13 +163,18 @@ static char *get_key(char *str, struct sort_key *key, int flags)
 		/* Loop through fields */
 		else {
 			unsigned char ch = 0;
+			/* -kSTART,N.ENDCHAR: stop at the start of field N instead
+			 * of its end, ENDCHAR below is an offset from there */
+			unsigned fields = key->range[2*j] + j;
+			if (j && key->range[3])
+				fields--;
 
 			end = 0;
-			for (i = 1; i < key->range[2*j] + j; i++) {
+			for (i = 1; i < fields; i++) {
 				if (key_separator) {
 					/* Skip body of key and separator */
 					while ((ch = str[end]) != '\0') {
-							end++;
+						end++;
 						if (ch == key_separator)
 							break;
 					}
@@ -186,9 +191,9 @@ static char *get_key(char *str, struct sort_key *key, int flags)
 				}
 			}
 			/* Remove last delim: "abc:def:" => "abc:def" */
-			if (j && ch) {
+			if (j && ch && !key->range[3]) {
 				//if (str[end-1] != key_separator)
-				//  bb_error_msg(_and_die("BUG! "
+				//  bb_error_msg_and_die("BUG! "
 				//  "str[start:%d,end:%d]:'%.*s'",
 				//  start, end, (int)(end-start), &str[start]);
 				end--;
@@ -203,9 +208,11 @@ static char *get_key(char *str, struct sort_key *key, int flags)
 	/* Strip trailing whitespace if necessary */
 	if (flags & FLAG_bb)
 		while (end > start && isspace(str[end-1])) end--;
-	/* -kSTART,N.ENDCHAR: honor ENDCHAR (1-based) */
+	/* -kSTART,N.ENDCHAR: honor ENDCHAR (1-based), counted from the
+	 * start of field N, which the loop above stopped at
+	 */
 	if (key->range[3]) {
-		end = key->range[3];
+		end += key->range[3];
 		if (end > len) end = len;
 	}
 	/* -kN.STARTCHAR[,...]: honor STARTCHAR (1-based) */

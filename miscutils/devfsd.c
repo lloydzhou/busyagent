@@ -1016,9 +1016,9 @@ static void restore(char *spath, struct stat source_stat, int rootlen)
 	dest_stat.st_mode = 0;
 	dpath = concat_path_file(mount_point, spath + rootlen);
 	lstat(dpath, &dest_stat);
-	free(dpath);
 	if (S_ISLNK(source_stat.st_mode) || (source_stat.st_mode & S_ISVTX))
 		copy_inode(dpath, &dest_stat, (source_stat.st_mode & ~S_ISVTX), spath, &source_stat);
+	free(dpath);
 
 	if (S_ISDIR(source_stat.st_mode))
 		dir_operation(RESTORE, spath, rootlen, NULL);
@@ -1271,7 +1271,7 @@ static void dir_operation(int type, const char * dir_name, int var, unsigned lon
 
 	while ((de = readdir(dp)) != NULL) {
 
-		if (de->d_name && DOT_OR_DOTDOT(de->d_name))
+		if (DOT_OR_DOTDOT(de->d_name))
 			continue;
 		path = concat_path_file(dir_name, de->d_name);
 		if (lstat(path, &statbuf) == 0) {

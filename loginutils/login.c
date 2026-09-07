@@ -181,9 +181,9 @@ static void die_if_nologin(void)
 
 #if ENABLE_SELINUX
 static void initselinux(char *username, char *full_tty,
-						security_context_t *user_sid)
+						char **user_sid)
 {
-	security_context_t old_tty_sid, new_tty_sid;
+	char *old_tty_sid, *new_tty_sid;
 
 	if (!is_selinux_enabled())
 		return;
@@ -333,7 +333,7 @@ int login_main(int argc UNUSED_PARAM, char **argv)
 	char *opt_user = opt_user; /* for compiler */
 	char *full_tty;
 	char *short_tty;
-	IF_SELINUX(security_context_t user_sid = NULL;)
+	IF_SELINUX(char *user_sid = NULL;)
 #if ENABLE_PAM
 	int pamret;
 	pam_handle_t *pamh;

@@ -49,8 +49,8 @@ static void mkswap_selinux_setcontext(int fd, const char *path)
 
 	xfstat(fd, &stbuf, path);
 	if (S_ISREG(stbuf.st_mode)) {
-		security_context_t newcon;
-		security_context_t oldcon = NULL;
+		const char *newcon;
+		char *oldcon = NULL;
 		context_t context;
 
 		if (fgetfilecon(fd, &oldcon) < 0) {

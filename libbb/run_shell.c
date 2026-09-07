@@ -33,14 +33,14 @@
 #endif
 
 #if ENABLE_SELINUX
-static security_context_t current_sid;
+static char *current_sid;
 
 void FAST_FUNC renew_current_security_context(void)
 {
 	freecon(current_sid);  /* Release old context  */
 	getcon(&current_sid);  /* update */
 }
-void FAST_FUNC set_current_security_context(security_context_t sid)
+void FAST_FUNC set_current_security_context(char *sid)
 {
 	freecon(current_sid);  /* Release old context  */
 	current_sid = sid;

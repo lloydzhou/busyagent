@@ -311,7 +311,7 @@ struct dnode {
 	const char *name;       /* usually basename, but think "ls -l dir/file" */
 	const char *fullname;   /* full name (usable for stat etc) */
 	struct dnode *dn_next;  /* for linked list */
-	IF_SELINUX(security_context_t sid;)
+	IF_SELINUX(char *sid;)
 	smallint fname_allocated;
 
 	/* Used to avoid re-doing [l]stat at printout stage

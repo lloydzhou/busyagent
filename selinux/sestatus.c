@@ -92,7 +92,7 @@ static void read_config(char **pc, int npc, char **fc, int nfc)
 
 static void display_verbose(void)
 {
-	security_context_t con, _con;
+	char *con, *_con;
 	char *fc[50], *pc[50], *cterm;
 	pid_t *pidList;
 	int i;

@@ -9,7 +9,7 @@
 #include "libbb.h"
 #include <selinux/context.h>
 
-context_t FAST_FUNC set_security_context_component(security_context_t cur_context,
+context_t FAST_FUNC set_security_context_component(char *cur_context,
 			char *user, char *role, char *type, char *range)
 {
 	context_t con = context_new(cur_context);
@@ -31,7 +31,7 @@ error:
 	return NULL;
 }
 
-void FAST_FUNC setfscreatecon_or_die(security_context_t scontext)
+void FAST_FUNC setfscreatecon_or_die(char *scontext)
 {
 	if (setfscreatecon(scontext) < 0) {
 		/* Can be NULL. All known printf implementations
@@ -43,7 +43,7 @@ void FAST_FUNC setfscreatecon_or_die(security_context_t scontext)
 
 void FAST_FUNC selinux_preserve_fcontext(int fdesc)
 {
-	security_context_t context;
+	char *context;
 
 	if (fgetfilecon(fdesc, &context) < 0) {
 		if (errno == ENODATA || errno == ENOTSUP)

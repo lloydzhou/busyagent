@@ -75,7 +75,7 @@ testing "awk %.3d 99999999999999000.1234" \
 testing "awk %.*d 3 99999999999999000.1234" \
 "awk 'BEGIN { printf \"%.*d\n\", 3, 99999999999999000.1234; }'" "99999999999999008\n" "" ""
 
-# fractioals are rounded towards 0
+# fractionals are rounded towards 0
 testing "awk %d -1.9" \
 "awk 'BEGIN { printf \"%d\n\", -1.9; }'" "-1\n" "" ""
 testing "awk %u -1.9" \
@@ -84,6 +84,31 @@ testing "awk %x -1.9" \
 "awk 'BEGIN { printf \"%x\n\", -1.9; }'" "ffffffffffffffff\n" "" ""
 testing "awk %o -1.9" \
 "awk 'BEGIN { printf \"%o\n\", -1.9; }'" "1777777777777777777777\n" "" ""
+
+# OFMT can contain literals before and after %SPEC:
+testing "awk OFMT='R%%:%f!' -1.9" \
+"awk -v OFMT='R%%:%f!' 'BEGIN { print -1.9; }'" "R%:-1.900000!\n" "" ""
+
+# OFMT is ignored if the value has no fractionals (even if it does not fit into uint64)
+testing "awk OFMT='R%%:%f!' 2**128" \
+"awk -v OFMT='R%%:%f!' 'BEGIN { print 2**128; }'" "340282366920938463463374607431768211456\n" "" ""
+testing "awk OFMT='R%%:%f!' 2**128" \
+"awk -v OFMT='R%%:%f!' 'BEGIN { print -2**129; }'" "-680564733841876926926749214863536422912\n" "" ""
+
+# OFMT can contain no %SPEC (be a literal):
+testing "awk OFMT='No formats, %% allowed!'" \
+"awk -v OFMT='No formats, %% allowed!' 'BEGIN { print -1.9; }'" "No formats, % allowed!\n" "" ""
+
+# OFMT can't have more than one %SPEC:
+testing "awk OFMT='%f%s' is not allowed" \
+"awk -v OFMT='R%%:%f!%s!' 'BEGIN { print -1.9; }' 2>&1" \
+"awk: cmd. line:1: Invalid format specifier\n" "" ""
+
+# OFMT %s:
+testing "awk OFMT='%-22s' -1.9" \
+"awk -v OFMT='R:%-22s!' 'BEGIN { print -1.9; }'" \
+"R:-1.9                  !\n" "" ""
+
 
 # 4294967295 = 0xffffffff
 testing "awk bitwise op" "awk '{ print or(4294967295,1) }'" "4294967295\n" "" "\n"

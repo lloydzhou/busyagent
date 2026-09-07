@@ -26,7 +26,7 @@ mode_t FAST_FUNC getopt_mk_fifo_nod(char **argv)
 	mode_t mode = 0666;
 	char *smode = NULL;
 #if ENABLE_SELINUX
-	security_context_t scontext;
+	char *scontext;
 #endif
 	int opt;
 	opt = getopt32(argv, "m:" IF_SELINUX("Z:"), &smode IF_SELINUX(,&scontext));

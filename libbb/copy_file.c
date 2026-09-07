@@ -118,10 +118,10 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
 
 #if ENABLE_SELINUX
 	if ((flags & FILEUTILS_PRESERVE_SECURITY_CONTEXT) && is_selinux_enabled() > 0) {
-		security_context_t con;
+		char *con;
 		if (lgetfilecon(source, &con) >= 0) {
 			if (setfscreatecon(con) < 0) {
-				bb_perror_msg("can't set setfscreatecon %s", con);
+				bb_perror_msg("can't setfscreatecon %s", con);
 				freecon(con);
 				return -1;
 			}
@@ -327,7 +327,7 @@ int FAST_FUNC copy_file(const char *source, const char *dest, int flags)
 		if ((flags & (FILEUTILS_PRESERVE_SECURITY_CONTEXT|FILEUTILS_SET_SECURITY_CONTEXT))
 		 && is_selinux_enabled() > 0
 		) {
-			security_context_t con;
+			char *con;
 			if (getfscreatecon(&con) == -1) {
 				bb_simple_perror_msg("getfscreatecon");
 				return -1;

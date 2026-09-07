@@ -467,7 +467,7 @@ IF_FEATURE_FIND_INUM(   ACTS(inum,  ino_t inode_num;))
 IF_FEATURE_FIND_SAMEFILE(ACTS(samefile, ino_t inode_num; dev_t device;))
 IF_FEATURE_FIND_USER(   ACTS(user,  uid_t uid;))
 IF_FEATURE_FIND_SIZE(   ACTS(size,  char size_char; off_t size;))
-IF_FEATURE_FIND_CONTEXT(ACTS(context, security_context_t context;))
+IF_FEATURE_FIND_CONTEXT(ACTS(context, char *context;))
 IF_FEATURE_FIND_PAREN(  ACTS(paren, action ***subexpr;))
 IF_FEATURE_FIND_PRUNE(  ACTS(prune))
 IF_FEATURE_FIND_QUIT(   ACTS(quit))
@@ -983,7 +983,7 @@ ACTF(empty)
 #if ENABLE_FEATURE_FIND_CONTEXT
 ACTF(context)
 {
-	security_context_t con;
+	char *con;
 	int rc;
 
 	if (G.recurse_flags & ACTION_FOLLOWLINKS) {

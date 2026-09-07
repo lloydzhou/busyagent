@@ -57,7 +57,7 @@ int mkdir_main(int argc UNUSED_PARAM, char **argv)
 	unsigned opt;
 	char *smode;
 #if ENABLE_SELINUX
-	security_context_t scontext;
+	char *scontext;
 #endif
 
 	opt = getopt32long(argv, "m:pv" IF_SELINUX("Z:"),

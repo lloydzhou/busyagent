@@ -151,6 +151,21 @@
 # endif
 #endif
 
+/* Somewhere after gcc-9, it stopped recognizing "int var = var;" initializer
+ * as the "this variable is intentionally not initialized, don't warn" idiom.
+ */
+#if !__GNUC_PREREQ(10,0)
+# define UNINITIALIZED_VAR(var,zero) var = var
+#else
+# define UNINITIALIZED_VAR(var,zero) var = zero
+/* NB: in case newer gcc is able to see that the variable
+ * is never used before initialization on all possible code paths,
+ * you can use int UNINITIALIZED_VAR(var,var);
+ * instead of  int UNINITIALIZED_VAR(var,0);
+ * and avoid having extra zeroing instruction.
+ */
+#endif
+
 
 /* ---- Endian Detection ------------------------------------ */
 
