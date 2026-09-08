@@ -285,6 +285,80 @@ testing "oapi dry-run masks credential headers" \
 	"GET https://petstore.example.io/v2/pet/1\n  Authorization: Bearer ***\n  X-Api-Key: ***\n  X-Amz-Key: ***\n  X-Custom-Info: keep-me\n" \
 	"" ""
 
-rm -rf oa.home swagger2.tmp.json
+# === review-fix coverage =============================================
+
+# masking matrix: underscore and key-id variants masked at any name
+# length; auth-ish and consent headers are NOT credentials
+testing "oapi masking covers apikey spellings, spares look-alikes" \
+	'BA_HOME=$PWD/oa.home oapi s2 get-pet 1 --header "apikey: v1" --header "X_SOME_Very_Long_Header_API_Token: v2" --header "X-Access-Key-Id: v3" --header "X-Auth-Request-User: bob" --header "X-Cookie-Consent: yes" --dry-run 2>&1' \
+	"GET https://petstore.example.io/v2/pet/1\n  apikey: ***\n  X_SOME_Very_Long_Header_API_Token: ***\n  X-Access-Key-Id: ***\n  X-Auth-Request-User: bob\n  X-Cookie-Consent: yes\n" \
+	"" ""
+
+# sensitive query values are masked in the dry-run request line
+cat > q.tmp.json <<'SPEC'
+{"openapi":"3.0.0","servers":[{"url":"https://api.example.io"}],
+ "paths":{"/x":{"get":{"operationId":"gx",
+  "parameters":[{"name":"api_key","in":"query","schema":{"type":"string"}},
+                {"name":"limit","in":"query","schema":{"type":"integer"}}],
+  "responses":{}}}}}
+SPEC
+testing "oapi dry-run masks sensitive query values" \
+	'BA_HOME=$PWD/oa.home oapi connect q $PWD/q.tmp.json >/dev/null && BA_HOME=$PWD/oa.home oapi q gx --api-key hush --limit 5 --dry-run 2>&1' \
+	"GET https://api.example.io/x?api_key=***&limit=5\n" \
+	"" ""
+
+# an option-looking token after --body/--jq/-o is a missing value, not
+# a swallowed --dry-run that would put the request on the wire
+testing "oapi --body followed by an option is rejected" \
+	'BA_HOME=$PWD/oa.home oapi s2 get-pet 1 --body --dry-run 2>&1; echo rc=$?' \
+	"oapi: missing value for --body
+rc=1\n" \
+	"" ""
+
+testing "oapi --jq followed by an option is rejected" \
+	'BA_HOME=$PWD/oa.home oapi s2 get-pet 1 --jq --dry-run 2>&1; echo rc=$?' \
+	"oapi: missing value for --jq
+rc=1\n" \
+	"" ""
+
+testing "oapi -o validates its value" \
+	'BA_HOME=$PWD/oa.home oapi s2 get-pet 1 -o xml --dry-run 2>&1; echo rc=$?' \
+	"oapi: -o supports 'text' only
+rc=1\n" \
+	"" ""
+
+# a relative servers url is fine to display but must not be dialed
+cat > rel.tmp.json <<'SPEC'
+{"openapi":"3.0.0","servers":[{"url":"/svc"}],
+ "paths":{"/x":{"get":{"operationId":"gx","responses":{}}}}}
+SPEC
+testing "oapi refuses to send against a relative servers url" \
+	'BA_HOME=$PWD/oa.home oapi connect rel $PWD/rel.tmp.json >/dev/null && BA_HOME=$PWD/oa.home oapi rel gx 2>&1; echo rc=$?' \
+	"oapi: base url '/svc/x' is not absolute (relative servers url; dry-run only)
+rc=1\n" \
+	"" ""
+
+# kebab-case conversion must split acronym boundaries
+cat > acr.tmp.json <<'SPEC'
+{"openapi":"3.0.0","servers":[{"url":"https://api.example.io"}],
+ "paths":{"/u":{"get":{"operationId":"getURLValue","responses":{}}},
+          "/s":{"get":{"operationId":"getHTTPStatusCode","responses":{}}}}}
+SPEC
+testing "oapi kebab-case splits acronym boundaries" \
+	'BA_HOME=$PWD/oa.home oapi connect acr $PWD/acr.tmp.json >/dev/null && BA_HOME=$PWD/oa.home oapi acr get-url-value --dry-run 2>&1 && BA_HOME=$PWD/oa.home oapi acr get-http-status-code --dry-run 2>&1' \
+	"GET https://api.example.io/u
+GET https://api.example.io/s\n" \
+	"" ""
+
+# dry-run connect shows what would be fetched without fetching it
+# (192.0.2.1 is TEST-NET-1: a real fetch would hang, not return)
+testing "oapi --dry-run connect does not fetch" \
+	'BA_HOME=$PWD/oa.home oapi --dry-run connect phantom https://192.0.2.1/spec.json 2>&1; echo rc=$?' \
+	"GET https://192.0.2.1/spec.json
+  connect phantom
+rc=0\n" \
+	"" ""
+
+rm -rf oa.home swagger2.tmp.json q.tmp.json acr.tmp.json rel.tmp.json
 
 exit $FAILCOUNT

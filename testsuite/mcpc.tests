@@ -31,10 +31,20 @@ while IFS= read -r line; do
 		printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back its arguments","inputSchema":{"type":"object","properties":{"msg":{"type":"string"}}}},{"name":"add","description":"add two numbers","inputSchema":{"type":"object"}}]}}\n' "$id"
 		;;
 	tools/call)
-		printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echo-called"}],"isError":false}}\n' "$id"
+		case "$line" in
+		*'"name":"nope"'*)
+			printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"tool not found"}}\n' "$id"
+			;;
+		*)
+			printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echo-called"}],"isError":false}}\n' "$id"
+			;;
+		esac
 		;;
 	ping)
 		printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+		;;
+	*)
+		printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"unknown method %s"}}\n' "$id" "$method"
 		;;
 	esac
 done
@@ -100,6 +110,97 @@ testing "mcpc connect --protocol-version reaches the handshake" \
 testing "mcpc grep searches cached tools" \
 	'BA_HOME=$PWD/mc.home mcpc grep numbers 2>&1 | tr -s " "' \
 	"echo add\n" \
+	"" ""
+
+# === review-fix coverage (stdio) =====================================
+
+# the embedded echo server answers unknown tools with a JSON-RPC error
+# (same as testsuite/echo-mcp.sh); the CLI surfaces it
+testing "mcpc surfaces a JSON-RPC error from the server" \
+	'BA_HOME=$PWD/mc.home mcpc @echo tools-call nope 2>&1; echo rc=$?' \
+	'{"code":-32601,"message":"tool not found"}
+rc=1\n' \
+	"" ""
+
+# a 20 KB tools/list must come through connect and tools-list intact
+cat > echo-big.tmp.sh <<'ECHO'
+#!/bin/sh
+while IFS= read -r line; do
+	method=$(printf '%s' "$line" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+	id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+	case "$method" in
+	initialize)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"big","version":"1.0"}}}\n' "$id"
+		;;
+	notifications/*)
+		:
+		;;
+	tools/list)
+		desc=$(awk 'BEGIN{for(i=0;i<20000;i++)printf "x"}')
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"t1","description":"%s"}]}}\n' "$id" "$desc"
+		;;
+	*)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+		;;
+	esac
+done
+ECHO
+chmod +x echo-big.tmp.sh
+
+testing "mcpc connects through a 20 KB tools/list" \
+	'BA_HOME=$PWD/mc.home mcpc connect cmd:$PWD/echo-big.tmp.sh @big 2>&1 && BA_HOME=$PWD/mc.home mcpc @big tools-list 2>&1 | wc -c' \
+	"connected @big
+20026\n" \
+	"" ""
+
+# with the cache deleted, tools-list falls back to the daemon's copy
+testing "mcpc tools-list daemon fallback carries the full array" \
+	'rm -f mc.home/mcpc/servers/big.json && BA_HOME=$PWD/mc.home mcpc @big tools-list 2>&1 | wc -c' \
+	"20026\n" \
+	"" ""
+
+# a session whose server exits must drop out of ls (not linger dead)
+cat > echo-die.tmp.sh <<'ECHO'
+#!/bin/sh
+n=0
+while IFS= read -r line; do
+	n=$((n+1))
+	method=$(printf '%s' "$line" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+	id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+	case "$method" in
+	initialize)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"die","version":"1.0"}}}\n' "$id"
+		;;
+	notifications/*)
+		:
+		;;
+	tools/list)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id"
+		;;
+	*)
+		printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+		;;
+	esac
+	if [ "$n" -ge 4 ]; then exit 0; fi
+done
+ECHO
+chmod +x echo-die.tmp.sh
+
+testing "mcpc retires a session whose server died" \
+	'BA_HOME=$PWD/mc.home mcpc connect cmd:$PWD/echo-die.tmp.sh @doomed >/dev/null 2>&1; BA_HOME=$PWD/mc.home mcpc @doomed tools-call nope >/dev/null 2>&1; BA_HOME=$PWD/mc.home mcpc @doomed tools-call nope >/dev/null 2>&1; BA_HOME=$PWD/mc.home mcpc @doomed tools-call nope >/dev/null 2>&1; BA_HOME=$PWD/mc.home mcpc ls 2>&1 | grep -c "@doomed" || true' \
+	"0\n" \
+	"" ""
+
+# names with quotes stay valid JSON in ls --json
+testing "mcpc ls --json escapes a quoted session name" \
+	'BA_HOME=$PWD/mc.home mcpc connect cmd:$PWD/echo-mcp.tmp.sh "@we\"ird" >/dev/null 2>&1 && BA_HOME=$PWD/mc.home mcpc ls --json 2>&1 | grep -cF "name\":\"we\\\"ird" || true' \
+	"1\n" \
+	"" ""
+
+# removing the socket of a live daemon must self-heal on the next command
+testing "mcpc recovers when the daemon socket is removed" \
+	'BA_HOME=$PWD/mc.home mcpc connect cmd:$PWD/echo-mcp.tmp.sh @base >/dev/null 2>&1 && rm -f mc.home/mcpc/daemon.sock && BA_HOME=$PWD/mc.home mcpc ls >/dev/null 2>&1 && BA_HOME=$PWD/mc.home mcpc connect cmd:$PWD/echo-mcp.tmp.sh @echo >/dev/null 2>&1; test $(cat mc.home/mcpc/daemon.pid) -gt 0 && echo pidfile-ok' \
+	"pidfile-ok\n" \
 	"" ""
 
 testing "mcpc close drops the session, cache survives" \
@@ -169,6 +270,66 @@ CGI
 		"3\n" \
 		"" ""
 
+	# a server that answers notifications with 5xx fails the connect:
+	# success is judged by the HTTP status, not by the empty body
+	cat > "$WEB/cgi-bin/mcp500" <<'CGI500'
+#!/bin/sh
+body=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
+method=$(printf '%s' "$body" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+case "$method" in
+	notifications/*)
+		printf 'Status: 500 Internal Server Error\r\n\r\n'
+		;;
+	*)
+		printf 'Mcp-Session-Id: s500\r\n'
+		printf 'Content-Type: application/json\r\n\r\n'
+		printf '{"jsonrpc":"2.0","id":1,"result":{}}'
+		;;
+esac
+CGI500
+	chmod +x "$WEB/cgi-bin/mcp500"
+
+	testing "mcpc http notification answered 5xx fails the connect" \
+		"BA_HOME=$PWD/mc.home mcpc connect http://127.0.0.1:$PORT/cgi-bin/mcp500 @n500 2>&1 | grep -o 'connect @n500 failed'; echo rc=\$?" \
+		"connect @n500 failed
+rc=0\n" \
+		"" ""
+
+	# a server that replies with an SSE body (event stream carrying the
+	# JSON-RPC message events) must be understood
+	cat > "$WEB/cgi-bin/mcpsse" <<'CGISSE'
+#!/bin/sh
+body=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
+method=$(printf '%s' "$body" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+printf 'Content-Type: text/event-stream\r\n\r\n'
+case "$method" in
+	initialize)
+		printf 'event: message\ndata: {"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"sse-mcp","version":"1.0"}}}\n\n' "$id"
+		;;
+	notifications/*)
+		:
+		;;
+	tools/list)
+		printf 'event: message\ndata: {"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"sse_tool","description":"over sse","inputSchema":{"type":"object"}}]}}\n\n' "$id"
+		;;
+	tools/call)
+		printf 'event: message\ndata: {"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"sse-result"}]}}\n\n' "$id"
+		;;
+esac
+CGISSE
+	chmod +x "$WEB/cgi-bin/mcpsse"
+
+	testing "mcpc connects over an SSE streamable-http endpoint" \
+		"BA_HOME=$PWD/mc.home mcpc connect http://127.0.0.1:$PORT/cgi-bin/mcpsse @sse 2>&1" \
+		"connected @sse\n" \
+		"" ""
+
+	testing "mcpc tools-call over sse" \
+		"BA_HOME=$PWD/mc.home mcpc @sse tools-call sse_tool 2>&1" \
+		'{"content":[{"type":"text","text":"sse-result"}]}\n' \
+		"" ""
+
 	kill $HTTPD_PID 2>/dev/null
 	rm -rf "$ROOT"
 else
@@ -188,7 +349,7 @@ testing "mcpc works again after a restart (implicit spawn)" \
 	"connected @echo2\n" \
 	"" ""
 
-rm -rf mc.home mc2.home mc.e2e echo-mcp.tmp.sh mcpc-stdio.log
+rm -rf mc.home mc2.home mc.e2e echo-mcp.tmp.sh echo-big.tmp.sh echo-die.tmp.sh mcpc-stdio.log
 
 echo "mcpc: done"
 

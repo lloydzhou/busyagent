@@ -98,6 +98,14 @@ testing "busyagent rejects schemeless URL" \
 	"HTTP request failed\n" \
 	"" ""
 
+# control characters anywhere in the url (path included) never reach
+# the wire as header/line breaks
+CRLF_URL="http://127.0.0.1:9/x$(printf '\r\n')X-Inject: 1"
+testing "busyagent rejects a CRLF smuggled in the url path" \
+	"busyagent hi -u \"\$CRLF_URL\" -k k -m m 2>&1 | grep -o \"HTTP request failed\"" \
+	"HTTP request failed\n" \
+	"" ""
+
 # https works out of the box; the unauthenticated-TLS caveat is announced
 # on stderr before any connection is attempted.
 testing "busyagent https connects silently (no TLS warning)" \
@@ -292,6 +300,16 @@ if has 'E2E_BAD_KEY'; then
 	exit
 fi
 
+# a single-line JSON body far beyond the old 64 KB SSE line cap: must
+# be delivered whole (the tail marker proves nothing was truncated)
+if case "$path" in */bigjson/*) true ;; *) false ;; esac; then
+	printf 'Content-Type: application/json\r\n\r\n'
+	printf '{"type":"error","error":{"type":"api_error","message":"big-json '
+	dd if=/dev/zero bs=1024 count=80 2>/dev/null | tr '\0' 'x'
+	printf ' tail-big-json-e2e-ok"}}'
+	exit
+fi
+
 header
 case $path in
 */chat/completions) openai_text 'openai-e2e-ok'; exit;;
@@ -382,6 +400,12 @@ testing "busyagent e2e non-sse json error body" \
 	'run_agent -n -s err-e2e -p claude E2E_BAD_KEY 2>&1 | grep -o "e2e-bad-key"; s=$(find "$HOME_DIR/projects" -type d -name err-e2e); grep -q "e2e-bad-key" "$s/events.jsonl" && echo logged' \
 	"e2e-bad-key
 logged\n" "" ""
+
+# >64 KB single-line JSON body on a non-SSE content-type: previously
+# fed through the SSE splitter, hit the line cap and failed the request
+testing "busyagent e2e large non-sse json body survives" \
+	'run_agent -n -s big-e2e -p claude -u "$BASE/bigjson" hello 2>&1 | grep -o "tail-big-json-e2e-ok"' \
+	"tail-big-json-e2e-ok\n" "" ""
 
 testing "busyagent e2e write tool loop" \
 	'rm -f "$TARGET"; run_agent -s write-e2e -p claude WRITE_E2E_MARKER >/dev/null; cat "$TARGET"' \
