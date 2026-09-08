@@ -7,6 +7,7 @@
  * assembly and the busybox tool executor.
  */
 #include "busyagent.h"
+#include "agent_common.h"
 #include "ba_builtin_schemas.h"
 /* everything below leans on libbb (xmalloc_read, full_write,
  * bb_make_directory, lineedit, ...) - include it once up front */
@@ -23,1503 +24,197 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* ============================================================
- * StrBuf - growable string buffer
- * ============================================================ */
-
-void sb_init(StrBuf *sb) {
-    sb->data = NULL;
-    sb->len = 0;
-    sb->cap = 0;
-}
-
-void sb_free(StrBuf *sb) {
-    free(sb->data);
-    sb->data = NULL;
-    sb->len = 0;
-    sb->cap = 0;
-}
-
-void sb_ensure(StrBuf *sb, size_t extra) {
-    if (sb->len + extra + 1 <= sb->cap) return;
-    size_t newcap = sb->cap ? sb->cap : 256;
-    while (newcap < sb->len + extra + 1) newcap *= 2;
-    char *p = realloc(sb->data, newcap);
-    if (!p) { fprintf(stderr, "out of memory\n"); abort(); }
-    sb->data = p;
-    sb->cap = newcap;
-}
-
-void sb_append(StrBuf *sb, const char *s) {
-    if (!s) return;
-    size_t n = strlen(s);
-    sb_appendn(sb, s, n);
-}
-
-void sb_appendn(StrBuf *sb, const char *s, size_t n) {
-    if (n == 0) return;
-    sb_ensure(sb, n);
-    memcpy(sb->data + sb->len, s, n);
-    sb->len += n;
-    sb->data[sb->len] = '\0';
-}
-
-void sb_appendf(StrBuf *sb, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    va_list ap2;
-    va_copy(ap2, ap);
-    int n = vsnprintf(NULL, 0, fmt, ap);
-    va_end(ap);
-    if (n < 0) return;
-    sb_ensure(sb, (size_t)n);
-    vsnprintf(sb->data + sb->len, (size_t)n + 1, fmt, ap2);
-    va_end(ap2);
-    sb->len += (size_t)n;
-    sb->data[sb->len] = '\0';
-}
-
-void sb_append_char(StrBuf *sb, char c) {
-    sb_ensure(sb, 1);
-    sb->data[sb->len++] = c;
-    sb->data[sb->len] = '\0';
-}
-
-void sb_truncate(StrBuf *sb, size_t len) {
-    if (len < sb->len) {
-        sb->len = len;
-        sb->data[len] = '\0';
-    }
-}
-
-void sb_append_json_string(StrBuf *sb, const char *src) {
-    if (!src) { sb_append(sb, "null"); return; }
-    sb_append_char(sb, '"');
-    while (*src) {
-        unsigned char c = (unsigned char)*src;
-        switch (c) {
-            case '"':  sb_append(sb, "\\\""); src++; break;
-            case '\\': sb_append(sb, "\\\\"); src++; break;
-            case '\b': sb_append(sb, "\\b"); src++; break;
-            case '\f': sb_append(sb, "\\f"); src++; break;
-            case '\n': sb_append(sb, "\\n"); src++; break;
-            case '\r': sb_append(sb, "\\r"); src++; break;
-            case '\t': sb_append(sb, "\\t"); src++; break;
-            default:
-                if (c < 0x20) {
-                    /* control chars -> \uXXXX (JSON spec) */
-                    sb_appendf(sb, "\\u%04x", c);
-                    src++;
-                } else {
-                    /* ASCII printable + all non-control bytes (incl. UTF-8 multibyte) pass through;
-                     * invalid UTF-8 is fixed at the source by util_sanitize_utf8 */
-                    sb_append_char(sb, c);
-                    src++;
-                }
-                break;
-        }
-    }
-    sb_append_char(sb, '"');
-}
-
-void sb_append_shell_arg(StrBuf *sb, const char *src) {
-    if (!src) {
-        sb_append(sb, "''");
-        return;
-    }
-    sb_append_char(sb, '\'');
-    for (; *src; src++) {
-        if (*src == '\'') sb_append(sb, "'\\''");
-        else sb_append_char(sb, *src);
-    }
-    sb_append_char(sb, '\'');
-}
-
-/* UTF-8 sanitize: logic identical to awk/sanitize_utf8.awk:
- * byte-by-byte scan, invalid UTF-8 bytes become the literal text \ufffd (6 ASCII chars).
- * Returns a new malloc'd string; caller frees.
- */
-char *util_sanitize_utf8(const char *src) {
-    if (!src) return util_strdup("");
-    size_t len = strlen(src);
-    /* worst case: every byte invalid, replaced by 6-char \ufffd */
-    StrBuf sb;
-    sb_init(&sb);
-    sb_ensure(&sb, len * 6 + 1);
-
-    const unsigned char *p = (const unsigned char *)src;
-    const unsigned char *end = p + len;
-
-    while (p < end) {
-        unsigned char b = *p;
-        if (b < 0x80) {
-            /* ASCII (0x00-0x7F): pass through */
-            sb_append_char(&sb, b);
-            p++;
-        } else if (b >= 0xC2 && b <= 0xDF) {
-            /* 2-byte sequence: C2-DF + 80-BF */
-            if (p + 1 < end && p[1] >= 0x80 && p[1] <= 0xBF) {
-                sb_appendn(&sb, (const char *)p, 2);
-                p += 2;
-            } else {
-                sb_append(&sb, "\\ufffd");
-                p++;
-            }
-        } else if (b >= 0xE0 && b <= 0xEF) {
-            /* 3-byte sequence: E0-EF + 80-BF + 80-BF */
-            if (p + 2 < end && p[1] >= 0x80 && p[1] <= 0xBF && p[2] >= 0x80 && p[2] <= 0xBF) {
-                sb_appendn(&sb, (const char *)p, 3);
-                p += 3;
-            } else {
-                sb_append(&sb, "\\ufffd");
-                p++;
-            }
-        } else if (b >= 0xF0 && b <= 0xF4) {
-            /* 4-byte sequence: F0-F4 + 80-BF + 80-BF + 80-BF */
-            if (p + 3 < end && p[1] >= 0x80 && p[1] <= 0xBF && p[2] >= 0x80 && p[2] <= 0xBF && p[3] >= 0x80 && p[3] <= 0xBF) {
-                sb_appendn(&sb, (const char *)p, 4);
-                p += 4;
-            } else {
-                sb_append(&sb, "\\ufffd");
-                p++;
-            }
-        } else {
-            /* invalid: C0-C1 (overlong), 80-BF (stray continuation), F5-FF (out of range) */
-            sb_append(&sb, "\\ufffd");
-            p++;
-        }
-    }
-    return sb.data;
-}
-
-/* ============================================================
- * utility functions
- * ============================================================ */
-
-char *util_new_session_id(void) {
-    time_t now = time(NULL);
-    struct tm tm;
-    localtime_r(&now, &tm);
-    char *buf = malloc(64);  /* larger than needed; silences -Wformat-truncation */
-    unsigned short r = (unsigned short)(rand() & 0xFFFF);
-    snprintf(buf, 64, "%04d%02d%02d-%02d%02d%02d-%04x",
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec, r);
-    return buf;
-}
-
-char *util_path_join(const char *a, const char *b) {
-    size_t alen = strlen(a);
-    /* skip leading slashes of b */
-    while (*b == '/') b++;
-    size_t blen = strlen(b);
-    char *r = malloc(alen + 1 + blen + 1);
-    memcpy(r, a, alen);
-    /* make sure a ends with a slash */
-    if (alen > 0 && a[alen - 1] != '/') {
-        r[alen++] = '/';
-    }
-    memcpy(r + alen, b, blen + 1);
-    return r;
-}
-
-int util_mkdirs(const char *path, int mode) {
-	/* bb_make_directory: recursive mkdir, 0 on success (EEXIST ok) */
-	return bb_make_directory((char *)path, mode, FILEUTILS_RECUR);
-}
-
-const char *util_home_dir(void) {
-    const char *home = getenv("HOME");
-    if (home) return home;
-    return "/tmp";
-}
-
-char *util_strdup(const char *s) {
-    if (!s) return NULL;
-    return strdup(s);
-}
-
-const char *util_env(const char *name, const char *defval) {
-    const char *v = getenv(name);
-    return v ? v : defval;
-}
-
-char *util_timestamp_now(void) {
-    time_t now = time(NULL);
-    struct tm tm;
-    localtime_r(&now, &tm);
-    char *buf = malloc(32);
-    strftime(buf, 32, "%Y-%m-%dT%H:%M:%S", &tm);
-    return buf;
-}
-
-long util_parse_size(const char *s) {
-    if (!s || !*s) return -1;
-    char *endp = NULL;
-    long val = strtol(s, &endp, 10);
-    if (endp == s || val <= 0) return -1;
-    if (*endp == 'k' || *endp == 'K') { val *= 1000; endp++; }
-    else if (*endp == 'm' || *endp == 'M') { val *= 1000000; endp++; }
-    else if (*endp == 'g' || *endp == 'G') { val *= 1000000000; endp++; }
-    return (*endp == '\0') ? val : -1;
-}
-
-long util_epoch_seconds(void) {
-    return (long)time(NULL);
-}
-
-int util_utf8_char_count(const char *s) {
-    int count = 0;
-    for (; *s; s++) {
-        /* UTF-8 continuation bytes are 10xxxxxx (0x80-0xBF); not counted */
-        if ((*(unsigned char*)s & 0xC0) != 0x80) count++;
-    }
-    return count;
-}
-
-size_t util_utf8_truncate_len(const char *s, size_t max_bytes) {
-    size_t len = strlen(s);
-    if (len <= max_bytes) return len;
-    /* walk back over UTF-8 continuation bytes so we never cut mid-character */
-    while (max_bytes > 0 && ((unsigned char)s[max_bytes] & 0xC0) == 0x80) {
-        max_bytes--;
-    }
-    return max_bytes;
-}
-
-void util_truncate_str(char *s, size_t max_total) {
-    size_t len = strlen(s);
-    if (len <= max_total) return;
-    /* leave 3 bytes for "..."; UTF-8-safe truncation */
-    size_t cut = (max_total >= 3) ? max_total - 3 : 0;
-    cut = util_utf8_truncate_len(s, cut);
-    s[cut] = '.';
-    s[cut + 1] = '.';
-    s[cut + 2] = '.';
-    s[cut + 3] = '\0';
-}
-
-void util_truncate_chars(char *s, int max_chars) {
-    if (util_utf8_char_count(s) <= max_chars) return;
-    /* leave 3 chars for "..."; find the byte offset of the (max_chars - 3)-th char */
-    int target = max_chars >= 3 ? max_chars - 3 : 0;
-    int char_count = 0;
-    char *p = s;
-    while (*p && char_count < target) {
-        if ((*(unsigned char *)p & 0xC0) != 0x80) char_count++;
-        p++;
-    }
-    p[0] = '.'; p[1] = '.'; p[2] = '.'; p[3] = '\0';
-}
-
-char *util_rtrim(char *s) {
-    size_t len = strlen(s);
-    while (len > 0 && (s[len-1] == '\n' || s[len-1] == '\r' ||
-                       s[len-1] == ' '  || s[len-1] == '\t')) {
-        s[--len] = '\0';
-    }
-    return s;
-}
-
-char *util_read_file(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz < 0) { fclose(f); return NULL; }
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    size_t nread = fread(buf, 1, (size_t)sz, f);
-    buf[nread] = '\0';
-    fclose(f);
-    return buf;
-}
-
-int util_write_file(const char *path, const char *content) {
-    FILE *f = fopen(path, "w");
-    if (!f) return -1;
-    size_t len = strlen(content);
-    size_t nw = fwrite(content, 1, len, f);
-    fclose(f);
-    return (nw == len) ? 0 : -1;
-}
-
-/* ==== ba_json.c ==== */
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
-#include <errno.h>
-
-/* ============================================================
- * internal helpers
- * ============================================================ */
-
-static void skip_ws(const char *src, size_t *pos) {
-    while (src[*pos] == ' ' || src[*pos] == '\t' ||
-           src[*pos] == '\n' || src[*pos] == '\r') {
-        (*pos)++;
-    }
-}
-
-static JsonParse make_err(const char *msg) {
-    JsonParse p;
-    memset(&p, 0, sizeof(p));
-    p.error = msg;
-    return p;
-}
-
-static JsonParse make_val(JsonType type, const char *src, size_t start, size_t end) {
-    JsonParse p;
-    p.val.type = type;
-    p.val.src = src;
-    p.val.start = start;
-    p.val.end = end;
-    p.error = NULL;
-    return p;
-}
-
-/* parse a JSON string (starting at the opening quote) */
-static JsonParse parse_string(const char *src, size_t *pos) {
-    size_t start = *pos;
-    (*pos)++; /* skip opening quote */
-    while (src[*pos] && src[*pos] != '"') {
-        if (src[*pos] == '\\') {
-            (*pos)++; /* skip escaped char */
-            if (!src[*pos])
-                return make_err("unterminated escape sequence");
-            /* NB: without this check the second ++ below walks past the
-             * NUL terminator and the loop keeps reading out of bounds */
-        }
-        (*pos)++;
-    }
-    if (src[*pos] != '"') return make_err("unclosed string");
-    (*pos)++; /* skip closing quote */
-    return make_val(JSON_STRING, src, start, *pos);
-}
-
-/* parse a JSON number */
-static JsonParse parse_number(const char *src, size_t *pos) {
-    size_t start = *pos;
-    if (src[*pos] == '-') (*pos)++;
-    while (isdigit((unsigned char)src[*pos])) (*pos)++;
-    if (src[*pos] == '.') {
-        (*pos)++;
-        while (isdigit((unsigned char)src[*pos])) (*pos)++;
-    }
-    if (src[*pos] == 'e' || src[*pos] == 'E') {
-        (*pos)++;
-        if (src[*pos] == '+' || src[*pos] == '-') (*pos)++;
-        while (isdigit((unsigned char)src[*pos])) (*pos)++;
-    }
-    return make_val(JSON_NUMBER, src, start, *pos);
-}
-
-/* forward declarations */
-static JsonParse json_parse_internal(const char *src, size_t *pos);
-
-/* parse a JSON array */
-static JsonParse parse_array(const char *src, size_t *pos) {
-    size_t start = *pos;
-    (*pos)++; /* skip [ */
-    skip_ws(src, pos);
-    if (src[*pos] == ']') { (*pos)++; return make_val(JSON_ARRAY, src, start, *pos); }
-    for (;;) {
-        skip_ws(src, pos);
-        JsonParse vp = json_parse(src, pos);
-        if (vp.error) return vp;
-        skip_ws(src, pos);
-        if (src[*pos] == ',') { (*pos)++; continue; }
-        if (src[*pos] == ']') { (*pos)++; break; }
-        return make_err("expected ',' or ']'");
-    }
-    return make_val(JSON_ARRAY, src, start, *pos);
-}
-
-/* parse a JSON object */
-static JsonParse parse_object(const char *src, size_t *pos) {
-    size_t start = *pos;
-    (*pos)++; /* skip { */
-    skip_ws(src, pos);
-    if (src[*pos] == '}') { (*pos)++; return make_val(JSON_OBJECT, src, start, *pos); }
-    for (;;) {
-        skip_ws(src, pos);
-        if (src[*pos] != '"') return make_err("expected string key");
-        JsonParse kp = parse_string(src, pos);
-        if (kp.error) return kp;
-        skip_ws(src, pos);
-        if (src[*pos] != ':') return make_err("expected ':'");
-        (*pos)++;
-        skip_ws(src, pos);
-        JsonParse vp = json_parse(src, pos);
-        if (vp.error) return vp;
-        skip_ws(src, pos);
-        if (src[*pos] == ',') { (*pos)++; continue; }
-        if (src[*pos] == '}') { (*pos)++; break; }
-        return make_err("expected ',' or '}'");
-    }
-    return make_val(JSON_OBJECT, src, start, *pos);
-}
-
-/* parse a JSON value */
-static JsonParse json_parse_internal(const char *src, size_t *pos) {    skip_ws(src, pos);
-    char c = src[*pos];
-    if (c == '"') return parse_string(src, pos);
-    if (c == '{') return parse_object(src, pos);
-    if (c == '[') return parse_array(src, pos);
-    if (c == 't') {
-        if (strncmp(src + *pos, "true", 4) == 0) { *pos += 4; return make_val(JSON_BOOL, src, *pos - 4, *pos); }
-        return make_err("expected 'true'");
-    }
-    if (c == 'f') {
-        if (strncmp(src + *pos, "false", 5) == 0) { *pos += 5; return make_val(JSON_BOOL, src, *pos - 5, *pos); }
-        return make_err("expected 'false'");
-    }
-    if (c == 'n') {
-        if (strncmp(src + *pos, "null", 4) == 0) { *pos += 4; return make_val(JSON_NULL, src, *pos - 4, *pos); }
-        return make_err("expected 'null'");
-    }
-    if (c == '-' || isdigit((unsigned char)c)) return parse_number(src, pos);
-    return make_err("unexpected character");
-}
-
-/* public parse entry points */
-JsonParse json_parse(const char *src, size_t *pos) {
-    return json_parse_internal(src, pos);
-}
-
-JsonParse json_parse_root(const char *src) {
-    if (!src) return make_err("null input");
-    size_t pos = 0;
-    JsonParse p = json_parse_internal(src, &pos);
-    if (p.error) return p;
-    skip_ws(src, &pos);
-    if (src[pos] != '\0') return make_err("trailing content");
-    return p;
-}
-
-/* ============================================================
- * queries
- * ============================================================ */
-
-JsonVal json_get(JsonVal obj, const char *key) {
-    if (obj.type != JSON_OBJECT) {
-        JsonVal null_val;
-        memset(&null_val, 0, sizeof(null_val));
-        return null_val;
-    }
-    size_t pos = obj.start + 1; /* skip { */
-    const char *src = obj.src;
-    skip_ws(src, &pos);
-    if (src[pos] == '}') {
-        JsonVal null_val;
-        memset(&null_val, 0, sizeof(null_val));
-        return null_val;
-    }
-    for (;;) {
-        skip_ws(src, &pos);
-        /* parse key */
-        JsonParse kp = parse_string(src, &pos);
-        if (kp.error) break;
-        /* compare key (without quotes) */
-        size_t klen = (kp.val.end - 1) - (kp.val.start + 1);
-        const char *kstr = src + kp.val.start + 1;
-        bool match = (strlen(key) == klen && strncmp(key, kstr, klen) == 0);
-        skip_ws(src, &pos);
-        if (src[pos] != ':') break;
-        pos++;
-        skip_ws(src, &pos);
-        if (match) {
-            return json_parse(src, &pos).val;
-        }
-        /* skip the value */
-        JsonParse vp = json_parse(src, &pos);
-        if (vp.error) break;
-        skip_ws(src, &pos);
-        if (src[pos] == ',') { pos++; continue; }
-        break;
-    }
-    JsonVal null_val;
-    memset(&null_val, 0, sizeof(null_val));
-    return null_val;
-}
-
-char *json_get_string(JsonVal obj, const char *key) {
-    JsonVal v = json_get(obj, key);
-    return json_string_val(v);
-}
-
-int json_get_int(JsonVal obj, const char *key) {
-    JsonVal v = json_get(obj, key);
-    if (v.type != JSON_NUMBER) return 0;
-    /* extract the span and convert to int */
-    char buf[64];
-    size_t len = v.end - v.start;
-    if (len >= sizeof(buf)) return 0;
-    memcpy(buf, v.src + v.start, len);
-    buf[len] = '\0';
-    return (int)strtod(buf, NULL);
-}
-
-long long json_get_ll(JsonVal obj, const char *key) {
-    JsonVal v = json_get(obj, key);
-    if (v.type != JSON_NUMBER) return 0;
-    char buf[64];
-    size_t len = v.end - v.start;
-    if (len >= sizeof(buf)) return 0;
-    memcpy(buf, v.src + v.start, len);
-    buf[len] = '\0';
-    return strtoll(buf, NULL, 10);
-}
-
-double json_get_double(JsonVal obj, const char *key) {
-    JsonVal v = json_get(obj, key);
-    return json_number_val(v);
-}
-
-bool json_get_bool(JsonVal obj, const char *key, bool def) {
-    JsonVal v = json_get(obj, key);
-    if (v.type == JSON_NULL) return def;
-    return json_bool_val(v);
-}
-
-/* ============================================================
- * array operations
- * ============================================================ */
-
-int json_array_len(JsonVal arr) {
-    if (arr.type != JSON_ARRAY) return 0;
-    int count = 0;
-    size_t pos = arr.start + 1; /* skip [ */
-    const char *src = arr.src;
-    skip_ws(src, &pos);
-    if (src[pos] == ']') return 0;
-    for (;;) {
-        skip_ws(src, &pos);
-        JsonParse vp = json_parse(src, &pos);
-        if (vp.error) break;
-        count++;
-        skip_ws(src, &pos);
-        if (src[pos] == ',') { pos++; continue; }
-        break;
-    }
-    return count;
-}
-
-JsonVal json_array_get(JsonVal arr, int index) {
-    if (arr.type != JSON_ARRAY) {
-        JsonVal null_val;
-        memset(&null_val, 0, sizeof(null_val));
-        return null_val;
-    }
-    size_t pos = arr.start + 1;
-    const char *src = arr.src;
-    skip_ws(src, &pos);
-    if (src[pos] == ']') {
-        JsonVal null_val;
-        memset(&null_val, 0, sizeof(null_val));
-        return null_val;
-    }
-    int cur = 0;
-    for (;;) {
-        skip_ws(src, &pos);
-        JsonParse vp = json_parse(src, &pos);
-        if (vp.error) break;
-        if (cur == index) return vp.val;
-        cur++;
-        skip_ws(src, &pos);
-        if (src[pos] == ',') { pos++; continue; }
-        break;
-    }
-    JsonVal null_val;
-    memset(&null_val, 0, sizeof(null_val));
-    return null_val;
-}
-
-/* ============================================================
- * value extraction
- * ============================================================ */
-
-char *json_string_val(JsonVal v) {
-    if (v.type != JSON_STRING) return NULL;
-    /* decode a JSON string (strip quotes, handle escapes) */
-    const char *src = v.src;
-    size_t start = v.start + 1; /* skip opening quote */
-    size_t end = v.end - 1;     /* skip closing quote */
-    size_t len = end - start;
-    char *buf = malloc(len * 2 + 1); /* worst case */
-    size_t out = 0;
-    for (size_t i = start; i < end; i++) {
-        if (src[i] == '\\') {
-            i++;
-            switch (src[i]) {
-                case '"':  buf[out++] = '"'; break;
-                case '\\': buf[out++] = '\\'; break;
-                case '/':  buf[out++] = '/'; break;
-                case 'b':  buf[out++] = '\b'; break;
-                case 'f':  buf[out++] = '\f'; break;
-                case 'n':  buf[out++] = '\n'; break;
-                case 'r':  buf[out++] = '\r'; break;
-                case 't':  buf[out++] = '\t'; break;
-                case 'u': {
-                    /* \uXXXX - surrogate pairs supported */
-                    unsigned int cp = 0;
-                    int hex_digits = 0;
-                    for (int j = 0; j < 4 && i + 1 < end; j++) {
-                        i++;
-                        char h = src[i];
-                        cp = cp * 16;
-                        if (h >= '0' && h <= '9') { cp += h - '0'; hex_digits++; }
-                        else if (h >= 'a' && h <= 'f') { cp += h - 'a' + 10; hex_digits++; }
-                        else if (h >= 'A' && h <= 'F') { cp += h - 'A' + 10; hex_digits++; }
-                        else break;
-                    }
-                    /* malformed \u (short hex) -> U+FFFD; avoid embedded NUL */
-                    if (hex_digits < 4)
-                        cp = 0xFFFD;
-                    /* high surrogate? check the following \uDC00-\uDFFF */
-                    if (cp >= 0xD800 && cp <= 0xDBFF &&
-                        i + 1 < end && src[i + 1] == '\\' && src[i + 2] == 'u') {
-                        size_t saved = i;
-                        i += 2; /* skip \u */
-                        unsigned int lo = 0;
-                        int valid = 1;
-                        for (int j = 0; j < 4 && i + 1 < end; j++) {
-                            i++;
-                            char h = src[i];
-                            if (h >= '0' && h <= '9') lo = lo * 16 + (h - '0');
-                            else if (h >= 'a' && h <= 'f') lo = lo * 16 + (h - 'a' + 10);
-                            else if (h >= 'A' && h <= 'F') lo = lo * 16 + (h - 'A' + 10);
-                            else { valid = 0; break; }
-                        }
-                        if (valid && lo >= 0xDC00 && lo <= 0xDFFF) {
-                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                        } else {
-                            /* not a valid low surrogate; fall back */
-                            i = saved;
-                        }
-                    }
-                    /* UTF-8 encode */
-                    if (cp < 0x80) {
-                        buf[out++] = (char)cp;
-                    } else if (cp < 0x800) {
-                        buf[out++] = (char)(0xC0 | (cp >> 6));
-                        buf[out++] = (char)(0x80 | (cp & 0x3F));
-                    } else if (cp < 0x10000) {
-                        buf[out++] = (char)(0xE0 | (cp >> 12));
-                        buf[out++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                        buf[out++] = (char)(0x80 | (cp & 0x3F));
-                    } else {
-                        buf[out++] = (char)(0xF0 | (cp >> 18));
-                        buf[out++] = (char)(0x80 | ((cp >> 12) & 0x3F));
-                        buf[out++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                        buf[out++] = (char)(0x80 | (cp & 0x3F));
-                    }
-                    break;
-                }
-                default: buf[out++] = src[i]; break;
-            }
-        } else {
-            buf[out++] = src[i];
-        }
-    }
-    buf[out] = '\0';
-    /* shrink to the actual size */
-    char *result = realloc(buf, out + 1);
-    return result ? result : buf;
-}
-
-double json_number_val(JsonVal v) {
-    if (v.type != JSON_NUMBER) return 0.0;
-    char buf[64];
-    size_t len = v.end - v.start;
-    if (len >= sizeof(buf)) return 0.0;
-    memcpy(buf, v.src + v.start, len);
-    buf[len] = '\0';
-    return strtod(buf, NULL);
-}
-
-bool json_bool_val(JsonVal v) {
-    if (v.type != JSON_BOOL) return false;
-    /* true spells "true", false "false" */
-    return v.src[v.start] == 't';
-}
-
-char *json_as_string(JsonVal v) {
-    if (v.type == JSON_STRING) return json_string_val(v);
-    if (v.type == JSON_NULL) return NULL;
-    /* other types: take the raw text */
-    size_t len = v.end - v.start;
-    char *s = malloc(len + 1);
-    memcpy(s, v.src + v.start, len);
-    s[len] = '\0';
-    return s;
-}
-
-/* ============================================================
- * object iterator
- * ============================================================ */
-
-void json_obj_iter_init(JsonObjectIter *it, JsonVal obj) {
-    memset(it, 0, sizeof(*it));
-    if (obj.type != JSON_OBJECT) return;
-    it->src = obj.src;
-    it->pos = obj.start + 1; /* skip { */
-    it->first = true;
-}
-
-bool json_obj_iter_next(JsonObjectIter *it) {
-    /* free the previous iteration's key */
-    free((char *)it->key);
-    it->key = NULL;
-
-    const char *src = it->src;
-    if (!src) return false;
-    skip_ws(src, &it->pos);
-    if (src[it->pos] == '}' || src[it->pos] == '\0') return false;
-    if (!it->first) {
-        /* skip the comma */
-        if (src[it->pos] == ',') it->pos++;
-        skip_ws(src, &it->pos);
-        if (src[it->pos] == '}' || src[it->pos] == '\0') return false;
-    }
-    it->first = false;
-    /* parse the key */
-    JsonParse kp = parse_string(src, &it->pos);
-    if (kp.error) return false;
-    /* key text (without quotes) */
-    size_t klen = (kp.val.end - 1) - (kp.val.start + 1);
-    char *key = malloc(klen + 1);
-    memcpy(key, src + kp.val.start + 1, klen);
-    key[klen] = '\0';
-    it->key = key; /* points at a temp buffer */
-    /* skip : */
-    skip_ws(src, &it->pos);
-    if (src[it->pos] == ':') it->pos++;
-    skip_ws(src, &it->pos);
-    /* parse the value */
-    JsonParse vp = json_parse(src, &it->pos);
-    if (vp.error) { free(key); return false; }
-    it->val = vp.val;
-    return true;
-}
-
-/* ============================================================
- * JSONL append
- * ============================================================ */
-
-int jsonl_append(const char *path, const char *json_line) {
-    FILE *f = fopen(path, "a");
-    if (!f) return -1;
-    fprintf(f, "%s\n", json_line);
-    fclose(f);
-    return 0;
-}
-
-void json_obj_iter_cleanup(JsonObjectIter *it) {
-    free((char *)it->key);
-    it->key = NULL;
-}
-
-/* ==== bb_http.c ==== */
 /*
  * bb_http - plain-HTTP transport for busyagent
  *
  * Replaces the libcurl backend of bash-agent's transport.c using only
- * busybox/libbb primitives: xhost2sockaddr for DNS, non-blocking connect
- * with poll() timeout, safe_read/safe_poll for the body pump, and a wget
- * style chunked decoder feeding the provider-agnostic SSE pump
- * (sse_stream_feed) in ba_transport.c.
+ * busybox/libbb primitives and the shared httpx-style client in
+ * agent_common.c (agc_http_request_stream) feeding the provider-agnostic
+ * SSE pump in ba_transport.c.
  *
- * Only http:// is supported in phase 1. TLS is a later phase.
+ * TLS is provided by the in-tree client (networking/tls.c); the
+ * no-verification trade-off is announced once per process.
  *
  * Copyright (C) 2026 by Lloyd Zhou <lloydzhou@qq.com>
  *
  * Licensed under GPLv2, see file LICENSE in this source tree.
  */
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-
-#define BA_CONNECT_TIMEOUT_MS  5000
-#define BA_READ_TIMEOUT_MS    300000   /* idle timeout for SSE streams */
-#define BA_MAX_HEADER         (64 * 1024)
 #define BA_MAX_RETRIES        2
 #define BA_RETRY_MAX_TIME_MS  20000
-#define BA_TLS_RECHDR_LEN     5     /* TLS record header (networking/tls.c) */
-#define BA_TLS_APPDATA        23    /* RECORD_TYPE_APPLICATION_DATA */
-/* RFC 5246: a TLSPlaintext fragment carries at most 2^14 bytes, and the
- * record layer may add up to 2^10 of compression overhead + cipher block
- * padding. 18 KiB covers every legal decrypted application-data record:
- * records larger than this are refused, never silently truncated. */
-#define BA_TLS_PLAIN_MAX      (18 * 1024)
-/* chunked transfer: sane upper bound for a single chunk size line value */
-#define BA_MAX_CHUNK_SIZE     (16 * 1024 * 1024)
-/* ba_read() polls in short slices so the cancelled flag is checked
- * promptly instead of blocking for the full idle timeout */
-#define BA_POLL_SLICE_MS      250
 
+/* forward declarations - the provider parsers live below (ba_transport) */
+static void parse_openai_sse_event(StreamCtx *sctx, const char *data, size_t data_len);
+static void parse_responses_sse_event(StreamCtx *sctx, const char *event,
+				      const char *data, size_t data_len);
+static void process_residual_json(const char *residual, const char *provider,
+				  sse_callback_fn callback, void *ctx);
+static void emit_simple_event(sse_callback_fn callback, void *ctx,
+			      SseEventType type, const char *content);
+
+/* pump context: provider dispatch rides on the shared SSE splitter
+ * (agent_common.c) while a bounded raw copy catches non-SSE JSON bodies */
 typedef struct {
-	char host[256];
-	int port;
-	int is_https;
-	char path[1024];
-} BaUrl;
+	StreamCtx *sctx;
+	AgcSse sse;
+	StrBuf raw;         /* whole body while no SSE field was recognized */
+	AgcHttpResp *resp;  /* response headers, filled before body chunks */
+	int mode_known;     /* content-type evaluated for this body */
+	int is_sse;         /* body declared itself text/event-stream */
+} BaSsePump;
 
-static int ba_parse_url(const char *url, BaUrl *u)
+/* one complete SSE event: dispatch each data line separately, matching
+ * the historical per-"data:"-line parse of the providers (each line is
+ * an independent JSON document for claude/openai) */
+static void ba_sse_dispatch_event(void *vctx, const char *event,
+				  const char *data, size_t data_len)
 {
-	char *colon;
-	const char *p, *slash;
+	BaSsePump *p = vctx;
+	StreamCtx *sctx = p->sctx;
+	const char *line = data;
+	size_t remain = data_len;
 
-	memset(u, 0, sizeof(*u));
-	if (strncmp(url, "https://", 8) == 0) {
-		u->is_https = 1;
-		p = url + 8;
-	} else if (strncmp(url, "http://", 7) == 0) {
-		p = url + 7;
-	} else {
-		return -1;
+	while (remain > 0) {
+		const char *nl = memchr(line, '\n', remain);
+		size_t llen = nl ? (size_t)(nl - line) : remain;
+
+		if (llen > 0) {
+			/* the provider parsers need NUL-terminated input */
+			char *copy = xstrndup(line, llen);
+
+			if (strcmp(sctx->provider, "openai") == 0)
+				parse_openai_sse_event(sctx, copy, llen);
+			else if (strcmp(sctx->provider, "responses") == 0)
+				parse_responses_sse_event(sctx, event, copy, llen);
+			else
+				sse_parse_event(sctx->provider, copy, llen,
+						sctx->callback, sctx->ctx);
+			free(copy);
+		}
+		if (!nl)
+			break;
+		line = nl + 1;
+		remain -= llen + 1;
 	}
-	slash = strchr(p, '/');
-	if (!slash) {
-		snprintf(u->host, sizeof(u->host), "%s", p);
-		snprintf(u->path, sizeof(u->path), "/");
-	} else {
-		size_t hlen = slash - p;
-		if (hlen >= sizeof(u->host))
-			return -1;
-		memcpy(u->host, p, hlen);
-		u->host[hlen] = '\0';
-		snprintf(u->path, sizeof(u->path), "%s", slash);
-	}
-	colon = strchr(u->host, ':');
-	if (colon) {
-		u->port = atoi(colon + 1);
-		*colon = '\0';
-	} else {
-		u->port = u->is_https ? 443 : 80;
-	}
-	if (!u->host[0] || u->port <= 0)
-		return -1;
-	return 0;
 }
 
-/* Connect with timeout (non-blocking connect + POLLOUT). -1 on error. */
-static int ba_connect(const char *host, int port)
+/* agc_http_request_stream chunk callback: 0 continue, <0 abort */
+static int ba_sse_pump_chunk(void *vctx, const char *buf, size_t len)
 {
-	len_and_sockaddr *lsa;
-	int fd, flags, rc;
-	struct pollfd pfd;
-	socklen_t slen;
-	int err;
+	BaSsePump *p = vctx;
 
-	lsa = host2sockaddr(host, port);
-	if (!lsa)
+	if (p->sctx->cancelled && *(p->sctx->cancelled))
 		return -1;
-	fd = socket(lsa->u.sa.sa_family, SOCK_STREAM, 0);
-	if (fd < 0) {
-		free(lsa);
-		return -1;
-	}
-	flags = fcntl(fd, F_GETFL, 0);
-	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-	rc = connect(fd, &lsa->u.sa, lsa->len);
-	if (rc < 0 && errno != EINPROGRESS) {
-		close(fd);
-		free(lsa);
-		return -1;
-	}
-	if (rc != 0) {
-		pfd.fd = fd;
-		pfd.events = POLLOUT;
-		if (safe_poll(&pfd, 1, BA_CONNECT_TIMEOUT_MS) <= 0) {
-			close(fd);
-			free(lsa);
-			return -1;
-		}
-		err = 0;
-		slen = sizeof(err);
-		getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &slen);
-		if (err != 0) {
-			close(fd);
-			free(lsa);
-			return -1;
-		}
-	}
-	fcntl(fd, F_SETFL, flags);   /* back to blocking */
-	free(lsa);
-	return fd;
-}
+	if (!p->mode_known) {
+		/* the response header is in: decide once whether this is
+		 * an SSE stream or a plain JSON document.  A large plain
+		 * body must not be fed through the SSE line splitter
+		 * (its per-line cap does not apply to JSON bodies). */
+		const char *ct = p->resp ? p->resp->content_type : NULL;
 
-static int send_all(int fd, const char *buf, size_t len);
-static int send_all_conn(tls_state_t *tls, int fd, const char *buf, size_t len)
-{
-#if ENABLE_TLS
-	if (tls) {
-		while (len) {
-			size_t chunk = len > 8192 ? 8192 : len;
-			memcpy(tls_get_outbuf(tls, chunk), buf, chunk);
-			tls_xwrite(tls, chunk);
-			buf += chunk;
-			len -= chunk;
-		}
+		p->is_sse = (ct
+			     && strncasecmp(ct, "text/event-stream", 17) == 0);
+		p->mode_known = 1;
+	}
+	if (p->is_sse) {
+		agc_sse_feed(&p->sse, buf, len, ba_sse_dispatch_event, p);
+		if (p->sse.error)
+			return -1;
 		return 0;
 	}
-#else
-	(void)tls;
-#endif
-	return send_all(fd, buf, len);
-}
-
-static int send_all(int fd, const char *buf, size_t len)
-{
-	return full_write(fd, buf, len) == (ssize_t)len ? 0 : -1;
-}
-
-typedef struct {
-	int fd;
-	int chunked;              /* Transfer-Encoding: chunked */
-	long content_length;      /* -1 if unknown */
-	long body_left;           /* for content_length mode */
-	long chunk_left;          /* for chunked mode */
-	int chunk_state;          /* 0=size line, 1=data, 2=data CRLF, 3=trailers, 4=done */
-	int eof;
-	tls_state_t *tls;
-	char tls_plain[BA_TLS_PLAIN_MAX];
-	int tls_plain_len;
-	int tls_plain_pos;
-	char hdr[BA_MAX_HEADER];
-	size_t hdr_len;
-	int status;
-	int got_header;
-	char pending[4096];
-	size_t pending_len;
-	volatile int *cancelled;  /* checked between poll slices */
-} BaResp;
-
-/* Read more bytes into buf, honoring idle timeout and the cancelled flag.
- * Returns n>0, 0 on EOF, -1 on error/timeout/cancel. */
-static int ba_read(BaResp *r, char *buf, size_t bufsz)
-{
-	int64_t deadline = (int64_t)monotonic_ms() + BA_READ_TIMEOUT_MS;
-	int fd;
-
-#if ENABLE_TLS
-	if (r->tls)
-		fd = r->tls->ifd;
-	else
-#endif
-		fd = r->fd;
-
-	for (;;) {
-		struct pollfd pfd;
-		int pr;
-
-		if (r->cancelled && *(r->cancelled))
-			return -1;
-		pfd.fd = fd;
-		pfd.events = POLLIN;
-		pr = safe_poll(&pfd, 1, BA_POLL_SLICE_MS);
-		if (pr > 0)
-			break;
-		if (pr < 0) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		/* poll slice timed out: re-check cancel/total-idle deadlines */
-		if ((int64_t)monotonic_ms() > deadline)
-			return -1;
-	}
-
-#if ENABLE_TLS
-	if (r->tls) {
-		while (r->tls_plain_len == 0) {
-			int tn = tls_xread_record(r->tls, "application data");
-			if (tn < 1)
-				return 0;   /* TLS EOF */
-			if (r->tls->inbuf[0] != BA_TLS_APPDATA)
-				return -1;
-			/* never truncate: a record beyond the protocol maximum
-			 * means the peer (or a MITM) misbehaves - fail loudly */
-			if (tn > (int)sizeof(r->tls_plain))
-				return -1;
-			memcpy(r->tls_plain, r->tls->inbuf + BA_TLS_RECHDR_LEN, tn);
-			r->tls_plain_len = tn;
-			r->tls_plain_pos = 0;
-		}
-		{
-			int give = r->tls_plain_len - r->tls_plain_pos;
-			if (give > (int)bufsz)
-				give = bufsz;
-			memcpy(buf, r->tls_plain + r->tls_plain_pos, give);
-			r->tls_plain_pos += give;
-			if (r->tls_plain_pos >= r->tls_plain_len) {
-				r->tls_plain_len = 0;
-				r->tls_plain_pos = 0;
-			}
-			return give;
-		}
-	}
-#endif
-	{
-		int n = safe_read(fd, buf, bufsz);
-		return n;   /* 0 = EOF */
-	}
-}
-
-/* Read and parse the response header. Returns 0 on success. */
-static int ba_read_header(BaResp *r)
-{
-	char *p, *end;
-
-	while (r->hdr_len < BA_MAX_HEADER - 1) {
-		char *hit;
-		size_t have = r->hdr_len;
-
-		hit = (have >= 4) ? memmem(r->hdr, have, "\r\n\r\n", 4) : NULL;
-		if (hit)
-			break;
-		{
-			size_t want = BA_MAX_HEADER - 1 - r->hdr_len;
-			int n;
-			if (want > 4096)
-				want = 4096;
-			if (want == 0)
-				return -1;   /* header too large */
-			n = ba_read(r, r->hdr + r->hdr_len, want);
-			if (n <= 0)
-				return -1;
-			r->hdr_len += n;
-			r->hdr[r->hdr_len] = '\0';
-		}
-		hit = memmem(r->hdr, r->hdr_len, "\r\n\r\n", 4);
-		if (hit)
-			break;
-		(void)hit;
-	}
-	end = memmem(r->hdr, r->hdr_len, "\r\n\r\n", 4);
-	if (!end)
+	/* non-SSE body: keep the whole copy for the JSON fallback,
+	 * bounded like agc_http_request; crossing the limit fails the
+	 * request instead of silently truncating the document */
+	if (len > BA_MAX_BODY - p->raw.len)
 		return -1;
-
-	/* the read that completed the header may have consumed body bytes:
-	 * keep them for ba_body_read (first SSE chunk lives here) */
-	{
-		size_t body_start = (end - r->hdr) + 4;
-		size_t avail = r->hdr_len - body_start;
-		if (avail > sizeof(r->pending))
-			avail = sizeof(r->pending);
-		memcpy(r->pending, r->hdr + body_start, avail);
-		r->pending_len = avail;
-	}
-
-	/* status code from first line */
-	r->status = 0;
-	p = strchr(r->hdr, ' ');
-	if (p)
-		r->status = atoi(p + 1);
-
-	r->chunked = 0;
-	r->content_length = -1;
-	r->got_header = 1;
-
-	/* NB: keep one strtok_r state across the whole header - re-initialising
-	 * it per iteration made every call restart from the status line, so
-	 * Transfer-Encoding/Content-Length were never seen */
-	{
-		char *save = NULL;
-		char *line = strtok_r(r->hdr, "\r\n", &save);
-		while (line) {
-			str_tolower(line);   /* libbb in-place lowercase */
-			if (strncmp(line, "transfer-encoding:", 18) == 0
-			 && strstr(line, "chunked"))
-				r->chunked = 1;
-			else if (strncmp(line, "content-length:", 15) == 0) {
-				const char *v = line + 15;
-				while (*v == ' ' || *v == '\t')
-					v++;
-				/* digits only: junk or a negative value must not
-				 * drive body_left below zero */
-				if (*v >= '0' && *v <= '9')
-					r->content_length = atol(v);
-			}
-			line = strtok_r(NULL, "\r\n", &save);
-		}
-	}
-	if (r->chunked) {
-		r->chunk_state = 0;
-		r->chunk_left = 0;
-	} else {
-		r->body_left = r->content_length;
-	}
+	sb_appendn(&p->raw, buf, len);
 	return 0;
-}
-
-/* Raw byte source for body decoding: bytes the header read already
- * consumed come first, then the socket/TLS stream. Returns n>0, 0 EOF,
- * -1 error/timeout/cancel. */
-static int resp_raw_read(BaResp *r, char *out, size_t outsz)
-{
-	if (r->pending_len > 0) {
-		size_t n = r->pending_len < outsz ? r->pending_len : outsz;
-		memcpy(out, r->pending, n);
-		r->pending_len -= n;
-		memmove(r->pending, r->pending + n, r->pending_len);
-		return (int)n;
-	}
-	if (r->eof)
-		return 0;
-	return ba_read(r, out, outsz);
-}
-
-/* strict hex chunk-size: digits only (no sign), bounded, no overflow.
- * Accepts 0: the zero chunk is legal - it starts the trailer section. */
-static int parse_chunk_size_hex(const char *s, long *out)
-{
-	unsigned long v = 0;
-
-	if (!*s)
-		return -1;
-	for (; *s; s++) {
-		int d;
-		if (*s >= '0' && *s <= '9')      d = *s - '0';
-		else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
-		else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
-		else
-			return -1;   /* sign, space or extension junk */
-		if (v > (ULONG_MAX >> 4))
-			return -1;
-		v = (v << 4) | (unsigned long)d;
-	}
-	if (v > (unsigned long)BA_MAX_CHUNK_SIZE)
-		return -1;
-	*out = (long)v;
-	return 0;
-}
-
-/* Decode next piece of body into out (already de-chunked).
- * Returns n>0 data, 0 end of body, -1 error. */
-static int ba_body_read(BaResp *r, char *out, size_t outsz)
-{
-	if (!r->chunked) {
-		int n;
-		size_t want = outsz;
-		if (r->content_length >= 0) {
-			if (r->body_left <= 0)
-				return 0;
-			if (want > (size_t)r->body_left)
-				want = (size_t)r->body_left;
-		}
-		n = resp_raw_read(r, out, want);
-		if (n < 0)
-			return -1;
-		if (n == 0) {
-			r->eof = 1;
-			/* a fixed-length body cut short is an error, not EOF */
-			if (r->content_length >= 0 && r->body_left > 0)
-				return -1;
-			return 0;
-		}
-		if (r->content_length >= 0)
-			r->body_left -= n;
-		return n;
-	}
-
-	/* chunked: 0=size line, 1=chunk data, 2=CRLF after chunk data,
-	 * 3=trailer section after the zero chunk, 4=done.  The data-CRLF
-	 * and the trailer section are distinct states: collapsing them
-	 * (the old code) ended the body after the FIRST chunk. */
-	for (;;) {
-		char line[130];
-		size_t ln = 0;
-
-		if (r->chunk_state == 4)
-			return 0;   /* done */
-		if (r->chunk_state == 1) {
-			int n;
-			size_t want = r->chunk_left < (long)outsz
-			            ? (size_t)r->chunk_left : outsz;
-			n = resp_raw_read(r, out, want);
-			if (n < 0)
-				return -1;
-			if (n == 0)
-				return -1;   /* unexpected EOF mid-chunk */
-			r->chunk_left -= n;
-			if (r->chunk_left == 0)
-				r->chunk_state = 2;
-			return n;
-		}
-		/* read one header line (size line, data CRLF or trailer) */
-		for (;;) {
-			char ch;
-			int c = resp_raw_read(r, &ch, 1);
-			if (c <= 0)
-				return -1;
-			if (ch == '\n')
-				break;
-			if (ch == '\r')
-				continue;   /* part of CRLF */
-			if (ln >= sizeof(line) - 1)
-				return -1;   /* size/trailer line too long */
-			line[ln++] = ch;
-		}
-		line[ln] = '\0';
-		if (r->chunk_state == 2) {
-			if (ln != 0)
-				return -1;   /* missing CRLF after chunk data */
-			r->chunk_state = 0;
-			continue;   /* next chunk size */
-		}
-		if (r->chunk_state == 3) {
-			if (ln == 0) {
-				r->chunk_state = 4;   /* end of trailer section */
-				return 0;
-			}
-			continue;   /* trailer field: keep consuming */
-		}
-		/* state 0: "HEX[;ext]" size line */
-		{
-			char *semi = strchr(line, ';');
-			long v;
-			if (semi)
-				*semi = '\0';
-			if (parse_chunk_size_hex(line, &v) != 0)
-				return -1;
-			if (v == 0) {
-				r->chunk_state = 3;   /* zero chunk: trailers follow */
-				continue;
-			}
-			r->chunk_left = v;
-			r->chunk_state = 1;
-		}
-	}
-}
-
-/* 0 on success, -1 if any send failed. The plaintext path surfaces
- * write errors (EPIPE when the peer closed, ECONNRESET...); the TLS
- * path uses xwrite(), which exits the process on failure (libbb
- * semantics), so a short TLS write never returns here. */
-static int ba_send_request(tls_state_t *tls, int fd, const BaUrl *u, const char **headers,
-			    int header_count, const char *body, size_t body_len)
-{
-	char *first;
-	int i;
-	int rc = 0;
-
-	/* host and path are each up to ~1 KiB: too long for a stack buffer */
-	if (u->port != 80)
-		first = xasprintf("POST %s HTTP/1.1\r\n"
-				  "Host: %s:%d\r\n"
-				  "Content-Length: %lu\r\n"
-				  "Connection: close\r\n",
-				  u->path, u->host, u->port, (unsigned long)body_len);
-	else
-		first = xasprintf("POST %s HTTP/1.1\r\n"
-				  "Host: %s\r\n"
-				  "Content-Length: %lu\r\n"
-				  "Connection: close\r\n",
-				  u->path, u->host, (unsigned long)body_len);
-	rc |= send_all_conn(tls, fd, first, strlen(first));
-	free(first);
-	for (i = 0; i < header_count; i++) {
-		rc |= send_all_conn(tls, fd, headers[i], strlen(headers[i]));
-		rc |= send_all_conn(tls, fd, "\r\n", 2);
-	}
-	rc |= send_all_conn(tls, fd, "\r\n", 2);
-	rc |= send_all_conn(tls, fd, body, body_len);
-	return rc;
-}
-
-
-#if ENABLE_TLS
-/* https:// support: in-tree TLS state machine (networking/tls.c), the same
- * code ssl_client and wget use. Returns a handshaked session; the caller
- * owns it and free()s it with the socket.
- *
- * SECURITY: the in-tree TLS client performs NO certificate-chain, validity,
- * hostname, handshake-signature or Finished verification, and record MAC/tag
- * checking is not implemented either (networking/tls.c upstream comments).
- * A machine-in-the-middle can therefore finish a handshake with any
- * self-signed certificate and read/inject traffic, including API keys.
- * http_post_sse() prints a one-time warning so the trade-off is explicit. */
-static tls_state_t *ba_tls_connect(const char *host, int port)
-{
-	len_and_sockaddr *lsa;
-	int fd;
-	tls_state_t *tls;
-
-	lsa = host2sockaddr(host, port);
-	if (!lsa)
-		return NULL;
-	/* xconnect_stream() creates the socket, connects and RETURNS the fd
-	 * (libbb semantics) - keep its return value */
-	fd = xconnect_stream(lsa);
-	free(lsa);
-
-	tls = new_tls_state();
-	tls->ifd = tls->ofd = fd;
-	tls_handshake(tls, host);
-	return tls;
-}
-#endif
-
-/* release the per-request TLS state (inbuf/outbuf/hsd allocations);
- * the socket itself stays owned by the caller.  Compiled regardless of
- * ENABLE_TLS so the pump can call it unconditionally (no-op there). */
-static void ba_tls_dispose(tls_state_t *tls)
-{
-	if (!tls)
-		return;
-#if ENABLE_TLS
-	free(tls->inbuf);
-	free(tls->outbuf);
-	free(tls->hsd);
-#endif
-	free(tls);
-}
-
-/* The in-tree TLS client (networking/tls.c) authenticates neither the peer
- * nor the records: no certificate-chain, validity or hostname validation, no
- * handshake-signature/Finished verification and no MAC/tag checking. HTTPS
- * therefore works out of the box, but a machine in the middle controlling
- * the network can impersonate the endpoint. We make that trade-off explicit:
- * the connection is allowed, with a one-time warning on stderr. Point -u at
- * a TLS-terminating gateway or a trusted network for API credentials. */
-static void ba_tls_notice(void)
-{
-	static int warned;
-
-	if (!warned) {
-		warned = 1;
-		bb_error_msg("WARNING: https: the built-in TLS client does not verify"
-			     " server certificates or hostnames - use a trusted network"
-			     " or a TLS-terminating gateway for API credentials.");
-	}
 }
 
 /* Streaming POST with SSE pump. Mirrors the old curl semantics:
- * up to 2 retries, 1s delay, 20s total retry window, retry on 5xx. */
+ * up to 2 retries, 1s delay, 20s total retry window, retry on 5xx.
+ * HTTP connect/send/read all go through the shared agc_http core
+ * (agent_common.c) - the same client mcpc and oapi use. */
 int http_post_sse(const char *url, const char **headers, int header_count,
 		  const char *body, size_t body_len,
 		  const char *provider,
 		  sse_callback_fn callback, void *ctx,
 		  volatile int *cancelled)
 {
-	BaUrl u;
-	char buf[4096];
 	unsigned start_ms = monotonic_ms();
 	int attempt;
 
-	if (ba_parse_url(url, &u) != 0)
-		return -1;
-
-	/* https:// works out of the box; the authentication trade-off of the
-	 * in-tree TLS client (see ba_tls_notice) is announced on stderr once.
-	 * This also covers the ENABLE_TLS=0 build, where an https URL would
-	 * otherwise fall through to a plaintext connect. */
-	if (u.is_https)
-		ba_tls_notice();
-
 	for (attempt = 0; attempt <= BA_MAX_RETRIES; attempt++) {
 		StreamCtx sctx;
-		BaResp r;
-		int fd = -1;
-		tls_state_t *tls = NULL;
-		int io_err = 0, http_code = 0;
-
-#if ENABLE_TLS
-		if (u.is_https) {
-			tls = ba_tls_connect(u.host, u.port);
-			if (!tls) {
-				io_err = 1;
-				goto attempt_done;
-			}
-			fd = tls->ifd;
-		} else
-#endif
-		{
-			fd = ba_connect(u.host, u.port);
-			if (fd < 0) {
-				io_err = 1;
-				goto attempt_done;
-			}
-		}
-		memset(&r, 0, sizeof(r));
-		r.fd = fd;
-		r.tls = tls;
-		r.cancelled = cancelled;
-		(void)tls;
-		if (ba_send_request(tls, fd, &u, headers, header_count, body, body_len) != 0) {
-			io_err = 1;   /* request never left: no point reading a reply */
-			close(fd);
-			ba_tls_dispose(tls);
-			tls = NULL;
-			goto attempt_done;
-		}
-		if (ba_read_header(&r) != 0) {
-			io_err = 1;
-			close(fd);
-			ba_tls_dispose(tls);
-			tls = NULL;
-			goto attempt_done;
-		}
-		http_code = r.status;
+		BaSsePump pump;
+		AgcHttpReq req;
+		AgcHttpResp resp;
+		int rc, io_err, http_code;
 
 		sse_stream_init(&sctx, provider, callback, ctx, cancelled);
-		for (;;) {
-			int n = ba_body_read(&r, buf, sizeof(buf));
-			if (n < 0) {
-				io_err = 1;
-				break;
+		memset(&pump, 0, sizeof(pump));
+		pump.sctx = &sctx;
+		pump.resp = &resp;
+		sb_init(&pump.raw);
+		agc_sse_init(&pump.sse);
+
+		memset(&req, 0, sizeof(req));
+		req.method = "POST";
+		req.url = url;
+		req.headers = headers;
+		req.header_count = header_count;
+		req.body = body ? body : "";
+		req.body_len = body_len;
+		req.cancelled = cancelled;
+		req.timeout_ms = BA_READ_TIMEOUT_MS;
+
+		rc = agc_http_request_stream(&req, ba_sse_pump_chunk, &pump, &resp);
+		io_err = (rc != AGC_HTTP_COMPLETE && rc != AGC_HTTP_STOPPED);
+		http_code = resp.status;
+		agc_http_resp_free(&resp);
+
+		if (cancelled && *cancelled) {
+			sse_stream_free(&sctx);
+			agc_sse_free(&pump.sse);
+			sb_free(&pump.raw);
+			{
+				SseEvent st;
+				memset(&st, 0, sizeof(st));
+				st.type = SSE_STOP;
+				st.content = (char *)"interrupted";
+				callback(ctx, &st);
 			}
-			if (n == 0)
-				break;
-			if (sse_stream_feed(&sctx, buf, n) == 0) {
-				/* cancelled */
-				sse_stream_free(&sctx);
-				close(fd);
-				ba_tls_dispose(tls);
-				{
-					SseEvent st;
-					memset(&st, 0, sizeof(st));
-					st.type = SSE_STOP;
-					st.content = (char *)"interrupted";
-					callback(ctx, &st);
-				}
-				return 0;
-			}
+			return 0;
 		}
-		close(fd);
-		ba_tls_dispose(tls);
-		tls = NULL;
 
 		if (!io_err && http_code < 500) {
-			/* non-SSE JSON error bodies etc. */
-			sse_stream_finish(&sctx, provider, callback, ctx);
+			/* stream tail: a last unterminated event, the
+			 * responses termination check and - when nothing
+			 * looked like SSE at all - the plain JSON body */
+			agc_sse_finish(&pump.sse, ba_sse_dispatch_event, &pump);
+			if (!pump.sse.saw_sse)
+				process_residual_json(pump.raw.data ? pump.raw.data : "",
+						      provider, callback, ctx);
+			else if (strcmp(provider, "responses") == 0
+			 && !sctx.responses_terminal) {
+				emit_simple_event(callback, ctx, SSE_ERROR,
+					"Stream interrupted (no response.completed received)");
+				emit_simple_event(callback, ctx, SSE_STOP, "error");
+			}
 			sse_stream_free(&sctx);
+			agc_sse_free(&pump.sse);
+			sb_free(&pump.raw);
 			if (http_code >= 400)
 				return http_code;
 			return 0;
 		}
-		sse_stream_free(&sctx);
 		/* 5xx or io error: fall through to retry logic */
+		sse_stream_free(&sctx);
+		agc_sse_free(&pump.sse);
+		sb_free(&pump.raw);
 
-	attempt_done:
-		ba_tls_dispose(tls);
-		tls = NULL;
-		if (cancelled && *cancelled) {
-			SseEvent st;
-			memset(&st, 0, sizeof(st));
-			st.type = SSE_STOP;
-			st.content = (char *)"interrupted";
-			callback(ctx, &st);
-			return 0;
-		}
 		if (attempt >= BA_MAX_RETRIES)
 			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
-		(void)0;
-			if ((unsigned)(monotonic_ms() - start_ms) >= BA_RETRY_MAX_TIME_MS)
+		if ((unsigned)(monotonic_ms() - start_ms) >= BA_RETRY_MAX_TIME_MS)
 			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
 		{
 			SseEvent retry_evt;
@@ -2472,6 +1167,8 @@ char *ba_tool_call_summary(const char *name, const char *input_json)
     return xstrdup("");
 }
 
+char *ba_display_event_json(const BaDisplayMsg *msg, int stream_output);
+
 char *ba_display_event_json(const BaDisplayMsg *msg, int stream_output)
 {
     StrBuf buf;
@@ -2712,8 +1409,6 @@ char *ba_display_push(BaDisplay *ds, const BaDisplayMsg *msg)
 static void emit_simple_event(sse_callback_fn callback, void *ctx,
                               SseEventType type, const char *content);
 static void fill_openai_usage_event(SseEvent *evt, JsonVal usage);
-static void process_residual_json(StreamCtx *sctx, const char *provider,
-                              sse_callback_fn callback, void *ctx);
 
 static void streamctx_free_openai_tools(StreamCtx *sctx) {
     for (int i = 0; i < sctx->responses_item_count; i++) FREE_PTR(sctx->responses_item_ids[i]);
@@ -2982,45 +1677,6 @@ static void parse_responses_sse_event(StreamCtx *sctx, const char *event, const 
     }
 }
 
-/* Feed one decoded chunk of body; splits SSE events internally.
- * Called by the http pump; returns 0 when cancelled. */
-int sse_stream_feed(StreamCtx *sctx, const char *ptr, size_t total) {
-    if (sctx->cancelled && *(sctx->cancelled)) return 0;
-
-    for (size_t i = 0; i < total; i++) {
-        if (sctx->cancelled && *(sctx->cancelled)) return 0;
-        if (ptr[i] == '\n') {
-            char *line = sctx->line_buf.data;
-            size_t llen;
-            if (!line) {   /* empty line before any data (SSE allows it) */
-                continue;
-            }
-            llen = strlen(line);
-            if (llen > 0 && line[llen-1] == '\r') line[--llen] = '\0';
-
-            if (strncmp(line, "event: ", 7) == 0 && strcmp(sctx->provider, "responses") == 0) {
-                FREE_PTR(sctx->event);
-                sctx->event = util_strdup(line + 7);
-            } else if (strncmp(line, "data: ", 6) == 0) {
-                const char *data = line + 6;
-                if (strcmp(sctx->provider, "openai") == 0) parse_openai_sse_event(sctx, data, strlen(data));
-                else if (strcmp(sctx->provider, "responses") == 0) parse_responses_sse_event(sctx, sctx->event ? sctx->event : "", data, strlen(data));
-                else sse_parse_event(sctx->provider, data, strlen(data), sctx->callback, sctx->ctx);
-            } else if (strncmp(line, "data:", 5) == 0) {
-                const char *data = line + 5;
-                while (*data == ' ') data++;
-                if (strcmp(sctx->provider, "openai") == 0) parse_openai_sse_event(sctx, data, strlen(data));
-                else if (strcmp(sctx->provider, "responses") == 0) parse_responses_sse_event(sctx, sctx->event ? sctx->event : "", data, strlen(data));
-                else sse_parse_event(sctx->provider, data, strlen(data), sctx->callback, sctx->ctx);
-            }
-            sb_truncate(&sctx->line_buf, 0);
-        } else {
-            sb_append_char(&sctx->line_buf, ptr[i]);
-        }
-    }
-    return 1;
-}
-
 /* init/free StreamCtx (extracted from the old inline init) */
 void sse_stream_init(StreamCtx *sctx, const char *provider,
                      sse_callback_fn callback, void *ctx,
@@ -3028,27 +1684,16 @@ void sse_stream_init(StreamCtx *sctx, const char *provider,
     memset(sctx, 0, sizeof(*sctx));
     sctx->callback = callback;
     sctx->ctx = ctx;
-    sb_init(&sctx->line_buf);
     sctx->cancelled = cancelled;
     sctx->provider = (char *)provider;
 }
 
-
-/* After the stream: handle leftover non-SSE JSON, check responses termination.
- * Mirrors the success tail of the old curl-based http_post_sse. */
-void sse_stream_finish(StreamCtx *sctx, const char *provider,
-                       sse_callback_fn callback, void *ctx) {
-    process_residual_json(sctx, provider, callback, ctx);
-    if (strcmp(provider, "responses") == 0 && !sctx->responses_terminal) {
-        emit_simple_event(callback, ctx, SSE_ERROR, "Stream interrupted (no response.completed received)");
-        emit_simple_event(callback, ctx, SSE_STOP, "error");
-    }
-}
-
 void sse_stream_free(StreamCtx *sctx) {
-    sb_free(&sctx->line_buf);
-    FREE_PTR(sctx->event);
     streamctx_free_openai_tools(sctx);
+    sctx->callback = NULL;
+    sctx->ctx = NULL;
+    sctx->provider = NULL;
+    sctx->cancelled = NULL;
 }
 
 /* ============================================================
@@ -3078,11 +1723,10 @@ static void fill_openai_usage_event(SseEvent *evt, JsonVal usage) {
     }
 }
 
-/* handle non-SSE responses: parse leftover JSON in line_buf as a full reply */
-static void process_residual_json(StreamCtx *sctx, const char *provider,
+/* handle non-SSE responses: parse the whole JSON body as a full reply */
+static void process_residual_json(const char *residual, const char *provider,
                                   sse_callback_fn callback, void *ctx) {
-    if (!sctx->line_buf.data || sctx->line_buf.len == 0) return;
-    char *residual = sctx->line_buf.data;
+    if (!residual || !residual[0]) return;
     while (*residual == ' ' || *residual == '\t' || *residual == '\r' || *residual == '\n') residual++;
     if (*residual != '{') return;
 
@@ -3091,6 +1735,12 @@ static void process_residual_json(StreamCtx *sctx, const char *provider,
     if (jp.error) return;
 
     char *err_msg = json_get_string(jp.val, "error");
+    if (!err_msg) {
+        /* provider error objects: {"error":{"message":...}} (claude) */
+        JsonVal ev = json_get(jp.val, "error");
+        if (ev.type == JSON_OBJECT)
+            err_msg = json_get_string(ev, "message");
+    }
     if (err_msg) {
         emit_simple_event(callback, ctx, SSE_ERROR, err_msg);
         free(err_msg);
