@@ -47,7 +47,7 @@
 //usage:       "	-o FMT		Output format: json (default) or text\n"
 //usage:       "	--header H:V	Custom header, repeatable\n"
 //usage:       "	--dry-run	Print the request, send nothing\n"
-//usage:       "	--timeout N	Not implemented (compat flag)\n"
+//usage:       "	--timeout N	Request timeout in milliseconds\n"
 //usage:       "	--insecure	Accepted for compatibility (TLS is never verified)"
 
 #include "busyagent.h"
@@ -177,6 +177,8 @@ static char *oapi_reg_path(const char *name)
 }
 
 /* load the wrapper document; -1 when missing (does not die) */
+static void oapi_free(OapiRegistry *r);
+
 static int oapi_load(OapiRegistry *r, const char *name)
 {
 	FILE *f;
@@ -188,13 +190,18 @@ static int oapi_load(OapiRegistry *r, const char *name)
 	if (!r->path)
 		return -1;
 	f = fopen(r->path, "r");
-	if (!f)
+	if (!f) {
+		oapi_free(r);
+		memset(r, 0, sizeof(*r));
 		return -1;
+	}
 	fseek(f, 0, SEEK_END);
 	sz = ftell(f);
 	fseek(f, 0, SEEK_SET);
 	if (sz < 0) {
 		fclose(f);
+		oapi_free(r);
+		memset(r, 0, sizeof(*r));
 		return -1;
 	}
 	data = xmalloc(sz + 1);
@@ -209,6 +216,8 @@ static int oapi_load(OapiRegistry *r, const char *name)
 	 * alive until oapi_free() */
 	if (r->jp.error) {
 		bb_error_msg("%s: invalid registry entry: %s", name, r->jp.error);
+		oapi_free(r);
+		memset(r, 0, sizeof(*r));
 		return -1;
 	}
 	r->source = json_get_string(r->jp.val, "source");
@@ -216,6 +225,8 @@ static int oapi_load(OapiRegistry *r, const char *name)
 	r->spec = json_get(r->jp.val, "spec");
 	if (r->spec.type != JSON_OBJECT) {
 		bb_error_msg("%s: registry entry has no spec object", name);
+		oapi_free(r);
+		memset(r, 0, sizeof(*r));
 		return -1;
 	}
 	return 0;
@@ -275,7 +286,8 @@ static int oapi_save(const char *name, const char *source, const char *spec_json
  * case conversion + json pointer
  * ============================================================ */
 
-/* lower camel/kebab/snake to kebab-case: getPetById -> get-pet-by-id */
+/* lower camel/kebab/snake to kebab-case: getPetById -> get-pet-by-id,
+ * acronym runs included: getURLValue -> get-url-value */
 static char *oapi_kebab(const char *s)
 {
 	StrBuf sb;
@@ -289,13 +301,19 @@ static char *oapi_kebab(const char *s)
 			if (sb.len)
 				sb_append_char(&sb, '-');
 		} else if (c >= 'A' && c <= 'Z') {
-			/* break before an uppercase run unless the previous
-			 * character is uppercase too (acronym: getURL -> get-url) */
-			if (sb.len && sb.data[sb.len-1] != '-') {
-				char prev = p[-1];
-				if (!(prev >= 'A' && prev <= 'Z'))
-					sb_append_char(&sb, '-');
-			}
+			char prev = (p > s) ? p[-1] : '\0';
+			char next = p[1];
+
+			/* break before an uppercase that follows a lowercase
+			 * or digit (getPet), and before the last uppercase of
+			 * a run that is followed by a lowercase (getURLValue:
+			 * the V ends the URL acronym) */
+			if (sb.len && sb.data[sb.len-1] != '-'
+			 && ((prev >= 'a' && prev <= 'z')
+			     || (prev >= '0' && prev <= '9')
+			     || ((prev >= 'A' && prev <= 'Z')
+				 && next >= 'a' && next <= 'z')))
+				sb_append_char(&sb, '-');
 			sb_append_char(&sb, (char)(c - 'A' + 'a'));
 		} else {
 			sb_append_char(&sb, c);
@@ -531,7 +549,8 @@ static OapiOp *oapi_ops_find(OapiOps *ops, const char *cmd)
  * ============================================================ */
 
 /* Percent-encode a single path/query component.  A path parameter is
- * one resource segment: '/' must never escape it. */
+ * one resource segment: '/' must never escape it.  '%' passes through
+ * so pre-encoded values are not double-encoded. */
 static void oapi_encode(StrBuf *sb, const char *s)
 {
 	static const char hex[] = "0123456789ABCDEF";
@@ -540,7 +559,7 @@ static void oapi_encode(StrBuf *sb, const char *s)
 		unsigned char c = (unsigned char)*s;
 		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 		 || (c >= '0' && c <= '9') || c == '-' || c == '_'
-		 || c == '.' || c == '~')
+		 || c == '.' || c == '~' || c == '%')
 			sb_append_char(sb, (char)c);
 		else {
 			sb_append_char(sb, '%');
@@ -581,8 +600,12 @@ static char *oapi_base_url(OapiRegistry *r)
 				return abs;
 			}
 		}
-		if (url && url[0])
-			return url;   /* hope for the best */
+		if (url && url[0]) {
+			/* a relative servers url cannot be dialed; return it
+			 * for dry-run display and let the send path reject it
+			 * with a clear message */
+			return url;
+		}
 		free(url);
 	}
 	/* Swagger 2.0: "host" + "basePath" + "schemes[0]" */
@@ -610,9 +633,16 @@ static char *oapi_base_url(OapiRegistry *r)
 					  && strncmp(r->source, "http://", 7) == 0)
 					 ? "http" : "https";
 			{
-				char *abs = xasprintf("%s://%s%s", scheme, host,
-						      (base_path && base_path[0])
-						      ? base_path : "");
+				char *abs;
+				if (base_path && base_path[0] && base_path[0] != '/')
+					/* basePath without the leading slash would
+					 * glue onto the host */
+					abs = xasprintf("%s://%s/%s", scheme, host,
+							base_path);
+				else
+					abs = xasprintf("%s://%s%s", scheme, host,
+							(base_path && base_path[0])
+							? base_path : "");
 				free(host);
 				free(base_path);
 				return abs;
@@ -632,6 +662,76 @@ static char *oapi_base_url(OapiRegistry *r)
 /* dry-run prints the request line and headers; mask credential headers so a
  * key passed via --header never reaches the terminal or logs. Keeps the
  * auth scheme word (Bearer/Basic/...) for debuggability. */
+
+/* credential-header/parameter detection.  The name is normalized
+ * ('_' -> '-', lowercased) and matched as a whole - never as a
+ * substring: X-Auth-Request-User or X-Cookie-Consent must not be
+ * masked, while apikey, X_API_KEY, X-Access-Key-Id or arbitrarily
+ * long *-Token names must be. */
+static int oapi_name_is_sensitive(const char *name, size_t len)
+{
+	static const char * const exact[] = {
+		"authorization", "signature", "secret",
+		"key", "apikey", NULL,
+	};
+	static const char * const suffix[] = {
+		"-key", "-key-id", "-token", NULL,
+	};
+	char norm[256];
+	size_t n = 0;
+	int i;
+
+	for (; n < len && n < sizeof(norm) - 1; n++) {
+		char c = name[n];
+
+		if (c == '_')
+			c = '-';
+		norm[n] = (char)tolower((unsigned char)c);
+	}
+	norm[n] = '\0';
+
+	for (i = 0; exact[i]; i++)
+		if (strcmp(norm, exact[i]) == 0)
+			return 1;
+	for (i = 0; suffix[i]; i++) {
+		size_t sl = strlen(suffix[i]);
+
+		if (n > sl && strcmp(norm + n - sl, suffix[i]) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+/* request line with sensitive query values masked (api_key=***) */
+static void oapi_print_url_masked(const char *method, const char *url)
+{
+	const char *q = strchr(url, '?');
+	size_t i;
+
+	if (!q) {
+		printf("%s %s\n", method, url);
+		return;
+	}
+	printf("%s %.*s", method, (int)(q - url), url);
+	i = 1;   /* skip the '?' */
+	while (q[i]) {
+		const char *amp = strchr(q + i, '&');
+		const char *pair = q + i;
+		size_t plen = amp ? (size_t)(amp - pair) : strlen(pair);
+		const char *eq = memchr(pair, '=', plen);
+
+		putchar(i == 1 ? '?' : '&');
+		if (eq && oapi_name_is_sensitive(pair, eq - pair))
+			printf("%.*s=***", (int)(eq - pair), pair);
+		else
+			printf("%.*s", (int)plen, pair);
+		if (!amp)
+			break;
+		i = (size_t)(amp - q) + 1;
+	}
+	putchar('\n');
+}
+
 static void oapi_print_headers_masked(const char **headers, int n)
 {
 	int i;
@@ -639,25 +739,12 @@ static void oapi_print_headers_masked(const char **headers, int n)
 	for (i = 0; i < n; i++) {
 		const char *h = headers[i];
 		const char *colon = strchr(h, ':');
-		char lower[32];
-		size_t name_len, k;
 
 		if (!colon) {
 			printf("  %s\n", h);
 			continue;
 		}
-		name_len = colon - h;
-		if (name_len >= sizeof(lower))
-			name_len = sizeof(lower) - 1;
-		for (k = 0; k < name_len; k++)
-			lower[k] = tolower((unsigned char)h[k]);
-		lower[name_len] = '\0';
-		if (strstr(lower, "auth") || strstr(lower, "token")
-		 || strstr(lower, "secret") || strstr(lower, "cookie")
-		 || strstr(lower, "password")
-		 || (name_len == 3 && strcmp(lower, "key") == 0)
-		 || (name_len >= 4
-		     && strcmp(lower + name_len - 4, "-key") == 0)) {
+		if (oapi_name_is_sensitive(h, colon - h)) {
 			const char *val = colon + 1;
 			const char *sp;
 
@@ -665,7 +752,11 @@ static void oapi_print_headers_masked(const char **headers, int n)
 				val++;
 			sp = strchr(val, ' ');
 			if (sp && sp - val <= 16)
-				printf("  %.*s***\n", (int)(sp - val + 1), val);
+				/* "Authorization: Bearer ***": keep the
+				 * scheme word, drop the credentials */
+				printf("  %.*s: %.*s ***\n",
+				       (int)(colon - h), h,
+				       (int)(sp - val), val);
 			else
 				printf("  %.*s: ***\n", (int)(colon - h), h);
 			continue;
@@ -675,7 +766,8 @@ static void oapi_print_headers_masked(const char **headers, int n)
 }
 
 /* apply a --jq dot-path via the shared agc_json_path evaluator.
- * Returns 0 on match (printed), 1 when the path does not resolve. */
+ * Returns 0 on success (jq semantics: an empty match set, e.g. [] over
+ * an empty array, is success with no output), 1 on a path syntax error. */
 static int oapi_jq_print(JsonVal v, const char *path)
 {
 	AgcJqMatches m;
@@ -700,7 +792,7 @@ static int oapi_jq_print(JsonVal v, const char *path)
 		}
 	}
 	free(m.v);
-	return m.n ? 0 : 1;
+	return 0;
 }
 
 /* text output: scalar as-is, array element per line, object raw json */
@@ -783,7 +875,8 @@ static char *oapi_fetch_spec(const char *source)
 	return xmalloc_xopen_read_close(source, NULL);
 }
 
-static int oapi_cmd_connect(const char *name, const char *source)
+static int oapi_cmd_connect(const char *name, const char *source,
+			    int dry_run)
 {
 	char *spec;
 	JsonParse jp;
@@ -791,6 +884,12 @@ static int oapi_cmd_connect(const char *name, const char *source)
 	if (!oapi_valid_name(name)) {
 		bb_error_msg("bad name '%s'", name);
 		return 1;
+	}
+	if (dry_run) {
+		/* show what would be fetched; no network, no writes */
+		printf("GET %s\n", source);
+		printf("  connect %s\n", name);
+		return 0;
 	}
 	spec = oapi_fetch_spec(source);
 	if (!spec)
@@ -813,10 +912,30 @@ static int oapi_cmd_connect(const char *name, const char *source)
 	}
 	{
 		OapiOps ops;
+		int i, j, dup = 0;
+
 		oapi_ops_build(&ops, jp.val);
-		printf("connected %s: %d operations (source %s)\n",
-		       name, ops.count, source);
+		/* two operation ids collapsing onto the same kebab-case
+		 * name would make one unreachable from the CLI */
+		for (i = 0; i < ops.count && !dup; i++)
+			for (j = i + 1; j < ops.count; j++)
+				if (strcmp(ops.v[i].kebab, ops.v[j].kebab) == 0) {
+					bb_error_msg("operations '%s' and '%s' both map "
+						     "to '%s' (kebab collision)",
+						     ops.v[i].op_id,
+						     ops.v[j].op_id,
+						     ops.v[i].kebab);
+					dup = 1;
+					break;
+				}
+		if (!dup)
+			printf("connected %s: %d operations (source %s)\n",
+			       name, ops.count, source);
 		oapi_ops_free(&ops);
+		if (dup) {
+			free(spec);
+			return 1;
+		}
 	}
 	free(spec);
 	return 0;
@@ -906,10 +1025,15 @@ static int oapi_cmd_schema(OapiRegistry *r, const char *opname)
 				typ = json_get_string(schema, "type");
 			if (!typ)
 				typ = json_get_string(p, "type");
-			printf("  --%s  in:%s%s%s%s\n",
-			       nm ? oapi_kebab(nm) : "?", in ? in : "?",
-			       typ ? " type:" : "", typ ? typ : "",
-			       req ? "  (required)" : "");
+			{
+				char *kb = nm ? oapi_kebab(nm) : NULL;
+
+				printf("  --%s  in:%s%s%s%s\n",
+				       kb ? kb : "?", in ? in : "?",
+				       typ ? " type:" : "", typ ? typ : "",
+				       req ? "  (required)" : "");
+				free(kb);
+			}
 			free(nm); free(in); free(typ);
 		}
 		if (o->has_body)
@@ -1001,7 +1125,7 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 		if (a[0] == '-' && a[1] == '-' && a[2]) {
 			if (strcmp(a, "--dry-run") == 0) { opts->dry_run = 1; continue; }
 			if (strcmp(a, "--body") == 0) {
-				if (!argv[i + 1])
+				if (!argv[i + 1] || oapi_option_token(argv[i + 1]))
 					bb_error_msg_and_die("missing value for --body");
 				opts->body = argv[++i];
 				continue;
@@ -1011,7 +1135,7 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 				continue;
 			}
 			if (strcmp(a, "--jq") == 0) {
-				if (!argv[i + 1])
+				if (!argv[i + 1] || oapi_option_token(argv[i + 1]))
 					bb_error_msg_and_die("missing value for --jq");
 				opts->jq = argv[++i];
 				continue;
@@ -1093,9 +1217,12 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 			continue;
 		}
 		if (strcmp(a, "-o") == 0) {
-			if (!argv[i + 1])
+			if (!argv[i + 1] || oapi_option_token(argv[i + 1]))
 				bb_error_msg_and_die("missing value for -o");
-			opts->text_out = (strcmp(argv[++i], "text") == 0);
+			if (strcmp(argv[i + 1], "text") != 0)
+				bb_error_msg_and_die("-o supports 'text' only");
+			opts->text_out = 1;
+			i++;
 			continue;
 		}
 		if (n_pos >= 16)
@@ -1263,13 +1390,12 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 	/* body: --body or -F fields */
 	sb_init(&body);
 	if (opts->body) {
+		if (opts->n_f)
+			bb_error_msg_and_die("--body and -F are mutually exclusive");
 		if (opts->body[0] == '@') {
+			/* xmalloc_xopen_read_close dies on failure */
 			char *data = xmalloc_xopen_read_close(opts->body + 1, NULL);
-			if (!data) {
-				bb_perror_msg("%s", opts->body + 1);
-				sb_free(&url); sb_free(&query); sb_free(&body);
-				goto out_free;
-			}
+
 			sb_append(&body, data);
 			free(data);
 		} else if (strcmp(opts->body, "-") == 0) {
@@ -1303,7 +1429,7 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 
 	/* send */
 	if (opts->dry_run) {
-		printf("%s %s\n", op->method, url.data);
+		oapi_print_url_masked(op->method, url.data);
 		oapi_print_headers_masked(opts->headers, opts->n_headers);
 		if (body.len)
 			printf("  body: %s\n", body.data);
@@ -1311,6 +1437,14 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 	} else {
 		AgcHttpReq req;
 		AgcHttpResp resp;
+
+		if (strncmp(url.data, "http://", 7) != 0
+		 && strncmp(url.data, "https://", 8) != 0) {
+			bb_error_msg("base url '%s' is not absolute "
+				     "(relative servers url; dry-run only)",
+				     url.data);
+			goto out_send;
+		}
 		memset(&req, 0, sizeof(req));
 		req.method = op->method;
 		req.url = url.data;
@@ -1339,7 +1473,7 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 				goto out_send;
 			}
 			if (oapi_jq_print(jp.val, opts->jq) != 0) {
-				bb_error_msg("--jq path '%s' not found", opts->jq);
+				bb_error_msg("--jq path '%s' is invalid", opts->jq);
 				agc_http_resp_free(&resp);
 				goto out_send;
 			}
@@ -1490,13 +1624,22 @@ static int oapi_cmd_api(OapiRegistry *r, const char *method, const char *path,
 		return 1;
 	}
 	if (opts->dry_run) {
-		printf("%s %s\n", method, url.data);
+		oapi_print_url_masked(method, url.data);
 		oapi_print_headers_masked(opts->headers, opts->n_headers);
 		if (data)
 			printf("  body: %s\n", data);
 		sb_free(&url);
 		free(base);
 		return 0;
+	}
+	if (strncmp(url.data, "http://", 7) != 0
+	 && strncmp(url.data, "https://", 8) != 0) {
+		bb_error_msg("base url '%s' is not absolute "
+			     "(relative servers url; dry-run only)",
+			     url.data);
+		sb_free(&url);
+		free(base);
+		return 1;
 	}
 	memset(&req, 0, sizeof(req));
 	req.method = method;
@@ -1580,7 +1723,7 @@ int oapi_main(int argc UNUSED_PARAM, char **argv)
 	if (strcmp(argv[1], "connect") == 0) {
 		if (!argv[2] || !argv[3] || argv[4])
 			bb_error_msg_and_die("usage: oapi connect NAME SPEC-URL-OR-FILE");
-		return oapi_cmd_connect(argv[2], argv[3]);
+		return oapi_cmd_connect(argv[2], argv[3], opts.dry_run);
 	}
 	if (strcmp(argv[1], "sync") == 0) {
 		int rc;
@@ -1590,7 +1733,7 @@ int oapi_main(int argc UNUSED_PARAM, char **argv)
 			return 1;
 		if (!r.source || !r.source[0])
 			bb_error_msg_and_die("%s: registry entry has no source", argv[2]);
-		rc = oapi_cmd_connect(argv[2], r.source);
+		rc = oapi_cmd_connect(argv[2], r.source, opts.dry_run);
 		oapi_free(&r);
 		return rc;
 	}
