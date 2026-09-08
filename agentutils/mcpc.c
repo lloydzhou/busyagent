@@ -45,7 +45,8 @@
 //usage:       "@NAME ping			Protocol ping\n"
 //usage:       "\n"
 //usage:       "	--json		Raw JSON output for scripting\n"
-//usage:       "	--insecure	Accepted for compatibility (TLS is never verified)"
+//usage:       "	--insecure	Accepted for compatibility (TLS is never verified)\n"
+//usage:       "	--timeout N	Accepted for compatibility (fixed timeouts)"
 
 #include "busyagent.h"
 #include "agent_common.h"
@@ -64,7 +65,8 @@
 #define MCPC_MAX_SESSIONS 16
 #define MCPC_STDIO_TIMEOUT_MS 30000
 #define MCPC_CLIENT_TIMEOUT_MS 30000
-#define MCPC_MAX_LINE (16 * 1024)
+/* one JSON-RPC line (request or response) - tool lists run large */
+#define MCPC_MAX_LINE (4 * 1024 * 1024)
 #define MCPC_DAEMON_START_MS 5000
 #define MCPC_LOCK_MODE 0600
 
@@ -363,8 +365,11 @@ static char *mcpc_read_line_to(int fd, int timeout_ms)
 		if (ch == '\n')
 			break;
 		if (ch != '\r') {
-			if (sb.len >= MCPC_MAX_LINE)
+			if (sb.len >= MCPC_MAX_LINE) {
+				bb_error_msg("response line over %d bytes",
+					     MCPC_MAX_LINE);
 				goto fail;
+			}
 			sb_append_char(&sb, ch);
 		}
 	}
@@ -531,7 +536,10 @@ static int mcpc_http_chunk(void *ctx, const char *data, size_t len)
 	return c->json ? 1 : 0;
 }
 
-static char *mcpc_http_roundtrip(McpSession *s, const char *req, int want_id)
+/* status_out (optional) receives the HTTP status code once the response
+ * header arrived; 0 when no header was ever parsed (transport error) */
+static char *mcpc_http_roundtrip(McpSession *s, const char *req,
+				 int want_id, int *status_out)
 {
 	AgcHttpResp resp;
 	const char *hdrs[MCPC_MAX_HEADERS + 3];
@@ -565,6 +573,8 @@ static char *mcpc_http_roundtrip(McpSession *s, const char *req, int want_id)
 	rc = agc_http_request_stream(&hreq, mcpc_http_chunk, &ctx, &resp);
 	if (sid_idx >= 0)
 		free((void *)hdrs[sid_idx]);
+	if (status_out)
+		*status_out = resp.status;
 	if (rc < 0) {
 		s->dead = 1;
 		agc_sse_free(&ctx.sse);
@@ -592,6 +602,7 @@ static char *mcpc_http_roundtrip(McpSession *s, const char *req, int want_id)
 		if (!ctx.json) {
 			agc_sse_free(&ctx.sse);
 			agc_http_resp_free(&resp);
+			sb_free(&ctx.body);
 			bb_error_msg("SSE stream carried no matching message event");
 			return NULL;
 		}
@@ -655,7 +666,7 @@ static char *mcpc_rpc_call(McpSession *s, const char *method,
 	if (s->transport == 1)
 		resp = mcpc_stdio_roundtrip(s, req, s->next_id);
 	else
-		resp = mcpc_http_roundtrip(s, req, s->next_id);
+		resp = mcpc_http_roundtrip(s, req, s->next_id, NULL);
 	s->next_id++;
 	free(req);
 	return resp;
@@ -673,14 +684,28 @@ static int mcpc_notify(McpSession *s, const char *method)
 			rc = -1;
 		}
 	} else {
-		/* Notifications do not carry an id; a 202/empty response is valid. */
-		char *r = mcpc_http_roundtrip(s, req, -1);
-		if (!r && s->dead)
+		/* Notifications do not carry an id; a 202/empty response is
+		 * valid.  Success is judged by the HTTP status: any 2xx
+		 * means delivered, everything else (including transport
+		 * errors, where no status arrives) is a failure. */
+		int st = 0;
+		char *r = mcpc_http_roundtrip(s, req, -1, &st);
+
+		if (!r && (s->dead || st < 200 || st >= 300))
 			rc = -1;
 		free(r);
 	}
 	free(req);
 	return rc;
+}
+
+/* raw source slice of an array value (malloc'd), or the default when
+ * the value is absent/not an array */
+static char *mcpc_json_array_raw(JsonVal v, const char *def)
+{
+	if (v.type == JSON_ARRAY)
+		return xstrndup(v.src + v.start, v.end - v.start);
+	return xstrdup(def);
 }
 
 /* initialize + initialized; 0 on success (fills server_info/tools) */
@@ -718,12 +743,15 @@ static int mcpc_handshake(McpSession *s)
 	}
 	{
 		JsonVal si = json_get(result, "serverInfo");
+		char *si_json;
+
+		/* helpers return the raw slice; sb_append() copies, so the
+		 * temporaries must be freed here */
+		si_json = (si.type == JSON_OBJECT)
+			? xstrndup(si.src + si.start, si.end - si.start)
+			: xstrdup("{}");
 		free(s->server_info_json);
-		if (si.type == JSON_OBJECT)
-			s->server_info_json = xstrndup(si.src + si.start,
-						       si.end - si.start);
-		else
-			s->server_info_json = xstrdup("{}");
+		s->server_info_json = si_json;
 	}
 	free(resp);
 	if (mcpc_notify(s, "notifications/initialized") != 0)
@@ -731,20 +759,24 @@ static int mcpc_handshake(McpSession *s)
 
 	/* cache the tool list up front: tools-list/grep stay offline */
 	resp = mcpc_rpc_call(s, "tools/list", "");
-	if (resp) {
-		jp = json_parse_root(resp);
-		if (!jp.error) {
-			JsonVal r2 = json_get(jp.val, "result");
-			JsonVal tools = json_get(r2, "tools");
-			free(s->tools_json);
-			if (tools.type == JSON_ARRAY)
-				s->tools_json = xstrndup(tools.src + tools.start,
-							  tools.end - tools.start);
-			else
-				s->tools_json = xstrdup("[]");
-		}
-		free(resp);
+	if (!resp) {
+		bb_error_msg("tools/list failed during connect");
+		return -1;
 	}
+	jp = json_parse_root(resp);
+	if (jp.error) {
+		bb_error_msg("bad tools/list response: %s", jp.error);
+		free(resp);
+		return -1;
+	}
+	{
+		JsonVal r2 = json_get(jp.val, "result");
+		JsonVal tools = json_get(r2, "tools");
+
+		free(s->tools_json);
+		s->tools_json = mcpc_json_array_raw(tools, "[]");
+	}
+	free(resp);
 	return 0;
 }
 
@@ -787,12 +819,25 @@ static McpSession *mcpc_sess_open(const char *name, const char *target,
 		if (strncmp(target, "http://", 7) != 0
 		 && strncmp(target, "https://", 8) != 0) {
 			/* upstream convenience: bare host -> https:// */
+			if (strlen(target) + 8 + 1 > sizeof(s->url)) {
+				bb_error_msg("target url too long");
+				goto fail;
+			}
 			snprintf(s->url, sizeof(s->url), "https://%s", target);
 		} else {
+			if (strlen(target) + 1 > sizeof(s->url)) {
+				bb_error_msg("target url too long");
+				goto fail;
+			}
 			snprintf(s->url, sizeof(s->url), "%s", target);
 		}
-		if (extra_header && extra_header[0])
+		if (extra_header && extra_header[0]) {
+			if (s->n_headers >= MCPC_MAX_HEADERS) {
+				bb_error_msg("too many headers");
+				goto fail;
+			}
 			s->headers[s->n_headers++] = xstrdup(extra_header);
+		}
 	}
 	if (protocol_version && protocol_version[0])
 		s->protocol_version = xstrdup(protocol_version);
@@ -832,12 +877,23 @@ static char *mcpc_err(const char *fmt, const char *arg)
 				for (; *a; a++) {
 					if (*a == '"' || *a == '\\')
 						sb_append_char(&sb, '\\');
+					if ((unsigned char)*a < 0x20) {
+						/* keep the line protocol intact */
+						sb_appendf(&sb, "\\u%04x",
+							   (unsigned char)*a);
+						continue;
+					}
 					sb_append_char(&sb, *a);
 				}
 				p++;
 			} else {
 				if (*p == '"' || *p == '\\')
 					sb_append_char(&sb, '\\');
+				if ((unsigned char)*p < 0x20) {
+					sb_appendf(&sb, "\\u%04x",
+						   (unsigned char)*p);
+					continue;
+				}
 				sb_append_char(&sb, *p);
 			}
 		}
@@ -846,26 +902,38 @@ static char *mcpc_err(const char *fmt, const char *arg)
 	return sb.data;
 }
 
+/* json-escape a string into sb */
+static void mcpc_esc(StrBuf *sb, const char *s);
+
 static char *mcpc_daemon_handle(const char *line)
 {
 	JsonParse jp = json_parse_root(line);
-	char *op;
-	char *name;
-	char *str;
+	char *op = NULL;
+	char *name = NULL;
+	char *reply = NULL;
 
-	if (jp.error)
-		return mcpc_err("bad request: %s", jp.error);
+	if (jp.error) {
+		reply = mcpc_err("bad request: %s", jp.error);
+		goto out;
+	}
 	op = json_get_string(jp.val, "op");
-	if (!op)
-		return mcpc_err("missing op", NULL);
+	if (!op) {
+		reply = mcpc_err("missing op", NULL);
+		goto out;
+	}
 	name = json_get_string(jp.val, "name");
 
 	if (strcmp(op, "ping") == 0) {
-		if (!name)
-			return mcpc_err("missing name", NULL);
-		if (!mcpc_sess_find(name))
-			return mcpc_err("no live session: %s", name);
-		return mcpc_ok("{\"alive\":true}");
+		if (!name) {
+			reply = mcpc_err("missing name", NULL);
+			goto out;
+		}
+		if (!mcpc_sess_find(name)) {
+			reply = mcpc_err("no live session: %s", name);
+			goto out;
+		}
+		reply = mcpc_ok("{\"alive\":true}");
+		goto out;
 	}
 	if (strcmp(op, "list") == 0) {
 		StrBuf sb;
@@ -878,34 +946,40 @@ static char *mcpc_daemon_handle(const char *line)
 				continue;
 			if (sb.len > 1)
 				sb_append_char(&sb, ',');
-			sb_appendf(&sb, "{\"name\":\"%s\",\"transport\":\"%s\","
+			sb_append(&sb, "{\"name\":");
+			mcpc_esc(&sb, s->name);
+			sb_appendf(&sb, ",\"transport\":\"%s\","
 				   "\"pid\":%d,\"server_info\":%s}",
-				   s->name, s->transport ? "stdio" : "http",
+				   s->transport ? "stdio" : "http",
 				   (int)getpid(),
 				   s->server_info_json ? s->server_info_json : "{}");
 		}
 		sb_append(&sb, "]");
-		str = mcpc_ok(sb.data);
+		reply = mcpc_ok(sb.data);
 		sb_free(&sb);
-		return str;
+		goto out;
 	}
 	if (strcmp(op, "connect") == 0) {
 		McpSession *s;
 		char *target = json_get_string(jp.val, "target");
 		char *hdr = json_get_string(jp.val, "header");
 		char *ver = json_get_string(jp.val, "protocol_version");
-		char *reply;
 
 		if (!name || !target) {
+			free(target);
+			free(hdr);
 			free(ver);
-			return mcpc_err("connect needs name+target", NULL);
+			reply = mcpc_err("connect needs name+target", NULL);
+			goto out;
 		}
 		s = mcpc_sess_open(name, target, hdr, ver);
 		free(target);
 		free(hdr);
 		free(ver);
-		if (!s)
-			return mcpc_err("cannot connect %s", name);
+		if (!s) {
+			reply = mcpc_err("cannot connect %s", name);
+			goto out;
+		}
 		{
 			char *r = xasprintf("{\"server_info\":%s,\"tools\":%s}",
 					    s->server_info_json ? s->server_info_json : "{}",
@@ -913,41 +987,49 @@ static char *mcpc_daemon_handle(const char *line)
 			reply = mcpc_ok(r);
 			free(r);
 		}
-		return reply;
+		goto out;
 	}
 	if (strcmp(op, "close") == 0) {
 		int i;
-		if (!name)
-			return mcpc_err("missing name", NULL);
+		if (!name) {
+			reply = mcpc_err("missing name", NULL);
+			goto out;
+		}
 		for (i = 0; i < g_n_sessions; i++) {
 			if (g_sessions[i] && strcmp(g_sessions[i]->name, name) == 0) {
 				mcpc_sess_free(g_sessions[i]);
 				g_sessions[i] = g_sessions[g_n_sessions - 1];
 				g_n_sessions--;
-				return mcpc_ok(NULL);
+				reply = mcpc_ok(NULL);
+				goto out;
 			}
 		}
-		return mcpc_err("no such session: %s", name);
+		reply = mcpc_err("no such session: %s", name);
+		goto out;
 	}
 	if (strcmp(op, "call") == 0) {
 		McpSession *s;
 		char *method;
 		char *params;
 		char *resp;
-		char *reply = NULL;
 
-		if (!name)
-			return mcpc_err("missing name", NULL);
+		if (!name) {
+			reply = mcpc_err("missing name", NULL);
+			goto out;
+		}
 		s = mcpc_sess_find(name);
-		if (!s)
-			return mcpc_err("no live session: %s", name);
+		if (!s) {
+			reply = mcpc_err("no live session: %s", name);
+			goto out;
+		}
 		method = json_get_string(jp.val, "method");
 		/* params may be any JSON type (object for tools/call arguments):
 		 * take the raw source slice, not just string values */
 		params = json_as_string(json_get(jp.val, "params"));
 		if (!method) {
 			free(params);
-			return mcpc_err("missing method", NULL);
+			reply = mcpc_err("missing method", NULL);
+			goto out;
 		}
 		resp = mcpc_rpc_call(s, method, params);
 		free(method);
@@ -957,29 +1039,40 @@ static char *mcpc_daemon_handle(const char *line)
 		else
 			reply = mcpc_ok(resp);
 		free(resp);
-		return reply;
+		goto out;
 	}
 	if (strcmp(op, "tools") == 0) {
 		McpSession *s;
-		if (!name)
-			return mcpc_err("missing name", NULL);
+		if (!name) {
+			reply = mcpc_err("missing name", NULL);
+			goto out;
+		}
 		s = mcpc_sess_find(name);
-		if (!s)
-			return mcpc_err("no live session: %s", name);
+		if (!s) {
+			reply = mcpc_err("no live session: %s", name);
+			goto out;
+		}
 		{
 			char *r = xasprintf("{\"server_info\":%s,\"tools\":%s}",
 					    s->server_info_json ? s->server_info_json : "{}",
 					    s->tools_json ? s->tools_json : "[]");
-			char *reply = mcpc_ok(r);
+			reply = mcpc_ok(r);
 			free(r);
-			return reply;
 		}
+		goto out;
 	}
 	if (strcmp(op, "stop") == 0) {
 		g_stop = 1;
-		return mcpc_ok("{\"stopping\":true}");
+		reply = mcpc_ok("{\"stopping\":true}");
+		goto out;
 	}
-	return mcpc_err("unknown op: %s", op);
+	reply = mcpc_err("unknown op: %s", op);
+ out:
+	/* single exit: op/name ownership lives here, every branch
+	 * returns its reply through this tail */
+	free(op);
+	free(name);
+	return reply;
 }
 
 static void mcpc_sighandler(int sig UNUSED_PARAM)
@@ -1038,7 +1131,8 @@ static int mcpc_daemon_run(void)
 	mcpc_ignore_sigpipe();
 	{
 		char *d = mcpc_dir();
-		bb_make_directory(d, 0755, FILEUTILS_RECUR);
+		/* owner-only: the socket and pid/lock files live here */
+		bb_make_directory(d, 0700, FILEUTILS_RECUR);
 		free(d);
 	}
 	lockfd = open(lp, O_RDWR | O_CREAT, MCPC_LOCK_MODE);
@@ -1087,6 +1181,8 @@ static int mcpc_daemon_run(void)
 		free(pp);
 		return 1;
 	}
+	/* whatever umask says: only the owner may talk to the daemon */
+	chmod(sp, 0600);
 	{
 		FILE *f = fopen(pp, "w");
 		if (!f) {
@@ -1148,16 +1244,22 @@ static int mcpc_daemon_run(void)
 				if (ch == '\n')
 					break;
 				if (ch != '\r') {
-					if (sb.len >= MCPC_MAX_LINE)
+					if (sb.len >= MCPC_MAX_LINE) {
+						bb_error_msg("request over %d bytes; dropped",
+							     MCPC_MAX_LINE);
 						break;
+					}
 					sb_append_char(&sb, ch);
 				}
 			}
 			if (sb.data) {
 				resp = mcpc_daemon_handle(sb.data);
 				if (resp) {
-					full_write(cfd, resp, strlen(resp));
-					full_write(cfd, "\n", 1);
+					size_t rlen = strlen(resp);
+
+					if (full_write(cfd, resp, rlen) != (ssize_t)rlen
+					 || full_write(cfd, "\n", 1) != 1)
+						bb_perror_msg("write response");
 					free(resp);
 				}
 			}
@@ -1360,6 +1462,8 @@ static char *mcpc_rpc(const char *line)
 				break;
 			if (ch != '\r') {
 				if (sb.len >= MCPC_MAX_LINE) {
+					bb_error_msg("daemon response over %d bytes",
+						     MCPC_MAX_LINE);
 					sb_free(&sb);
 					close(fd);
 					return NULL;
@@ -1426,6 +1530,10 @@ static int mcpc_cmd_connect(const char *name, const char *target,
 		JsonVal r = json_get(jp.val, "result");
 		JsonVal si = json_get(r, "server_info");
 		JsonVal tools = json_get(r, "tools");
+		char *si_json = (si.type == JSON_OBJECT)
+			? xstrndup(si.src + si.start, si.end - si.start)
+			: xstrdup("{}");
+		char *tools_json = mcpc_json_array_raw(tools, "[]");
 		StrBuf cache;
 		sb_init(&cache);
 		sb_append(&cache, "{\"transport\":");
@@ -1433,14 +1541,12 @@ static int mcpc_cmd_connect(const char *name, const char *target,
 		sb_append(&cache, ",\"source\":");
 		mcpc_esc(&cache, target);
 		sb_append(&cache, ",\"server_info\":");
-		sb_append(&cache, si.type == JSON_OBJECT
-			  ? xstrndup(si.src + si.start, si.end - si.start)
-			  : xstrdup("{}"));
+		sb_append(&cache, si_json);
 		sb_append(&cache, ",\"tools\":");
-		sb_append(&cache, tools.type == JSON_ARRAY
-			  ? xstrndup(tools.src + tools.start, tools.end - tools.start)
-			  : xstrdup("[]"));
+		sb_append(&cache, tools_json);
 		sb_append(&cache, "}");
+		free(si_json);
+		free(tools_json);
 		mcpc_cache_save(name, cache.data);
 		sb_free(&cache);
 	}
@@ -1491,9 +1597,18 @@ static int mcpc_cmd_session(const char *name, char **argv, int argc,
 		bb_error_msg_and_die("no session command (tools-list|tools-get|tools-call|ping)");
 
 	if (strcmp(cmd, "ping") == 0) {
-		char *req = xasprintf("{\"op\":\"ping\",\"name\":\"%s\"}", name);
-		char *resp = mcpc_rpc(req);
+		StrBuf req_sb;
+		char *req;
+		char *resp;
 		JsonParse jp;
+
+		sb_init(&req_sb);
+		sb_append(&req_sb, "{\"op\":\"ping\",\"name\":");
+		mcpc_esc(&req_sb, name);
+		sb_append(&req_sb, "}");
+		req = req_sb.data;
+
+		resp = mcpc_rpc(req);
 
 		free(req);
 		if (!resp)
@@ -1543,11 +1658,14 @@ static int mcpc_cmd_session(const char *name, char **argv, int argc,
 				return 1;
 			jp = json_parse_root(resp);
 			if (!jp.error && json_get_bool(jp.val, "ok", 0)) {
-				char *tools = json_get_string(json_get(jp.val, "result"), "tools");
+				/* tools is an array: take the raw slice, not a
+				 * (always empty) string decoding */
+				char *tools = mcpc_json_array_raw(
+					json_get(json_get(jp.val, "result"), "tools"), "[]");
 				if (json_out)
-					printf("%s\n", tools ? tools : "[]");
+					printf("%s\n", tools);
 				else
-					mcpc_print_tools(tools ? tools : "[]", full);
+					mcpc_print_tools(tools, full);
 				free(tools);
 				rc = 0;
 			}
