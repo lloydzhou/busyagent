@@ -21,7 +21,8 @@
  * ============================================================ */
 #define BA_CONNECT_TIMEOUT_MS  5000
 #define BA_MAX_HEADER          (64 * 1024)
-#define BA_MAX_SSE_LINE        (64 * 1024)
+/* one SSE field line; SSE data payloads can be much larger */
+#define BA_MAX_SSE_LINE        (1024 * 1024)
 #define BA_MAX_SSE_DATA        (4 * 1024 * 1024)
 #define BA_MAX_HEADERS         64
 #define BA_TLS_RECHDR_LEN      5     /* TLS record header (networking/tls.c) */
@@ -47,6 +48,16 @@ int ba_parse_url(const char *url, BaUrl *u)
 
 	if (!url || !u)
 		return -1;
+	{
+		/* control characters anywhere in the url (path included)
+		 * would smuggle line breaks into the request; reject them
+		 * up front, before any part is copied into place */
+		const char *c;
+
+		for (c = url; *c; c++)
+			if ((unsigned char)*c < 0x20 || *c == 0x7f)
+				return -1;
+	}
 	memset(u, 0, sizeof(*u));
 	if (strncmp(url, "https://", 8) == 0) {
 		u->is_https = 1;
@@ -779,6 +790,12 @@ int agc_http_request_stream(const AgcHttpReq *req,
 	}
 	if (ba_parse_url(req->url, &u) != 0)
 		return AGC_HTTP_ERROR;
+#if !ENABLE_TLS
+	/* belt and braces: without TLS support an https url must fail
+	 * instead of silently degrading to a plaintext connection */
+	if (u.is_https)
+		return AGC_HTTP_ERROR;
+#endif
 	if (u.is_https)
 		ba_tls_notice();
 
@@ -1021,6 +1038,8 @@ void agc_sse_finish(AgcSse *s, agc_sse_event_fn fn, void *ctx)
 		return;
 	if (s->line_len > 0)
 		agc_sse_field(s);
+	if (s->error)
+		return;   /* the final field may still overflow */
 	agc_sse_dispatch(s, fn, ctx);
 }
 

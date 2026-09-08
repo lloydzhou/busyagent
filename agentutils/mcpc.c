@@ -16,6 +16,7 @@
 //config:	bool "mcpc (28 kb)"
 //config:	default y
 //config:	select AGENTUTILS_COMMON
+//config:	select TLS
 //config:	help
 //config:	  MCP client with daemon-held sessions: 'mcpc connect URL [@name]'
 //config:	  establishes a session, then 'mcpc @name tools-list' and

@@ -14,6 +14,7 @@
 //config:	bool "oapi (12 kb)"
 //config:	default y
 //config:	select AGENTUTILS_COMMON
+//config:	select TLS
 //config:	help
 //config:	  OpenAPI command line client: 'oapi connect NAME SPEC' caches an
 //config:	  API document, then 'oapi NAME OPERATION [args] [--flags]' builds

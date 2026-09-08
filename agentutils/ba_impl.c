@@ -57,6 +57,9 @@ typedef struct {
 	StreamCtx *sctx;
 	AgcSse sse;
 	StrBuf raw;         /* whole body while no SSE field was recognized */
+	AgcHttpResp *resp;  /* response headers, filled before body chunks */
+	int mode_known;     /* content-type evaluated for this body */
+	int is_sse;         /* body declared itself text/event-stream */
 } BaSsePump;
 
 /* one complete SSE event: dispatch each data line separately, matching
@@ -101,14 +104,29 @@ static int ba_sse_pump_chunk(void *vctx, const char *buf, size_t len)
 
 	if (p->sctx->cancelled && *(p->sctx->cancelled))
 		return -1;
-	agc_sse_feed(&p->sse, buf, len, ba_sse_dispatch_event, p);
-	if (p->sse.error)
+	if (!p->mode_known) {
+		/* the response header is in: decide once whether this is
+		 * an SSE stream or a plain JSON document.  A large plain
+		 * body must not be fed through the SSE line splitter
+		 * (its per-line cap does not apply to JSON bodies). */
+		const char *ct = p->resp ? p->resp->content_type : NULL;
+
+		p->is_sse = (ct
+			     && strncasecmp(ct, "text/event-stream", 17) == 0);
+		p->mode_known = 1;
+	}
+	if (p->is_sse) {
+		agc_sse_feed(&p->sse, buf, len, ba_sse_dispatch_event, p);
+		if (p->sse.error)
+			return -1;
+		return 0;
+	}
+	/* non-SSE body: keep the whole copy for the JSON fallback,
+	 * bounded like agc_http_request; crossing the limit fails the
+	 * request instead of silently truncating the document */
+	if (len > BA_MAX_BODY - p->raw.len)
 		return -1;
-	/* not a text/event-stream body so far: keep a copy for the
-	 * non-SSE JSON fallback (bounded like agc_http_request) */
-	if (!p->sse.saw_sse && p->raw.len <= BA_MAX_BODY
-	 && len <= BA_MAX_BODY - p->raw.len)
-		sb_appendn(&p->raw, buf, len);
+	sb_appendn(&p->raw, buf, len);
 	return 0;
 }
 
@@ -135,6 +153,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 		sse_stream_init(&sctx, provider, callback, ctx, cancelled);
 		memset(&pump, 0, sizeof(pump));
 		pump.sctx = &sctx;
+		pump.resp = &resp;
 		sb_init(&pump.raw);
 		agc_sse_init(&pump.sse);
 
@@ -195,8 +214,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 
 		if (attempt >= BA_MAX_RETRIES)
 			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
-		(void)0;
-			if ((unsigned)(monotonic_ms() - start_ms) >= BA_RETRY_MAX_TIME_MS)
+		if ((unsigned)(monotonic_ms() - start_ms) >= BA_RETRY_MAX_TIME_MS)
 			return io_err ? -1 : (http_code >= 400 ? http_code : 0);
 		{
 			SseEvent retry_evt;
