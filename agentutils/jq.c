@@ -97,16 +97,20 @@ int jq_main(int argc, char **argv)
 		if (v.type == JSON_NULL) {
 			puts("null");
 			printed = 1;
-		} else if (opts & 4) {
-			/* -c: compact - the source slice, one line */
-			printf("%.*s\n", (int)(v.end - v.start), v.src + v.start);
+		} else if ((opts & 1) && v.type == JSON_STRING) {
+			/* -r: top-level selected string, decoded, no quotes */
+			char *s = json_string_val(v);
+
+			puts(s ? s : "");
+			free(s);
 			printed = 1;
 		} else {
-			/* default (and -r): jq-style pretty print */
+			/* pretty by default, -c asks for the compact form;
+			 * container contents always stay valid JSON */
 			StrBuf out;
 
 			sb_init(&out);
-			agc_json_pretty(&out, v, 0, (opts & 1) != 0);
+			agc_json_print(&out, v, (opts & 4) ? -1 : 0);
 			sb_appendn(&out, "\n", 1);
 			if (out.len)
 				fwrite(out.data, 1, out.len, stdout);

@@ -132,6 +132,41 @@ testing "jq with no PATH pretty-prints like jq 1.7+" \
 ' \
 	"" ""
 
+# -r only affects top-level selected strings; container contents stay
+# valid JSON with quotes kept
+testing "jq -r keeps quotes inside objects and arrays" \
+	"echo '{\"a\":\"x\",\"b\":[\"y\"]}' | jq -r ." \
+	'{
+  "a": "x",
+  "b": [
+    "y"
+  ]
+}
+' \
+	"" ""
+
+# -c must serialize compactly, not echo the source slice
+testing "jq -c compacts multi-line input" \
+	"printf '{\\n  \"a\":  1,\\n  \"b\": [ 2 ]\\n}\\n' | jq -c ." \
+	'{"a":1,"b":[2]}\n' \
+	"" ""
+
+testing "jq -cr still strips quotes from a top-level string" \
+	"echo '\"hello\"' | jq -cr ." \
+	'hello\n' \
+	"" ""
+
+testing "jq -rc order does not matter" \
+	"echo '\"hi\"' | jq -rc ." \
+	'hi\n' \
+	"" ""
+
+# one sequential pass over the array, not a rescan per index
+testing "jq pretty-prints a 500-element array in one pass" \
+	"awk 'BEGIN{s=\"[\";for(i=1;i<=500;i++)s=s (i>1?\",\":\"\") i;print s \"]\"}' | jq . | wc -l" \
+	"502\n" \
+	"" ""
+
 # the match list grows dynamically: more than the initial 64 matches
 # must all be printed (previously truncated silently at 64)
 testing "jq .[] over a 100-element array prints every element" \
