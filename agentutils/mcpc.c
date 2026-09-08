@@ -26,7 +26,8 @@
 //kbuild:lib-$(CONFIG_MCPC) += mcpc.o
 
 //usage:#define mcpc_trivial_usage
-//usage:       "connect URL|cmd:CMD [@SESSION] | ls | close @SESSION | daemon stop\n"
+//usage:       "connect URL|cmd:CMD [@SESSION] [-H HDR] [--protocol-version V]\n"
+//usage:       "	| ls | close @SESSION | daemon stop\n"
 //usage:       "	| grep PATTERN | @SESSION COMMAND [ARGS]"
 //usage:#define mcpc_full_usage "\n\n"
 //usage:       "MCP client; sessions live in a background daemon\n"
@@ -195,6 +196,7 @@ typedef struct {
 	char *headers[MCPC_MAX_HEADERS];
 	int n_headers;
 	char *session_id;      /* Mcp-Session-Id (http) */
+	char *protocol_version; /* initialize handshake version */
 	int next_id;
 	pid_t pid;             /* stdio child */
 	int in_fd;             /* write end (child stdin) / http fd unused */
@@ -254,6 +256,7 @@ static void mcpc_sess_free(McpSession *s)
 	free(s->name);
 	free(s->cmd);
 	free(s->session_id);
+	free(s->protocol_version);
 	free(s->server_info_json);
 	free(s->tools_json);
 	free(s);
@@ -659,14 +662,20 @@ static int mcpc_notify(McpSession *s, const char *method)
 /* initialize + initialized; 0 on success (fills server_info/tools) */
 static int mcpc_handshake(McpSession *s)
 {
-	static const char *init_params =
-		"{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},"
-		"\"clientInfo\":{\"name\":\"busybox-mcpc\",\"version\":\"1.0\"}}";
+	/* protocolVersion is server-dependent: strict endpoints (e.g.
+	 * api.z.ai MCP) reject anything but the version they implement,
+	 * so connect can pin it with --protocol-version */
+	const char *ver = (s->protocol_version && s->protocol_version[0])
+			  ? s->protocol_version : "2025-03-26";
+	char *init_params = xasprintf(
+		"{\"protocolVersion\":\"%s\",\"capabilities\":{},"
+		"\"clientInfo\":{\"name\":\"busybox-mcpc\",\"version\":\"1.0\"}}", ver);
 	char *resp;
 	JsonParse jp;
 	JsonVal result;
 
 	resp = mcpc_rpc_call(s, "initialize", init_params);
+	free(init_params);
 	if (!resp)
 		return -1;
 	jp = json_parse_root(resp);
@@ -717,7 +726,8 @@ static int mcpc_handshake(McpSession *s)
 
 /* open a session: connect/spawn + handshake. 0 on success. */
 static McpSession *mcpc_sess_open(const char *name, const char *target,
-				  const char *extra_header)
+				  const char *extra_header,
+				  const char *protocol_version)
 {
 	McpSession *s;
 	McpSession *old = mcpc_sess_find(name);
@@ -760,6 +770,8 @@ static McpSession *mcpc_sess_open(const char *name, const char *target,
 		if (extra_header && extra_header[0])
 			s->headers[s->n_headers++] = xstrdup(extra_header);
 	}
+	if (protocol_version && protocol_version[0])
+		s->protocol_version = xstrdup(protocol_version);
 
 	if (mcpc_handshake(s) != 0) {
 		bb_error_msg("handshake failed for @%s", name);
@@ -857,13 +869,17 @@ static char *mcpc_daemon_handle(const char *line)
 		McpSession *s;
 		char *target = json_get_string(jp.val, "target");
 		char *hdr = json_get_string(jp.val, "header");
+		char *ver = json_get_string(jp.val, "protocol_version");
 		char *reply;
 
-		if (!name || !target)
+		if (!name || !target) {
+			free(ver);
 			return mcpc_err("connect needs name+target", NULL);
-		s = mcpc_sess_open(name, target, hdr);
+		}
+		s = mcpc_sess_open(name, target, hdr, ver);
 		free(target);
 		free(hdr);
+		free(ver);
 		if (!s)
 			return mcpc_err("cannot connect %s", name);
 		{
@@ -1334,7 +1350,7 @@ static void mcpc_esc(StrBuf *sb, const char *s)
 /* ---- CLI commands ---- */
 
 static int mcpc_cmd_connect(const char *name, const char *target,
-			    const char *header)
+			    const char *header, const char *protocol_version)
 {
 	StrBuf req;
 	char *resp;
@@ -1349,6 +1365,10 @@ static int mcpc_cmd_connect(const char *name, const char *target,
 	if (header && header[0]) {
 		sb_append(&req, ",\"header\":");
 		mcpc_esc(&req, header);
+	}
+	if (protocol_version && protocol_version[0]) {
+		sb_append(&req, ",\"protocol_version\":");
+		mcpc_esc(&req, protocol_version);
 	}
 	sb_append(&req, "}");
 	resp = mcpc_rpc(req.data);
@@ -1747,10 +1767,12 @@ int mcpc_main(int argc UNUSED_PARAM, char **argv)
 		const char *name = argv[3] ? mcpc_bare(argv[3]) : NULL;
 		const char *def = "default";
 		const char *header = NULL;
+		const char *pver = NULL;
 		int k;
 
 		if (!target)
-			bb_error_msg_and_die("usage: mcpc connect URL|cmd:CMD [@NAME]");
+			bb_error_msg_and_die("usage: mcpc connect URL|cmd:CMD [@NAME]"
+					     " [-H HEADER] [--protocol-version VER]");
 		if (!name)
 			name = def;
 		for (k = 3; argv[k]; k++) {
@@ -1758,8 +1780,13 @@ int mcpc_main(int argc UNUSED_PARAM, char **argv)
 				header = argv[k] + 9;
 			else if (strcmp(argv[k], "-H") == 0 && argv[k+1])
 				header = argv[++k];
+			else if (strncmp(argv[k], "--protocol-version=", 19) == 0)
+				pver = argv[k] + 19;
+			else if (strcmp(argv[k], "--protocol-version") == 0
+			 && argv[k+1])
+				pver = argv[++k];
 		}
-		return mcpc_cmd_connect(name, target, header);
+		return mcpc_cmd_connect(name, target, header, pver);
 	}
 
 	if (strcmp(a1, "ls") == 0) {

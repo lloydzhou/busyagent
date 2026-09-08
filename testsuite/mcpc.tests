@@ -91,6 +91,12 @@ testing "mcpc ping on a missing session fails nonzero" \
 	"rc=1\n" \
 	"" ""
 
+testing "mcpc connect --protocol-version reaches the handshake" \
+	'BA_HOME=$PWD/mc2.home mcpc connect cmd:$PWD/echo-mcp.tmp.sh @old --protocol-version 2024-11-05 2>&1; grep -c "\"protocolVersion\":\"2024-11-05\"" mcpc-stdio.log' \
+	"connected @old
+1\n" \
+	"" ""
+
 testing "mcpc grep searches cached tools" \
 	'BA_HOME=$PWD/mc.home mcpc grep numbers 2>&1 | tr -s " "' \
 	"echo add\n" \
@@ -182,6 +188,6 @@ testing "mcpc works again after a restart (implicit spawn)" \
 	"connected @echo2\n" \
 	"" ""
 
-rm -rf mc.home mc.e2e echo-mcp.tmp.sh mcpc-stdio.log
+rm -rf mc.home mc2.home mc.e2e echo-mcp.tmp.sh mcpc-stdio.log
 
 echo "mcpc: done"
