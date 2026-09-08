@@ -240,18 +240,24 @@ static void mcpc_sess_free(McpSession *s)
 		s->out_fd = -1;
 	}
 	if (s->transport == 1 && s->pid > 0) {
-		if (kill(-s->pid, SIGTERM) != 0 && errno != ESRCH)
-			kill(s->pid, SIGTERM);
+		int reaped = 0;
+
+		/* Single-pid signals only: a process-group kill after the
+		 * child is reaped could hit an unrelated pid that reused
+		 * the pgid. */
+		kill(s->pid, SIGTERM);
 		for (i = 0; i < 20; i++) {
-			if (waitpid(s->pid, NULL, WNOHANG) == s->pid)
+			if (waitpid(s->pid, NULL, WNOHANG) == s->pid) {
+				reaped = 1;
 				break;
+			}
 			usleep(50 * 1000);
 		}
-		if (waitpid(s->pid, NULL, WNOHANG) != s->pid) {
-			if (kill(-s->pid, SIGKILL) != 0 && errno != ESRCH)
-				kill(s->pid, SIGKILL);
+		if (!reaped) {
+			/* still unreaped, so the pid is still ours */
+			kill(s->pid, SIGKILL);
+			waitpid(s->pid, NULL, 0);
 		}
-		waitpid(s->pid, NULL, 0);
 	}
 	free(s->name);
 	free(s->cmd);
@@ -260,6 +266,24 @@ static void mcpc_sess_free(McpSession *s)
 	free(s->server_info_json);
 	free(s->tools_json);
 	free(s);
+}
+
+/* drop dead sessions between commands: the transport layers only mark
+ * them (the current request still owns the struct), so cleanup happens
+ * at request boundaries where nothing references the session anymore */
+static void mcpc_gc_dead_sessions(void)
+{
+	int i;
+
+	for (i = 0; i < g_n_sessions; ) {
+		if (g_sessions[i] && g_sessions[i]->dead) {
+			mcpc_sess_free(g_sessions[i]);
+			g_sessions[i] = g_sessions[g_n_sessions - 1];
+			g_n_sessions--;
+			continue;
+		}
+		i++;
+	}
 }
 
 /* ---- stdio transport ---- */
@@ -1030,19 +1054,11 @@ static int mcpc_daemon_run(void)
 	signal(SIGINT, mcpc_sighandler);
 	signal(SIGTERM, mcpc_sighandler);
 
-	if (mcpc_daemon_alive()) {
-		close(lockfd);
-		free(sp);
-		free(pp);
-		return 1;
-	}
-	if (unlink(sp) != 0 && errno != ENOENT) {
-		bb_perror_msg("unlink %s", sp);
-		close(lockfd);
-		free(sp);
-		free(pp);
-		return 1;
-	}
+	/* The flock above is the only mutual exclusion (the pid file is
+	 * advisory).  Unlinking the socket happens here, while holding
+	 * the lock, so a concurrent spawn can never steal a socket that
+	 * a running daemon still serves. */
+	unlink(sp);
 	lfd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (lfd < 0) {
 		bb_perror_msg("socket");
@@ -1099,6 +1115,9 @@ static int mcpc_daemon_run(void)
 		cfd = accept(lfd, NULL, NULL);
 		if (cfd < 0)
 			continue;
+		/* retire sessions marked dead by the previous request
+		 * before anything can list or find them again */
+		mcpc_gc_dead_sessions();
 		/* one request per connection keeps the protocol trivial */
 		{
 			StrBuf sb;
@@ -1145,6 +1164,9 @@ static int mcpc_daemon_run(void)
 			sb_free(&sb);
 		}
 		close(cfd);
+		/* this request may have marked sessions dead: retire them
+		 * now, while nothing holds a pointer into them */
+		mcpc_gc_dead_sessions();
 	}
 
 	for (i = 0; i < g_n_sessions; i++)
@@ -1185,13 +1207,13 @@ static int mcpc_dial(void)
 	return fd;
 }
 
-static int mcpc_daemon_alive(void)
+/* read the daemon pid file; 0 when absent or unparsable */
+static long mcpc_daemon_pid(void)
 {
 	char *pp = mcpc_pid_path();
 	FILE *f = fopen(pp, "r");
 	long pid = 0;
 	char buf[64];
-	int alive;
 
 	free(pp);
 	if (!f)
@@ -1199,37 +1221,52 @@ static int mcpc_daemon_alive(void)
 	if (fgets(buf, sizeof(buf), f))
 		pid = atol(buf);
 	fclose(f);
-	if (pid <= 0)
-		return 0;
-	alive = kill((pid_t)pid, 0) == 0 || errno == EPERM;
-	return alive;
+	return pid;
 }
 
 static int mcpc_spawn_daemon(void)
 {
-	char *sp = mcpc_sock_path();
 	const char *bb = bb_busybox_exec_path;
 	pid_t pid;
 	int i;
 
-	if (mcpc_daemon_alive()) {
+	/* fast path: a live daemon answers */
+	{
 		int fd = mcpc_dial();
+
 		if (fd >= 0) {
 			close(fd);
-			free(sp);
 			return 0;
 		}
-		free(sp);
-		return -1;
 	}
-	if (unlink(sp) != 0 && errno != ENOENT) {
-		free(sp);
-		return -1;
+
+	/* Self-heal: a daemon that still holds its pid but is not
+	 * answering (socket file removed, wedged accept loop, ...) is
+	 * unrecoverable for every future client.  Terminate it via the
+	 * pid file and let the replacement bind a fresh socket.  The
+	 * lock file decides: a daemon that still holds it wins and the
+	 * freshly spawned one exits immediately. */
+	{
+		long oldpid = mcpc_daemon_pid();
+
+		if (oldpid > 0 && oldpid != getpid()
+		 && (kill((pid_t)oldpid, 0) == 0 || errno == EPERM)) {
+			kill((pid_t)oldpid, SIGTERM);
+			for (i = 0; i < MCPC_DAEMON_START_MS / 100; i++) {
+				if (kill((pid_t)oldpid, 0) != 0
+				 && errno == ESRCH)
+					break;
+				usleep(100 * 1000);
+			}
+		}
 	}
+
+	/* The socket file is only ever unlinked by a daemon holding the
+	 * lock; a leftover file from a crashed daemon is reaped by the
+	 * new daemon before it binds. */
 	pid = fork();
 	if (pid < 0) {
 		bb_perror_msg("fork");
-		free(sp);
 		return -1;
 	}
 	if (pid == 0) {
@@ -1257,13 +1294,11 @@ static int mcpc_spawn_daemon(void)
 		int fd = mcpc_dial();
 		if (fd >= 0) {
 			close(fd);
-			free(sp);
 			return 0;
 		}
 		usleep(100 * 1000);
 	}
 	bb_error_msg("daemon did not come up");
-	free(sp);
 	return -1;
 }
 
