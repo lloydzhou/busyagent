@@ -250,3 +250,34 @@ else
 fi
 
 rm -rf oa.home oa.none petstore.tmp.json
+
+# === swagger 2.0 host/basePath resolution (dry-run: no network) =========
+
+cat > swagger2.tmp.json <<'SPEC'
+{
+  "swagger": "2.0",
+  "info": { "title": "s2", "version": "1.0.0" },
+  "host": "petstore.example.io",
+  "basePath": "/v2",
+  "schemes": ["https"],
+  "paths": {
+    "/pet/{id}": {
+      "get": {
+        "operationId": "getPet",
+        "summary": "one pet",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "type": "integer"}
+        ],
+        "responses": {"200": {"description": "ok"}}
+      }
+    }
+  }
+}
+SPEC
+
+testing "oapi resolves swagger 2.0 host/basePath into the base url" \
+	'BA_HOME=$PWD/oa.home oapi connect s2 $PWD/swagger2.tmp.json >/dev/null && BA_HOME=$PWD/oa.home oapi s2 get-pet 42 --dry-run 2>&1' \
+	"GET https://petstore.example.io/v2/pet/42\n" \
+	"" ""
+
+rm -rf oa.home swagger2.tmp.json

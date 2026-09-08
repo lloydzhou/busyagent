@@ -564,13 +564,19 @@ static char *oapi_base_url(OapiRegistry *r)
 			return url;   /* absolute server url */
 		if (url && url[0] == '/' && r->source
 		 && strncmp(r->source, "http", 4) == 0) {
-			/* "/api" + source origin */
+			/* "/api" resolved against the spec source origin */
 			BaUrl su;
 			char *abs;
 			if (ba_parse_url(r->source, &su) == 0) {
-				abs = xasprintf("http%s://%s:%d%s",
-						su.is_https ? "s" : "",
-						su.host, su.port, url);
+				int defport = su.is_https ? 443 : 80;
+				if (su.port == defport)
+					abs = xasprintf("http%s://%s%s",
+							su.is_https ? "s" : "",
+							su.host, url);
+				else
+					abs = xasprintf("http%s://%s:%d%s",
+							su.is_https ? "s" : "",
+							su.host, su.port, url);
 				free(url);
 				return abs;
 			}
@@ -578,6 +584,42 @@ static char *oapi_base_url(OapiRegistry *r)
 		if (url && url[0])
 			return url;   /* hope for the best */
 		free(url);
+	}
+	/* Swagger 2.0: "host" + "basePath" + "schemes[0]" */
+	{
+		char *host = json_get_string(r->spec, "host");
+		char *base_path = json_get_string(r->spec, "basePath");
+
+		if (host && host[0]) {
+			const char *scheme = NULL;
+			JsonVal schemes = json_get(r->spec, "schemes");
+
+			if (schemes.type == JSON_ARRAY
+			 && json_array_len(schemes) > 0) {
+				char *s0 = json_string_val(json_array_get(schemes, 0));
+				if (s0) {
+					if (strcmp(s0, "http") == 0)
+						scheme = "http";
+					else if (strcmp(s0, "https") == 0)
+						scheme = "https";
+					free(s0);
+				}
+			}
+			if (!scheme)   /* per spec: default to the source scheme */
+				scheme = (r->source
+					  && strncmp(r->source, "http://", 7) == 0)
+					 ? "http" : "https";
+			{
+				char *abs = xasprintf("%s://%s%s", scheme, host,
+						      (base_path && base_path[0])
+						      ? base_path : "");
+				free(host);
+				free(base_path);
+				return abs;
+			}
+		}
+		free(host);
+		free(base_path);
 	}
 	/* fallback: spec source itself */
 	return r->source ? xstrdup(r->source) : NULL;

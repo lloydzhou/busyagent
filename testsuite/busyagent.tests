@@ -100,9 +100,9 @@ testing "busyagent rejects schemeless URL" \
 
 # https works out of the box; the unauthenticated-TLS caveat is announced
 # on stderr before any connection is attempted.
-testing "busyagent https warns about unverified certificates" \
-	'busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -o "does not verify server certificates"' \
-	"does not verify server certificates\n" \
+testing "busyagent https connects silently (no TLS warning)" \
+	'busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -c "does not verify server certificates" || true' \
+	"0\n" \
 	"" ""
 
 # port 1 on loopback: refused immediately by xconnect after the warning,

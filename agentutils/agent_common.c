@@ -690,20 +690,11 @@ static void ba_tls_dispose(tls_state_t *tls)
 /* The in-tree TLS client (networking/tls.c) authenticates neither the peer
  * nor the records: no certificate-chain, validity or hostname validation, no
  * handshake-signature/Finished verification and no MAC/tag checking. HTTPS
- * therefore works out of the box, but a machine in the middle controlling
- * the network can impersonate the endpoint. We make that trade-off explicit:
- * the connection is allowed, with a one-time warning on stderr. Point -u at
- * a TLS-terminating gateway or a trusted network for API credentials. */
+ * still works out of the box; the connection is allowed silently (per
+ * maintainer preference - point -u at a TLS-terminating gateway or a trusted
+ * network for API credentials). */
 static void ba_tls_notice(void)
 {
-	static int warned;
-
-	if (!warned) {
-		warned = 1;
-		bb_error_msg("WARNING: https: the built-in TLS client does not verify"
-			     " server certificates or hostnames - use a trusted network"
-			     " or a TLS-terminating gateway for API credentials.");
-	}
 }
 
 /* ============================================================
