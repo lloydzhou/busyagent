@@ -175,3 +175,5 @@ testing "jq .[] over a 100-element array prints every element" \
 	"" ""
 
 echo "jq: done"
+
+exit $FAILCOUNT

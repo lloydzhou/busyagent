@@ -286,3 +286,5 @@ testing "oapi dry-run masks credential headers" \
 	"" ""
 
 rm -rf oa.home swagger2.tmp.json
+
+exit $FAILCOUNT

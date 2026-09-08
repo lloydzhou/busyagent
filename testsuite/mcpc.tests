@@ -191,3 +191,5 @@ testing "mcpc works again after a restart (implicit spawn)" \
 rm -rf mc.home mc2.home mc.e2e echo-mcp.tmp.sh mcpc-stdio.log
 
 echo "mcpc: done"
+
+exit $FAILCOUNT
