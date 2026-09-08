@@ -629,6 +629,51 @@ static char *oapi_base_url(OapiRegistry *r)
  * output
  * ============================================================ */
 
+/* dry-run prints the request line and headers; mask credential headers so a
+ * key passed via --header never reaches the terminal or logs. Keeps the
+ * auth scheme word (Bearer/Basic/...) for debuggability. */
+static void oapi_print_headers_masked(const char **headers, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		const char *h = headers[i];
+		const char *colon = strchr(h, ':');
+		char lower[32];
+		size_t name_len, k;
+
+		if (!colon) {
+			printf("  %s\n", h);
+			continue;
+		}
+		name_len = colon - h;
+		if (name_len >= sizeof(lower))
+			name_len = sizeof(lower) - 1;
+		for (k = 0; k < name_len; k++)
+			lower[k] = tolower((unsigned char)h[k]);
+		lower[name_len] = '\0';
+		if (strstr(lower, "auth") || strstr(lower, "token")
+		 || strstr(lower, "secret") || strstr(lower, "cookie")
+		 || strstr(lower, "password")
+		 || (name_len == 3 && strcmp(lower, "key") == 0)
+		 || (name_len >= 4
+		     && strcmp(lower + name_len - 4, "-key") == 0)) {
+			const char *val = colon + 1;
+			const char *sp;
+
+			while (*val == ' ')
+				val++;
+			sp = strchr(val, ' ');
+			if (sp && sp - val <= 16)
+				printf("  %.*s***\n", (int)(sp - val + 1), val);
+			else
+				printf("  %.*s: ***\n", (int)(colon - h), h);
+			continue;
+		}
+		printf("  %s\n", h);
+	}
+}
+
 /* apply a --jq dot-path via the shared agc_json_path evaluator.
  * Returns 0 on match (printed), 1 when the path does not resolve. */
 static int oapi_jq_print(JsonVal v, const char *path)
@@ -1259,8 +1304,7 @@ static int oapi_cmd_call(OapiRegistry *r, const char *opname,
 	/* send */
 	if (opts->dry_run) {
 		printf("%s %s\n", op->method, url.data);
-		for (i = 0; i < opts->n_headers; i++)
-			printf("  %s\n", opts->headers[i]);
+		oapi_print_headers_masked(opts->headers, opts->n_headers);
 		if (body.len)
 			printf("  body: %s\n", body.data);
 		rc = 0;
@@ -1447,8 +1491,7 @@ static int oapi_cmd_api(OapiRegistry *r, const char *method, const char *path,
 	}
 	if (opts->dry_run) {
 		printf("%s %s\n", method, url.data);
-		for (i = 0; i < opts->n_headers; i++)
-			printf("  %s\n", opts->headers[i]);
+		oapi_print_headers_masked(opts->headers, opts->n_headers);
 		if (data)
 			printf("  body: %s\n", data);
 		sb_free(&url);

@@ -280,4 +280,9 @@ testing "oapi resolves swagger 2.0 host/basePath into the base url" \
 	"GET https://petstore.example.io/v2/pet/42\n" \
 	"" ""
 
+testing "oapi dry-run masks credential headers" \
+	'BA_HOME=$PWD/oa.home oapi s2 get-pet 1 --header "Authorization: Bearer sk-hush123" --header "X-Api-Key: abc123" --header "X-Amz-Key: xyz789" --header "X-Custom-Info: keep-me" --dry-run 2>&1' \
+	"GET https://petstore.example.io/v2/pet/1\n  Bearer ***\n  X-Api-Key: ***\n  X-Amz-Key: ***\n  X-Custom-Info: keep-me\n" \
+	"" ""
+
 rm -rf oa.home swagger2.tmp.json
