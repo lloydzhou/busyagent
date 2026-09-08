@@ -73,38 +73,11 @@ int util_mkdirs(const char *path, int mode);
 /* home directory path */
 const char *util_home_dir(void);
 
-/* strdup, NULL-safe */
-char *util_strdup(const char *s);
-
 /* free + NULL */
 #define FREE_PTR(p) do { free(p); (p) = NULL; } while(0)
 
-/* getenv with a default */
-const char *util_env(const char *name, const char *defval);
-
-/* current timestamp string (ISO 8601) */
-char *util_timestamp_now(void);
-
-/* parse a number with k/m/g suffixes (util_parse_size parity) */
-long util_parse_size(const char *s);
-
-/* current epoch seconds */
-long util_epoch_seconds(void);
-
-/* count UTF-8 characters (approximate token counting) */
-int util_utf8_char_count(const char *s);
-
-/* largest offset <= max_bytes that never splits a UTF-8 char */
-size_t util_utf8_truncate_len(const char *s, size_t max_bytes);
-
-/* truncate in place to max_total bytes (UTF-8 safe), append "..." */
-void util_truncate_str(char *s, size_t max_total);
-
 /* truncate in place to max_chars UTF-8 chars, append "..." */
 void util_truncate_chars(char *s, int max_chars);
-
-/* UTF-8 sanitize: invalid bytes become the \ufffd literal, malloc'd */
-char *util_sanitize_utf8(const char *src);
 
 /* trim trailing whitespace */
 char *util_rtrim(char *s);
@@ -207,6 +180,10 @@ JsonVal json_array_get(JsonVal arr, int index);
 
 /* decoded string from a JSON_STRING (malloc'd copy) */
 char *json_string_val(JsonVal v);
+
+/* decode a JSON_STRING into buf (room for the raw span + 1 bytes);
+ * returns the decoded length - embedded NULs are preserved */
+size_t json_string_decode(JsonVal v, char *buf);
 
 /* double from a JSON_NUMBER */
 double json_number_val(JsonVal v);
@@ -333,9 +310,7 @@ typedef void (*agc_sse_event_fn)(void *ctx, const char *event,
 
 void agc_sse_init(AgcSse *s);
 void agc_sse_free(AgcSse *s);
-/* feed body bytes; dispatches complete events as they close.
- * Returns 0 when cancelled (s->cancelled semantics belong to the caller:
- * this splitter never blocks, so no cancel flag is needed here). */
+/* feed body bytes; dispatches complete events as they close */
 void agc_sse_feed(AgcSse *s, const char *ptr, size_t len,
 		  agc_sse_event_fn fn, void *ctx);
 /* dispatch a trailing unterminated event at EOF (usually nothing). */

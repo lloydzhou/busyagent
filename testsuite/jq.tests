@@ -57,7 +57,7 @@ testing "jq .a[].b walks array elements" \
 
 testing "jq [] over a non-array yields nothing" \
 	"echo '{\"a\":1}' | jq -e '.a[]'; echo rc=\$?" \
-	"rc=1\n" \
+	"rc=4\n" \
 	"" ""
 
 testing "jq . selects the root" \
@@ -68,9 +68,9 @@ testing "jq . selects the root" \
 rc=0\n' \
 	"" ""
 
-testing "jq -e exits 1 on no output" \
+testing "jq -e exits 4 on no output (jq 1.7 semantics)" \
 	"echo '{\"a\":1}' | jq -e '.missing[]'; echo rc=\$?" \
-	"rc=1\n" \
+	"rc=4\n" \
 	"" ""
 
 testing "jq invalid json fails" \

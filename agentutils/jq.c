@@ -24,7 +24,7 @@
 //usage:       "Extract values from JSON with a path expression\n"
 //usage:       "\n"
 //usage:       "	-r	Output string values raw (no quotes)\n"
-//usage:       "	-e	Exit 1 when nothing was printed\n"
+//usage:       "	-e	Exit 1 if last output false/null, 4 if none\n"
 //usage:       "	-c	Compact output (single line, no indentation)\n"
 //usage:       "\n"
 //usage:       "PATH is a jq path subset: .a.b, .[0], .[], .items[].id.\n"
@@ -50,6 +50,7 @@ int jq_main(int argc, char **argv)
 	AgcJqMatches m;
 	int i;
 	int printed = 0;
+	int last_falsy = 0;   /* -e: last output was false or null */
 	int nargs;
 
 	opts = getopt32(argv, "rec");
@@ -97,13 +98,19 @@ int jq_main(int argc, char **argv)
 		if (v.type == JSON_NULL) {
 			puts("null");
 			printed = 1;
+			last_falsy = 1;
 		} else if ((opts & 1) && v.type == JSON_STRING) {
-			/* -r: top-level selected string, decoded, no quotes */
-			char *s = json_string_val(v);
+			/* -r: top-level selected string, decoded, no quotes;
+			 * the explicit length keeps embedded NULs intact */
+			size_t raw = (v.end - 1) - (v.start + 1);
+			char *s = xmalloc(raw + 1);
+			size_t n = json_string_decode(v, s);
 
-			puts(s ? s : "");
+			fwrite(s, 1, n, stdout);
+			putchar('\n');
 			free(s);
 			printed = 1;
+			last_falsy = 0;
 		} else {
 			/* pretty by default, -c asks for the compact form;
 			 * container contents always stay valid JSON */
@@ -116,9 +123,19 @@ int jq_main(int argc, char **argv)
 				fwrite(out.data, 1, out.len, stdout);
 			sb_free(&out);
 			printed = 1;
+			last_falsy = (v.type == JSON_BOOL
+				      && !json_bool_val(v));
 		}
 	}
 	free(m.v);
 	free(data);
-	return (opts & 2 && !printed) ? 1 : 0;
+	if (opts & 2) {
+		/* jq 1.7: 1 when the last output was false/null,
+		 * 4 when nothing was ever printed */
+		if (!printed)
+			return 4;
+		if (last_falsy)
+			return 1;
+	}
+	return 0;
 }

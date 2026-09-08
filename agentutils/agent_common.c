@@ -144,7 +144,8 @@ static int ba_connect(const char *host, int port)
 		return -1;
 	}
 	flags = fcntl(fd, F_GETFL, 0);
-	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	if (flags >= 0)
+		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 	rc = connect(fd, &lsa->u.sa, lsa->len);
 	if (rc < 0 && errno != EINPROGRESS) {
 		close(fd);
@@ -1032,15 +1033,33 @@ void agc_sse_finish(AgcSse *s, agc_sse_event_fn fn, void *ctx)
 
 static void skip_ws(const char *src, size_t *pos);
 
+/* nesting limit: keeps the recursive-descent parser and the printer
+ * away from stack overflow on adversarial input like 50000 nested
+ * arrays */
+#define JSON_MAX_DEPTH 1024
+
 /* Print one JSON value (jq-style) into sb.
  * indent >= 0: pretty form with 2-space indentation.
  * indent < 0: compact single-line form (whitespace dropped, strings
  * kept intact - not a source-slice echo, so multi-line input still
  * comes out on one line). */
+static void agc_json_print_depth(StrBuf *sb, JsonVal v, int indent, int depth);
+
 void agc_json_print(StrBuf *sb, JsonVal v, int indent)
+{
+	agc_json_print_depth(sb, v, indent, 0);
+}
+
+static void agc_json_print_depth(StrBuf *sb, JsonVal v, int indent, int depth)
 {
 	int child = indent < 0 ? indent : indent + 1;
 
+	if (depth > JSON_MAX_DEPTH) {
+		/* parsed values are already bounded by the parser's
+		 * limit, so this only guards hand-built trees */
+		sb_append(sb, "null");
+		return;
+	}
 	switch (v.type) {
 	case JSON_OBJECT: {
 		JsonObjectIter it;
@@ -1059,7 +1078,7 @@ void agc_json_print(StrBuf *sb, JsonVal v, int indent)
 			}
 			sb_append_json_string(sb, it.key);
 			sb_append(sb, indent < 0 ? ":" : ": ");
-			agc_json_print(sb, it.val, child);
+			agc_json_print_depth(sb, it.val, child, depth + 1);
 		}
 		json_obj_iter_cleanup(&it);
 		if (n && indent >= 0) {
@@ -1095,7 +1114,7 @@ void agc_json_print(StrBuf *sb, JsonVal v, int indent)
 					for (k = 0; k <= indent; k++)
 						sb_append(sb, "  ");
 				}
-				agc_json_print(sb, vp.val, child);
+				agc_json_print_depth(sb, vp.val, child, depth + 1);
 				skip_ws(src, &pos);
 				if (src[pos] == ',') {
 					pos++;
@@ -1533,17 +1552,17 @@ static JsonParse parse_number(const char *src, size_t *pos) {
 }
 
 /* forward declarations */
-static JsonParse json_parse_internal(const char *src, size_t *pos);
+static JsonParse json_parse_internal(const char *src, size_t *pos, int depth);
 
 /* parse a JSON array */
-static JsonParse parse_array(const char *src, size_t *pos) {
+static JsonParse parse_array(const char *src, size_t *pos, int depth) {
     size_t start = *pos;
     (*pos)++; /* skip [ */
     skip_ws(src, pos);
     if (src[*pos] == ']') { (*pos)++; return make_val(JSON_ARRAY, src, start, *pos); }
     for (;;) {
         skip_ws(src, pos);
-        JsonParse vp = json_parse(src, pos);
+        JsonParse vp = json_parse_internal(src, pos, depth + 1);
         if (vp.error) return vp;
         skip_ws(src, pos);
         if (src[*pos] == ',') { (*pos)++; continue; }
@@ -1554,7 +1573,7 @@ static JsonParse parse_array(const char *src, size_t *pos) {
 }
 
 /* parse a JSON object */
-static JsonParse parse_object(const char *src, size_t *pos) {
+static JsonParse parse_object(const char *src, size_t *pos, int depth) {
     size_t start = *pos;
     (*pos)++; /* skip { */
     skip_ws(src, pos);
@@ -1568,7 +1587,7 @@ static JsonParse parse_object(const char *src, size_t *pos) {
         if (src[*pos] != ':') return make_err("expected ':'");
         (*pos)++;
         skip_ws(src, pos);
-        JsonParse vp = json_parse(src, pos);
+        JsonParse vp = json_parse_internal(src, pos, depth + 1);
         if (vp.error) return vp;
         skip_ws(src, pos);
         if (src[*pos] == ',') { (*pos)++; continue; }
@@ -1579,11 +1598,14 @@ static JsonParse parse_object(const char *src, size_t *pos) {
 }
 
 /* parse a JSON value */
-static JsonParse json_parse_internal(const char *src, size_t *pos) {    skip_ws(src, pos);
+static JsonParse json_parse_internal(const char *src, size_t *pos, int depth) {
+    skip_ws(src, pos);
+    if (depth > JSON_MAX_DEPTH)
+        return make_err("nesting too deep");
     char c = src[*pos];
     if (c == '"') return parse_string(src, pos);
-    if (c == '{') return parse_object(src, pos);
-    if (c == '[') return parse_array(src, pos);
+    if (c == '{') return parse_object(src, pos, depth);
+    if (c == '[') return parse_array(src, pos, depth);
     if (c == 't') {
         if (strncmp(src + *pos, "true", 4) == 0) { *pos += 4; return make_val(JSON_BOOL, src, *pos - 4, *pos); }
         return make_err("expected 'true'");
@@ -1602,13 +1624,13 @@ static JsonParse json_parse_internal(const char *src, size_t *pos) {    skip_ws(
 
 /* public parse entry points */
 JsonParse json_parse(const char *src, size_t *pos) {
-    return json_parse_internal(src, pos);
+    return json_parse_internal(src, pos, 0);
 }
 
 JsonParse json_parse_root(const char *src) {
     if (!src) return make_err("null input");
     size_t pos = 0;
-    JsonParse p = json_parse_internal(src, &pos);
+    JsonParse p = json_parse_internal(src, &pos, 0);
     if (p.error) return p;
     skip_ws(src, &pos);
     if (src[pos] != '\0') return make_err("trailing content");
@@ -1638,10 +1660,20 @@ JsonVal json_get(JsonVal obj, const char *key) {
         /* parse key */
         JsonParse kp = parse_string(src, &pos);
         if (kp.error) break;
-        /* compare key (without quotes) */
-        size_t klen = (kp.val.end - 1) - (kp.val.start + 1);
-        const char *kstr = src + kp.val.start + 1;
-        bool match = (strlen(key) == klen && strncmp(key, kstr, klen) == 0);
+        /* compare the decoded key: a literal "a\u0062" in the source
+         * names the same member as "ab" */
+        size_t klen;
+        bool match;
+        {
+            char *kdec = json_string_val(kp.val);
+
+            if (!kdec)
+                break;
+            klen = strlen(kdec);
+            match = (strlen(key) == klen
+                     && memcmp(key, kdec, klen) == 0);
+            free(kdec);
+        }
         skip_ws(src, &pos);
         if (src[pos] != ':') break;
         pos++;
@@ -1757,14 +1789,13 @@ JsonVal json_array_get(JsonVal arr, int index) {
  * value extraction
  * ============================================================ */
 
-char *json_string_val(JsonVal v) {
-    if (v.type != JSON_STRING) return NULL;
-    /* decode a JSON string (strip quotes, handle escapes) */
-    const char *src = v.src;
-    size_t start = v.start + 1; /* skip opening quote */
-    size_t end = v.end - 1;     /* skip closing quote */
-    size_t len = end - start;
-    char *buf = malloc(len * 2 + 1); /* worst case */
+/* decode the escape sequences of the raw JSON string span
+ * src[start,end) into buf; returns the decoded length. buf needs room
+ * for (end - start) + 1 bytes: every escape decodes to no more bytes
+ * than it occupies in the source. */
+static size_t json_decode_raw(const char *src, size_t start, size_t end,
+			      char *buf)
+{
     size_t out = 0;
     for (size_t i = start; i < end; i++) {
         if (src[i] == '\\') {
@@ -1840,10 +1871,29 @@ char *json_string_val(JsonVal v) {
             buf[out++] = src[i];
         }
     }
+    return out;
+}
+
+/* decode a JSON_STRING into a caller-provided buffer; returns the
+ * decoded length (embedded NULs are preserved) and NUL-terminates */
+size_t json_string_decode(JsonVal v, char *buf)
+{
+    if (v.type != JSON_STRING) {
+        buf[0] = '\0';
+        return 0;
+    }
+    size_t out = json_decode_raw(v.src, v.start + 1, v.end - 1, buf);
     buf[out] = '\0';
-    /* shrink to the actual size */
-    char *result = realloc(buf, out + 1);
-    return result ? result : buf;
+    return out;
+}
+
+char *json_string_val(JsonVal v) {
+    if (v.type != JSON_STRING) return NULL;
+    size_t len = (v.end - 1) - (v.start + 1);
+    char *buf = malloc(len + 1);
+    if (!buf) return NULL;
+    json_string_decode(v, buf);
+    return buf;
 }
 
 double json_number_val(JsonVal v) {
@@ -1904,12 +1954,12 @@ bool json_obj_iter_next(JsonObjectIter *it) {
     /* parse the key */
     JsonParse kp = parse_string(src, &it->pos);
     if (kp.error) return false;
-    /* key text (without quotes) */
-    size_t klen = (kp.val.end - 1) - (kp.val.start + 1);
-    char *key = malloc(klen + 1);
-    memcpy(key, src + kp.val.start + 1, klen);
-    key[klen] = '\0';
-    it->key = key; /* points at a temp buffer */
+    /* decoded key: escapes are resolved once here, so printers and
+     * lookups see the actual member name */
+    char *key = json_string_val(kp.val);
+    if (!key)
+        return false;
+    it->key = key;
     /* skip : */
     skip_ws(src, &it->pos);
     if (src[it->pos] == ':') it->pos++;
