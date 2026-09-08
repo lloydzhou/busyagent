@@ -234,6 +234,9 @@ void json_obj_iter_init(JsonObjectIter *it, JsonVal obj);
 bool json_obj_iter_next(JsonObjectIter *it);
 void json_obj_iter_cleanup(JsonObjectIter *it);  /* call to break out early */
 
+/* jq-style pretty printer: 2-space indent; raw_strings decodes strings */
+void agc_json_pretty(StrBuf *sb, JsonVal v, int indent, bool raw_strings);
+
 /* ============================================================
  * JSON Lines appending
  * ============================================================ */

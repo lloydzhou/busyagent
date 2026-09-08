@@ -62,7 +62,9 @@ testing "jq [] over a non-array yields nothing" \
 
 testing "jq . selects the root" \
 	"echo '{\"a\":1}' | jq -e '.'; echo rc=\$?" \
-	'{"a":1}
+	'{
+  "a": 1
+}
 rc=0\n' \
 	"" ""
 
@@ -86,6 +88,48 @@ rc=1\n" \
 testing "jq reads a file argument" \
 	"echo '{\"a\":\"file-val\"}' > jqt.json && jq -r '.a' jqt.json && rm -f jqt.json" \
 	"file-val\n" \
+	"" ""
+
+# pretty print (jq-style, 2-space indent) is the default; -c restores the
+# compact single-line form
+testing "jq pretty-prints nested objects" \
+	"echo '{\"meta\":{\"deep\":{\"v\":\"z\"}}}' | jq '.meta'" \
+	'{
+  "deep": {
+    "v": "z"
+  }
+}
+' \
+	"" ""
+
+testing "jq -r still pretty-prints objects" \
+	"echo '{\"a\":1}' | jq -r '.'" \
+	'{
+  "a": 1
+}
+' \
+	"" ""
+
+testing "jq -c keeps objects on one line" \
+	"echo '{\"a\":1}' | jq -c '.'" \
+	'{"a":1}\n' \
+	"" ""
+
+testing "jq pretty-prints empty containers compactly" \
+	"echo '{\"a\":{},\"b\":[]}' | jq '.'" \
+	'{
+  "a": {},
+  "b": []
+}
+' \
+	"" ""
+
+testing "jq with no PATH pretty-prints like jq 1.7+" \
+	"echo '{\"a\":1}' | jq" \
+	'{
+  "a": 1
+}
+' \
 	"" ""
 
 # the match list grows dynamically: more than the initial 64 matches

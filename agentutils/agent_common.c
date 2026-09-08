@@ -1030,6 +1030,84 @@ void agc_sse_finish(AgcSse *s, agc_sse_event_fn fn, void *ctx)
  * StrBuf - growable string buffer
  * ============================================================ */
 
+/* pretty-print one JSON value with 2-space indentation (jq-style) into sb.
+ * raw_strings: print string values decoded (jq -r) instead of the quoted
+ * source slice. Leaves have no trailing newline; the caller adds one. */
+void agc_json_pretty(StrBuf *sb, JsonVal v, int indent, bool raw_strings)
+{
+	switch (v.type) {
+	case JSON_OBJECT: {
+		JsonObjectIter it;
+		int n = 0;
+
+		sb_append(sb, "{");
+		json_obj_iter_init(&it, v);
+		while (json_obj_iter_next(&it)) {
+			int k;
+
+			sb_append(sb, n++ ? ",\n" : "\n");
+			for (k = 0; k <= indent; k++)
+				sb_append(sb, "  ");
+			sb_append_json_string(sb, it.key);
+			sb_append(sb, ": ");
+			agc_json_pretty(sb, it.val, indent + 1, raw_strings);
+		}
+		json_obj_iter_cleanup(&it);
+		if (n) {
+			int k;
+
+			sb_append(sb, "\n");
+			for (k = 0; k < indent; k++)
+				sb_append(sb, "  ");
+		}
+		sb_append(sb, "}");
+		break;
+	}
+	case JSON_ARRAY: {
+		int i, n = json_array_len(v);
+
+		sb_append(sb, "[");
+		for (i = 0; i < n; i++) {
+			int k;
+
+			sb_append(sb, i ? ",\n" : "\n");
+			for (k = 0; k <= indent; k++)
+				sb_append(sb, "  ");
+			agc_json_pretty(sb, json_array_get(v, i), indent + 1,
+					raw_strings);
+		}
+		if (n) {
+			int k;
+
+			sb_append(sb, "\n");
+			for (k = 0; k < indent; k++)
+				sb_append(sb, "  ");
+		}
+		sb_append(sb, "]");
+		break;
+	}
+	case JSON_STRING:
+		if (raw_strings) {
+			char *s = json_string_val(v);
+
+			sb_append(sb, s ? s : "");
+			free(s);
+		} else {
+			sb_appendn(sb, v.src + v.start, v.end - v.start);
+		}
+		break;
+	case JSON_NUMBER:
+		sb_appendn(sb, v.src + v.start, v.end - v.start);
+		break;
+	case JSON_BOOL:
+		sb_append(sb, json_bool_val(v) ? "true" : "false");
+		break;
+	default:
+		sb_append(sb, "null");
+		break;
+	}
+}
+
 void sb_init(StrBuf *sb) {
     sb->data = NULL;
     sb->len = 0;

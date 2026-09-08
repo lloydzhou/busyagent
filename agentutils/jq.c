@@ -19,16 +19,19 @@
 //kbuild:lib-$(CONFIG_JQ) += jq.o
 
 //usage:#define jq_trivial_usage
-//usage:       "[-re] PATH [FILE]"
+//usage:       "[-rec] [PATH [FILE]]"
 //usage:#define jq_full_usage "\n\n"
 //usage:       "Extract values from JSON with a path expression\n"
 //usage:       "\n"
 //usage:       "	-r	Output string values raw (no quotes)\n"
 //usage:       "	-e	Exit 1 when nothing was printed\n"
+//usage:       "	-c	Compact output (single line, no indentation)\n"
 //usage:       "\n"
 //usage:       "PATH is a jq path subset: .a.b, .[0], .[], .items[].id.\n"
+//usage:       "PATH defaults to '.' (pretty-print, like jq 1.7+).\n"
 //usage:       "Missing keys / bad indices give null; [] over a non-array\n"
-//usage:       "gives nothing. Reads stdin when FILE is absent or '-'."
+//usage:       "gives nothing. Objects/arrays pretty-print (2-space indent)\n"
+//usage:       "unless -c. Reads stdin when FILE is absent or '-'."
 
 #include "busyagent.h"
 #include "agent_common.h"
@@ -37,37 +40,40 @@
 
 int jq_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 
-int jq_main(int argc UNUSED_PARAM, char **argv)
+int jq_main(int argc, char **argv)
 {
 	unsigned opts;
 	const char *path;
+	const char *file;
 	char *data;
 	JsonParse jp;
 	AgcJqMatches m;
 	int i;
 	int printed = 0;
+	int nargs;
 
-	opts = getopt32(argv, "re");
+	opts = getopt32(argv, "rec");
+	nargs = argc - optind;
 	argv += optind;
-	if (!argv[0])
-		bb_error_msg_and_die("need a PATH (e.g. '.items[].id')");
-	if (argv[1] && argv[2])
+	if (nargs > 2)
 		bb_error_msg_and_die("too many arguments");
-	path = argv[0];
+	/* jq 1.7+ runs the identity filter when no PATH is given */
+	path = (nargs >= 1) ? argv[0] : ".";
+	file = (nargs >= 2) ? argv[1] : NULL;
 
-	if (!argv[1] || strcmp(argv[1], "-") == 0) {
+	if (!file || strcmp(file, "-") == 0) {
 		data = xmalloc_read(STDIN_FILENO, NULL);
 	} else {
-		FILE *f = fopen(argv[1], "r");
+		FILE *f = fopen(file, "r");
 		long sz;
 
 		if (!f)
-			bb_perror_msg_and_die("open %s", argv[1]);
+			bb_perror_msg_and_die("open %s", file);
 		fseek(f, 0, SEEK_END);
 		sz = ftell(f);
 		fseek(f, 0, SEEK_SET);
 		if (sz < 0)
-			bb_perror_msg_and_die("read %s", argv[1]);
+			bb_perror_msg_and_die("read %s", file);
 		data = xmalloc(sz + 1);
 		{
 			size_t got = fread(data, 1, sz, f);
@@ -91,14 +97,20 @@ int jq_main(int argc UNUSED_PARAM, char **argv)
 		if (v.type == JSON_NULL) {
 			puts("null");
 			printed = 1;
-		} else if ((opts & 1) && v.type == JSON_STRING) {
-			/* -r: raw string */
-			char *s = json_string_val(v);
-			puts(s ? s : "");
-			free(s);
+		} else if (opts & 4) {
+			/* -c: compact - the source slice, one line */
+			printf("%.*s\n", (int)(v.end - v.start), v.src + v.start);
 			printed = 1;
 		} else {
-			printf("%.*s\n", (int)(v.end - v.start), v.src + v.start);
+			/* default (and -r): jq-style pretty print */
+			StrBuf out;
+
+			sb_init(&out);
+			agc_json_pretty(&out, v, 0, (opts & 1) != 0);
+			sb_appendn(&out, "\n", 1);
+			if (out.len)
+				fwrite(out.data, 1, out.len, stdout);
+			sb_free(&out);
 			printed = 1;
 		}
 	}
