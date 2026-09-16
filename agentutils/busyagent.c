@@ -993,6 +993,20 @@ static int ba_run_session(BaRunCtx *ctx)
 			ba_stats_add(paths.stats, "total_cache_read_tokens", accum->cache_read_tokens);
 			ba_stats_add(paths.stats, "total_cache_creation_tokens", accum->cache_creation_tokens);
 
+			/* last-call output speed (tok/s): the transport's final
+			 * USAGE only allows the update when the provider
+			 * protocol completed over a 2xx without cancellation;
+			 * failed/interrupted calls keep the previous value, a
+			 * clean zero-token stream clears it to 0 */
+			if (accum->speed_ready && !accum->error && !g_interrupted) {
+				long long dur_ms = accum->end_ms - accum->start_ms;
+				int speed = dur_ms > 0
+					? (int)(accum->out_tokens * 1000LL / dur_ms)
+					: 0;
+				store_stats_set_int_file(paths.stats,
+					"last_call_speed_tok_per_sec", speed);
+			}
+
 			if (accum->tool_count > 0 && accum->stop_reason
 			 && (strcmp(accum->stop_reason, "tool_use") == 0
 			  || strcmp(accum->stop_reason, "tool_calls") == 0)) {

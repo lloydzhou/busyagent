@@ -22,7 +22,16 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
+
+/* wall-clock milliseconds; bash-agent PR #87 parity (gettimeofday) */
+static long long now_ms(void)
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+}
 
 /*
  * bb_http - plain-HTTP transport for busyagent
@@ -47,7 +56,8 @@ static void parse_openai_sse_event(StreamCtx *sctx, const char *data, size_t dat
 static void parse_responses_sse_event(StreamCtx *sctx, const char *event,
 				      const char *data, size_t data_len);
 static void process_residual_json(const char *residual, const char *provider,
-				  sse_callback_fn callback, void *ctx);
+				  sse_callback_fn callback, void *ctx,
+				  long long start_ms);
 static void emit_simple_event(sse_callback_fn callback, void *ctx,
 			      SseEventType type, const char *content);
 
@@ -60,7 +70,36 @@ typedef struct {
 	AgcHttpResp *resp;  /* response headers, filled before body chunks */
 	int mode_known;     /* content-type evaluated for this body */
 	int is_sse;         /* body declared itself text/event-stream */
+	long long first_ms; /* first body byte seen (TTFB end), 0 = none */
 } BaSsePump;
+
+/* claude data line: watch message_stop for protocol completeness, then
+ * hand off to the shared parser (which gets the stream start_ms so its
+ * USAGE events can carry start/end timestamps) */
+static void parse_claude_stream_event(StreamCtx *sctx, const char *data)
+{
+	size_t pos = 0;
+	JsonParse jp = json_parse(data, &pos);
+
+	if (!jp.error) {
+		char *type = json_get_string(jp.val, "type");
+		if (type && strcmp(type, "message_stop") == 0)
+			sctx->protocol_complete = 1;
+		FREE_PTR(type);
+	}
+	sse_parse_event(sctx->provider, data, strlen(data),
+			sctx->callback, sctx->ctx, sctx->start_ms);
+}
+
+/* the final USAGE may update the speed only when the stream finished
+ * the provider protocol cleanly over a 2xx and was not cancelled */
+static int stream_speed_ready(const StreamCtx *sctx, int rc, int http_code)
+{
+	return rc == AGC_HTTP_COMPLETE
+	    && http_code >= 200 && http_code < 300
+	    && !(sctx->cancelled && *(sctx->cancelled))
+	    && sctx->protocol_complete;
+}
 
 /* one complete SSE event: dispatch each data line separately, matching
  * the historical per-"data:"-line parse of the providers (each line is
@@ -86,8 +125,7 @@ static void ba_sse_dispatch_event(void *vctx, const char *event,
 			else if (strcmp(sctx->provider, "responses") == 0)
 				parse_responses_sse_event(sctx, event, copy, llen);
 			else
-				sse_parse_event(sctx->provider, copy, llen,
-						sctx->callback, sctx->ctx);
+				parse_claude_stream_event(sctx, copy);
 			free(copy);
 		}
 		if (!nl)
@@ -104,6 +142,8 @@ static int ba_sse_pump_chunk(void *vctx, const char *buf, size_t len)
 
 	if (p->sctx->cancelled && *(p->sctx->cancelled))
 		return -1;
+	if (!p->first_ms)
+		p->first_ms = now_ms();   /* first body byte: TTFB boundary */
 	if (!p->mode_known) {
 		/* the response header is in: decide once whether this is
 		 * an SSE stream or a plain JSON document.  A large plain
@@ -141,6 +181,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 		  volatile int *cancelled)
 {
 	unsigned start_ms = monotonic_ms();
+	long long t0_ms = now_ms();
 	int attempt;
 
 	for (attempt = 0; attempt <= BA_MAX_RETRIES; attempt++) {
@@ -151,6 +192,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 		int rc, io_err, http_code;
 
 		sse_stream_init(&sctx, provider, callback, ctx, cancelled);
+		sctx.start_ms = t0_ms;
 		memset(&pump, 0, sizeof(pump));
 		pump.sctx = &sctx;
 		pump.resp = &resp;
@@ -193,12 +235,34 @@ int http_post_sse(const char *url, const char **headers, int header_count,
 			agc_sse_finish(&pump.sse, ba_sse_dispatch_event, &pump);
 			if (!pump.sse.saw_sse)
 				process_residual_json(pump.raw.data ? pump.raw.data : "",
-						      provider, callback, ctx);
+						      provider, callback, ctx,
+						      sctx.start_ms);
 			else if (strcmp(provider, "responses") == 0
 			 && !sctx.responses_terminal) {
 				emit_simple_event(callback, ctx, SSE_ERROR,
 					"Stream interrupted (no response.completed received)");
 				emit_simple_event(callback, ctx, SSE_STOP, "error");
+			}
+			if (rc == AGC_HTTP_COMPLETE) {
+				/* final USAGE: replaces the stream events'
+				 * wall-clock pair with the transfer window
+				 * (first body byte -> end), excluding
+				 * DNS/TCP/TLS/TTFB like bash-agent's
+				 * curl -w time_total - time_starttransfer.
+				 * start=0/end=duration; token fields stay 0
+				 * so the accumulator's >0 guards skip them */
+				long long dur_ms = pump.first_ms
+					? now_ms() - pump.first_ms : 0;
+				SseEvent tevt;
+				if (dur_ms <= 0)
+					dur_ms = pump.first_ms ? 1 : 0;
+				memset(&tevt, 0, sizeof(tevt));
+				tevt.type = SSE_USAGE;
+				tevt.speed_ready = stream_speed_ready(&sctx, rc,
+					http_code);
+				tevt.start_ms = 0;
+				tevt.end_ms = dur_ms;
+				callback(ctx, &tevt);
 			}
 			sse_stream_free(&sctx);
 			agc_sse_free(&pump.sse);
@@ -406,7 +470,7 @@ int store_session_init(const SessionPaths *p, int is_new) {
                    "\"total_input_tokens\":0,"
                    "\"total_output_tokens\":0,\"total_cache_read_tokens\":0,"
                    "\"total_cache_creation_tokens\":0,\"current_context_tokens\":0,"
-                   "\"last_updated\":\"\"}\n");
+                   "\"last_call_speed_tok_per_sec\":0,\"last_updated\":\"\"}\n");
         fclose(f);
 
         /* write the session_start event (bash parity) */
@@ -813,6 +877,7 @@ static void stats_write_canonical(const char *path,
                                   int total_cache_read_tokens,
                                   int total_cache_creation_tokens,
                                   int current_context_tokens,
+                                  int last_call_speed_tok_per_sec,
                                   const char *last_updated) {
     StrBuf buf;
     sb_init(&buf);
@@ -820,11 +885,12 @@ static void stats_write_canonical(const char *path,
                "\"compact_request_count\":%d,\"sub_agent_request_count\":%d,"
                "\"total_input_tokens\":%d,\"total_output_tokens\":%d,"
                "\"total_cache_read_tokens\":%d,\"total_cache_creation_tokens\":%d,"
-               "\"current_context_tokens\":%d,\"last_updated\":",
+               "\"current_context_tokens\":%d,\"last_call_speed_tok_per_sec\":%d,"
+               "\"last_updated\":",
                current_turn_count, agent_request_count, compact_request_count,
                sub_agent_request_count, total_input_tokens, total_output_tokens,
                total_cache_read_tokens, total_cache_creation_tokens,
-               current_context_tokens);
+               current_context_tokens, last_call_speed_tok_per_sec);
     sb_append_json_string(&buf, last_updated ? last_updated : "");
     sb_append(&buf, "}\n");
     util_write_file(path, buf.data);
@@ -892,6 +958,7 @@ void store_stats_set_int_file(const char *path, const char *key, int value) {
     int total_input_tokens = 0, total_output_tokens = 0;
     int total_cache_read_tokens = 0, total_cache_creation_tokens = 0;
     int current_context_tokens = 0;
+    int last_call_speed_tok_per_sec = 0;
 
     char *content = store_stats_read(path);
     if (content && content[0]) {
@@ -906,6 +973,7 @@ void store_stats_set_int_file(const char *path, const char *key, int value) {
             total_cache_read_tokens = json_get_int(jp.val, "total_cache_read_tokens");
             total_cache_creation_tokens = json_get_int(jp.val, "total_cache_creation_tokens");
             current_context_tokens = json_get_int(jp.val, "current_context_tokens");
+            last_call_speed_tok_per_sec = json_get_int(jp.val, "last_call_speed_tok_per_sec");
         }
     }
 
@@ -918,6 +986,7 @@ void store_stats_set_int_file(const char *path, const char *key, int value) {
     else if (strcmp(key, "total_cache_read_tokens") == 0) total_cache_read_tokens = value;
     else if (strcmp(key, "total_cache_creation_tokens") == 0) total_cache_creation_tokens = value;
     else if (strcmp(key, "current_context_tokens") == 0) current_context_tokens = value;
+    else if (strcmp(key, "last_call_speed_tok_per_sec") == 0) last_call_speed_tok_per_sec = value;
 
     time_t now = time(NULL);
     struct tm tm_buf;
@@ -928,7 +997,7 @@ void store_stats_set_int_file(const char *path, const char *key, int value) {
                           compact_request_count, sub_agent_request_count,
                           total_input_tokens, total_output_tokens,
                           total_cache_read_tokens, total_cache_creation_tokens,
-                          current_context_tokens, ts);
+                          current_context_tokens, last_call_speed_tok_per_sec, ts);
     if (content) {
         free(content);
     }
@@ -1469,7 +1538,10 @@ static void streamctx_emit_openai_tool_calls(StreamCtx *sctx) {
 
 static void parse_openai_sse_event(StreamCtx *sctx, const char *data, size_t data_len) {
     if (data_len == 0) return;
-    if (strcmp(data, "[DONE]") == 0) return;
+    if (strcmp(data, "[DONE]") == 0) {
+        sctx->protocol_complete = sctx->openai_finished;
+        return;
+    }
 
     size_t pos = 0;
     JsonParse jp = json_parse(data, &pos);
@@ -1534,6 +1606,7 @@ static void parse_openai_sse_event(StreamCtx *sctx, const char *data, size_t dat
         /* non-standard APIs may use "" instead of null (e.g. sensenova);
          * an empty string must not trigger STOP */
         if (finish && finish[0]) {
+            sctx->openai_finished = 1;
             if (strcmp(finish, "tool_calls") == 0) {
                 streamctx_emit_openai_tool_calls(sctx);
                 emit_simple_event(sctx->callback, sctx->ctx, SSE_STOP, "tool_use");
@@ -1554,6 +1627,8 @@ static void parse_openai_sse_event(StreamCtx *sctx, const char *data, size_t dat
         memset(&evt, 0, sizeof(evt));
         evt.type = SSE_USAGE;
         fill_openai_usage_event(&evt, usage);
+        evt.start_ms = sctx->start_ms;
+        evt.end_ms = now_ms();
         sctx->callback(sctx->ctx, &evt);
     }
 }
@@ -1608,6 +1683,8 @@ static void responses_emit_usage(StreamCtx *sctx) {
     evt.in_tokens = sctx->responses_input_tokens;
     evt.out_tokens = sctx->responses_output_tokens;
     evt.cache_read_tokens = sctx->responses_cache_read_tokens;
+    evt.start_ms = sctx->start_ms;
+    evt.end_ms = now_ms();
     sctx->callback(sctx->ctx, &evt);
 }
 
@@ -1660,6 +1737,7 @@ static void parse_responses_sse_event(StreamCtx *sctx, const char *event, const 
         responses_emit_usage(sctx);
         emit_simple_event(sctx->callback, sctx->ctx, SSE_STOP, has_tools ? "tool_use" : "end_turn");
         sctx->responses_terminal = 1;
+        sctx->protocol_complete = 1;
     } else if (strcmp(event, "response.failed") == 0 || strcmp(event, "response.incomplete") == 0 || strcmp(event, "error") == 0) {
         JsonVal response = json_get(root, "response");
         if (response.type == JSON_NULL) response = root;
@@ -1725,7 +1803,8 @@ static void fill_openai_usage_event(SseEvent *evt, JsonVal usage) {
 
 /* handle non-SSE responses: parse the whole JSON body as a full reply */
 static void process_residual_json(const char *residual, const char *provider,
-                                  sse_callback_fn callback, void *ctx) {
+                                  sse_callback_fn callback, void *ctx,
+                                  long long start_ms) {
     if (!residual || !residual[0]) return;
     while (*residual == ' ' || *residual == '\t' || *residual == '\r' || *residual == '\n') residual++;
     if (*residual != '{') return;
@@ -1786,6 +1865,8 @@ static void process_residual_json(const char *residual, const char *provider,
             evt.out_tokens = json_get_int(usage, "output_tokens");
             evt.cache_read_tokens = json_get_int(usage, "cache_read_input_tokens");
             evt.cache_creation_tokens = json_get_int(usage, "cache_creation_input_tokens");
+            evt.start_ms = start_ms;
+            evt.end_ms = now_ms();
             callback(ctx, &evt);
         }
     } else {
@@ -1839,6 +1920,8 @@ static void process_residual_json(const char *residual, const char *provider,
             memset(&evt, 0, sizeof(evt));
             evt.type = SSE_USAGE;
             fill_openai_usage_event(&evt, usage);
+            evt.start_ms = start_ms;
+            evt.end_ms = now_ms();
             callback(ctx, &evt);
         }
     }
@@ -1859,7 +1942,7 @@ static void emit_simple_event(sse_callback_fn callback, void *ctx,
 }
 
 int sse_parse_event(const char *provider, const char *data, size_t data_len,
-                    sse_callback_fn callback, void *ctx) {
+                    sse_callback_fn callback, void *ctx, long long start_ms) {
     if (data_len == 0) return 0;
     if (strcmp(data, "[DONE]") == 0) {
         if (strcmp(provider, "claude") == 0) emit_simple_event(callback, ctx, SSE_STOP, "end_turn");
@@ -1939,6 +2022,8 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
                 if (it > 0) evt.in_tokens = it;
                 if (cr > 0) evt.cache_read_tokens = cr;
                 if (cc > 0) evt.cache_creation_tokens = cc;
+                evt.start_ms = start_ms;
+                evt.end_ms = now_ms();
                 callback(ctx, &evt);
             }
         } else if (strcmp(type, "message_start") == 0) {
@@ -1951,6 +2036,8 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
                 evt.in_tokens = json_get_int(usage, "input_tokens");
                 evt.cache_read_tokens = json_get_int(usage, "cache_read_input_tokens");
                 evt.cache_creation_tokens = json_get_int(usage, "cache_creation_input_tokens");
+                evt.start_ms = start_ms;
+                evt.end_ms = now_ms();
                 callback(ctx, &evt);
             }
         } else if (strcmp(type, "error") == 0) {
@@ -2035,6 +2122,8 @@ int sse_parse_event(const char *provider, const char *data, size_t data_len,
                 memset(&evt, 0, sizeof(evt));
                 evt.type = SSE_USAGE;
                 fill_openai_usage_event(&evt, usage);
+                evt.start_ms = start_ms;
+                evt.end_ms = now_ms();
                 callback(ctx, &evt);
             }
         }
@@ -2127,6 +2216,11 @@ void sse_accum_callback(void *ctx, const SseEvent *evt) {
         if (evt->out_tokens > 0) acc->out_tokens = evt->out_tokens;
         if (evt->cache_read_tokens > 0) acc->cache_read_tokens = evt->cache_read_tokens;
         if (evt->cache_creation_tokens > 0) acc->cache_creation_tokens = evt->cache_creation_tokens;
+        /* every USAGE refreshes the timing pair; the final USAGE
+         * (start=0, end=duration) overwrites the stream wall-clock */
+        acc->start_ms = evt->start_ms;
+        acc->end_ms = evt->end_ms;
+        acc->speed_ready = evt->speed_ready;
         break;
 
     case SSE_STOP:
@@ -2158,6 +2252,7 @@ void sse_accum_callback(void *ctx, const SseEvent *evt) {
         acc->out_tokens = 0;
         acc->cache_read_tokens = 0;
         acc->cache_creation_tokens = 0;
+        acc->speed_ready = 0;
         break;
     }
 }

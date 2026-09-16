@@ -260,6 +260,10 @@ typedef struct {
     int out_tokens;          /* USAGE: output tokens */
     int cache_read_tokens;   /* USAGE: cache-read tokens */
     int cache_creation_tokens; /* USAGE: cache-creation tokens */
+    long long start_ms;      /* USAGE: stream start timestamp (ms) */
+    long long end_ms;        /* USAGE: stream end timestamp (ms);
+                              * the final USAGE carries start=0/end=duration */
+    int speed_ready;         /* final USAGE only: protocol complete + HTTP 2xx */
 } SseEvent;
 
 typedef void (*sse_callback_fn)(void *ctx, const SseEvent *evt);
@@ -289,6 +293,8 @@ typedef struct {
     int openai_tool_cap;
     int responses_saw_text;
     int responses_terminal;
+    int protocol_complete;   /* provider stop seen (independent of the early STOP) */
+    int openai_finished;     /* non-empty finish_reason seen ([DONE] gate) */
     int responses_input_tokens;
     int responses_output_tokens;
     int responses_cache_read_tokens;
@@ -296,6 +302,7 @@ typedef struct {
     int *responses_item_indexes;
     int responses_item_count;
     int responses_item_cap;
+    long long start_ms;     /* stream start timestamp (ms), bash-agent parity */
 } StreamCtx;
 
 /* transport-agnostic SSE pump interface */
@@ -306,7 +313,8 @@ void sse_stream_free(StreamCtx *sctx);
 
 /* parse an SSE event line (from "data: ..." lines) */
 int sse_parse_event(const char *provider, const char *data, size_t data_len,
-                    sse_callback_fn callback, void *ctx);
+                    sse_callback_fn callback, void *ctx,
+                    long long start_ms);
 
 /* ============================================================
  * SSE accumulator - collects streamed events for the turn loop
@@ -340,6 +348,9 @@ typedef struct {
     int out_tokens;
     int cache_read_tokens;
     int cache_creation_tokens;
+    long long start_ms;      /* last USAGE start timestamp (final: 0) */
+    long long end_ms;        /* last USAGE end timestamp (final: duration) */
+    int speed_ready;         /* final USAGE allows a speed update; not a stop */
 
     /* stop reason */
     char *stop_reason;
