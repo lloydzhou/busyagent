@@ -311,6 +311,26 @@ if case "$path" in */bigjson/*) true ;; *) false ;; esac; then
 fi
 
 header
+# vision expansion (bash-agent PR #92): the encoded attachment is a
+# fixed 9-byte payload "PNGDAT012" -> UE5HREFUMDEy; off must keep the
+# <attached-images> block verbatim in the request body. the marker is
+# answered in the SSE dialect of the endpoint that received it.
+if has 'VISION_E2E_MARKER'; then
+	if has 'UE5HREFUMDEy'; then
+		if has '"type":"input_image"'; then m='vision-inputimage-e2e-ok'
+		elif has '"type":"image_url"'; then m='vision-imageurl-e2e-ok'
+		elif has '"source":{"type":"base64","media_type":"image/png","data":"UE5HREFUMDEy"'; then m='vision-on-e2e-ok'
+		else m='vision-b64-orphan-e2e'; fi
+	else
+		if has '<attached-images>'; then m='vision-off-raw-e2e-ok'
+		else m='vision-block-lost-e2e'; fi
+	fi
+	case $path in
+	*/chat/completions) openai_text "$m"; exit;;
+	*/responses) responses_text "$m"; exit;;
+	*) claude_text "$m"; exit;;
+	esac
+fi
 case $path in
 */chat/completions) openai_text 'openai-e2e-ok'; exit;;
 */responses) responses_text 'responses-e2e-ok'; exit;;
@@ -422,5 +442,76 @@ testing "busyagent e2e plan confirm lifecycle" \
 testing "busyagent e2e sub-agent result flows to parent" \
 	'out=$(run_agent -s sub-e2e -p claude SUB_E2E_MARKER); s=$(find "$HOME_DIR/projects" -type d -name sub-e2e); echo "$out" | grep -q "parent-e2e-done" && grep -q "sub_agent_start" "$s/events.jsonl" && grep -q "sub_agent_end" "$s/events.jsonl" && grep -q "claude-e2e-ok" "$s/events.jsonl" && echo sub-ok' \
 	"sub-ok\n" "" ""
+
+# === output speed in stats.json (bash-agent PR #87) =================
+
+# a complete claude SSE stream must record a non-negative integer
+# last_call_speed_tok_per_sec in stats.json
+testing "busyagent e2e speed recorded after claude stream" \
+	's=$(find "$HOME_DIR/projects" -type d -name text-e2e); grep -qE "\"last_call_speed_tok_per_sec\":[0-9]+" "$s/stats.json" && echo speed-field-ok' \
+	"speed-field-ok\n" "" ""
+
+# same contract for the openai and responses protocols
+testing "busyagent e2e speed recorded for openai and responses" \
+	'run_agent -s oai-speed-e2e -p openai hello >/dev/null; run_agent -s rsp-speed-e2e -p responses hello >/dev/null; o=$(find "$HOME_DIR/projects" -type d -name oai-speed-e2e); r=$(find "$HOME_DIR/projects" -type d -name rsp-speed-e2e); grep -qE "\"last_call_speed_tok_per_sec\":[0-9]+" "$o/stats.json" && grep -qE "\"last_call_speed_tok_per_sec\":[0-9]+" "$r/stats.json" && echo speed-both-ok' \
+	"speed-both-ok\n" "" ""
+
+# a 401 must NOT write a speed: the initial 0 survives (failures keep
+# the previous value instead of recording a bogus 0-token run)
+testing "busyagent e2e speed untouched on 401 failure" \
+	's=$(find "$HOME_DIR/projects" -type d -name err-e2e); grep -o "\"last_call_speed_tok_per_sec\":0" "$s/stats.json"' \
+	"\"last_call_speed_tok_per_sec\":0\n" "" ""
+
+# === conversation archive (bash-agent PR #90) =======================
+
+# a >512 KB conversation triggers the replay trim; dropped physical
+# lines (including the boundary user line) land in
+# conversation-archive.jsonl, the tail survives byte-for-byte (CRLF
+# and empty physical lines included)
+testing "busyagent e2e trim archives dropped lines with CRLF kept" \
+	'run_agent -s arch-e2e -p claude seed-arch >/dev/null; s=$(find "$HOME_DIR/projects" -type d -name arch-e2e); { for i in 1 2 3 4 5 6 7 8 9 10; do printf "{\"role\":\"assistant\",\"content\":\"%s\"}\n" "$(head -c 54000 /dev/zero | tr "\0" a)"; done; printf "{\"role\":\"user\",\"content\":\"q-arch\"}\n"; printf "{\"role\":\"assistant\",\"content\":\"a-arch\"}\r\n"; printf "\n"; } > "$s/conversation.jsonl"; run_agent -s arch-e2e -p claude arch-trigger >/dev/null; arc=$(cat "$s/conversation-archive.jsonl" | wc -l); conv=$(wc -l < "$s/conversation.jsonl"); cr=$(grep -c "$(printf "\r")" "$s/conversation.jsonl" || true); test "$arc" -eq 11 && test "$conv" -eq 4 && test "$cr" -eq 1 && grep -q "q-arch" "$s/conversation-archive.jsonl" && echo arch-ok' \
+	"arch-ok\n" "" ""
+
+# === native image attachments --vision (bash-agent PR #92) ===========
+
+# seed a session, then inject a user line whose <attached-images>
+# block maps Image #1 to a known 9-byte fake PNG (PNGDAT012)
+vis_seed()
+{
+	sid=$1
+	run_agent -s "$sid" -p claude seed-vision >/dev/null
+	s=$(find "$HOME_DIR/projects" -type d -name "$sid")
+	printf "PNGDAT012" > "$s/images/1.png"
+	printf '{"role":"user","content":"VISION_E2E_MARKER\\n<attached-images>\\n[Image #1] => %s/images/1.png\\n</attached-images>"}\n' "$s" >> "$s/conversation.jsonl"
+}
+
+# default (no --vision, no BA_VISION): the request body keeps the
+# <attached-images> block verbatim, no base64 anywhere
+testing "busyagent e2e vision off keeps attachment block raw" \
+	'vis_seed vis-e2e; run_agent -s vis-e2e -p claude next-off 2>&1 | grep -o "vision-off-raw-e2e-ok"' \
+	"vision-off-raw-e2e-ok\n" "" ""
+
+# --vision=on expands the mapping into a base64 image block while the
+# surrounding text (VISION_E2E_MARKER) stays in the request
+testing "busyagent e2e vision on sends base64 image block" \
+	'run_agent -s vis-e2e -p claude --vision=on next-on 2>&1 | grep -o "vision-on-e2e-ok"' \
+	"vision-on-e2e-ok\n" "" ""
+
+# bare --vision is the on form; BA_VISION works without the flag
+testing "busyagent e2e bare --vision and BA_VISION enable vision" \
+	'run_agent -s vis-e2e -p claude --vision next-bare 2>&1 | grep -o "vision-on-e2e-ok"; BA_VISION=on run_agent -s vis-e2e -p claude next-env 2>&1 | grep -o "vision-on-e2e-ok"' \
+	"vision-on-e2e-ok\nvision-on-e2e-ok\n" "" ""
+
+# protocol conversion: the image block becomes image_url (openai) and
+# input_image (responses) data URLs
+testing "busyagent e2e vision converts for openai and responses" \
+	'run_agent -s vis-e2e -p openai --vision=on next-oai 2>&1 | grep -o "vision-imageurl-e2e-ok"; run_agent -s vis-e2e -p responses --vision=on next-rsp 2>&1 | grep -o "vision-inputimage-e2e-ok"' \
+	"vision-imageurl-e2e-ok\nvision-inputimage-e2e-ok\n" "" ""
+
+# a mapping whose file is missing fails the whole build: error + stop,
+# nothing is sent
+testing "busyagent e2e vision missing attachment aborts the turn" \
+	'run_agent -s vis-miss -p claude seed-miss >/dev/null; s=$(find "$HOME_DIR/projects" -type d -name vis-miss); printf "{\"role\":\"user\",\"content\":\"VISION_E2E_MARKER\\\\n<attached-images>\\\\n[Image #1] => %s/images/9.png\\\\n</attached-images>\"}\n" "$s" >> "$s/conversation.jsonl"; out=$(run_agent -s vis-miss -p claude --vision=on next-miss 2>&1); rc=$?; echo "$out" | grep -o "Failed to build messages"; echo rc=$rc' \
+	"Failed to build messages\nrc=1\n" "" ""
 
 exit $FAILCOUNT

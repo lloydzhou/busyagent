@@ -2309,23 +2309,246 @@ void sse_accum_callback(void *ctx, const SseEvent *evt) {
  * request body building
  * ============================================================ */
 
+/* ─── vision expansion: aligned with src/awk/vision_body.awk semantics
+ * (bash-agent PR #92). role=user only; <attached-images> blocks are
+ * scanned, mapping lines load the file and base64-encode it (no line
+ * breaks); a line is rewritten only when it encoded at least one image;
+ * any attachment read failure returns NULL for the whole request ─── */
+
+/* awk regex parity: ^\[Image #[0-9]+\] => /.*\/images/[0-9]+\.png$ */
+static int vision_is_mapping_line(const char *line) {
+    const char *p = line;
+    if (strncmp(p, "[Image #", 8) != 0) return 0;
+    p += 8;
+    const char *hash = strchr(p, ']');
+    if (!hash || hash == p) return 0;
+    for (const char *q = p; q < hash; q++)
+        if (*q < '0' || *q > '9') return 0;
+    p = hash + 1;
+    if (strncmp(p, " => /", 5) != 0) return 0;
+    p += 5;
+    size_t len = strlen(p);
+    if (len < 13 || strcmp(p + len - 4, ".png") != 0) return 0;
+    const char *imgs = NULL;
+    for (const char *q = p; (q = strstr(q, "/images/")) != NULL; q += 8) imgs = q;
+    if (!imgs) return 0;
+    const char *num = imgs + 8;
+    const char *numend = p + len - 4;
+    if (numend <= num) return 0;
+    for (const char *q = num; q < numend; q++)
+        if (*q < '0' || *q > '9') return 0;
+    return 1;
+}
+
+/* awk convert_text parity: all blocks handled, a block without a
+ * matching line is kept verbatim. Returns malloc'd new text; image
+ * blocks are appended to img_buf (comma-separated); *ok=0 on failure */
+static char *vision_convert_text(const char *text, StrBuf *img_buf, int *img_count, int *ok) {
+    static const char *OPEN = "<attached-images>\n";
+    static const char *CLOSE = "</attached-images>";
+    size_t open_len = strlen(OPEN), close_len = strlen(CLOSE);
+    StrBuf cleaned;
+    sb_init(&cleaned);
+    const char *rest = text;
+    for (;;) {
+        const char *start = strstr(rest, OPEN);
+        if (!start) break;
+        size_t before_len = (size_t)(start - rest);
+        const char *section = start + open_len;
+        const char *stop = strstr(section, CLOSE);
+        if (!stop) break;
+        int found = 0;
+        const char *p = section;
+        while (p < stop) {
+            const char *nl = memchr(p, '\n', (size_t)(stop - p));
+            const char *line_end = nl ? nl : stop;
+            size_t llen = (size_t)(line_end - p);
+            char *line = malloc(llen + 1);
+            if (!line) { sb_free(&cleaned); *ok = 0; return NULL; }
+            memcpy(line, p, llen);
+            line[llen] = '\0';
+            if (vision_is_mapping_line(line)) {
+                const char *arrow = strstr(line, " => ");
+                const char *path = arrow ? arrow + 4 : line;
+                size_t data_len = 0;
+                char *data = util_read_file_len(path, &data_len);
+                char *b64 = data ? util_base64_encode(data, data_len) : NULL;
+                free(data);
+                if (!b64) {
+                    free(line);
+                    sb_free(&cleaned);
+                    *ok = 0;
+                    return NULL;
+                }
+                if (img_buf->len > 0) sb_append_char(img_buf, ',');
+                sb_append(img_buf, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"");
+                sb_append(img_buf, b64);
+                sb_append(img_buf, "\"}}");
+                free(b64);
+                (*img_count)++;
+                found = 1;
+            }
+            free(line);
+            p = nl ? nl + 1 : stop;
+        }
+        if (found) {
+            if (before_len >= 2 && rest[before_len - 2] == '\n' && rest[before_len - 1] == '\n')
+                before_len -= 2;
+            sb_appendn(&cleaned, rest, before_len);
+        } else {
+            sb_appendn(&cleaned, rest, before_len);
+            sb_append(&cleaned, OPEN);
+            sb_appendn(&cleaned, section, (size_t)(stop - section));
+            sb_append(&cleaned, CLOSE);
+        }
+        rest = stop + close_len;
+    }
+    sb_append(&cleaned, rest);
+    return cleaned.data;
+}
+
+/* expand a user line. Returns a malloc'd new line; NULL with *ok=1
+ * means no images (caller keeps the original); NULL with *ok=0 means
+ * an attachment failed to load (the request must not be sent) */
+static char *expand_vision_line(const char *line, int *ok) {
+    *ok = 1;
+    JsonParse pr = json_parse_root(line);
+    if (pr.error || pr.val.type != JSON_OBJECT) return NULL;
+    char *role = json_get_string(pr.val, "role");
+    int is_user = role && strcmp(role, "user") == 0;
+    free(role);
+    if (!is_user) return NULL;
+    JsonVal content = json_get(pr.val, "content");
+    StrBuf img;
+    sb_init(&img);
+    int img_count = 0;
+    StrBuf out;
+    sb_init(&out);
+    if (content.type == JSON_STRING) {
+        char *text = json_string_val(content);
+        if (!text) { sb_free(&img); sb_free(&out); return NULL; }
+        char *new_text = vision_convert_text(text, &img, &img_count, ok);
+        free(text);
+        if (!*ok) { sb_free(&img); sb_free(&out); return NULL; }
+        if (img_count == 0) {
+            free(new_text);
+            sb_free(&img);
+            sb_free(&out);
+            return NULL;
+        }
+        sb_append_char(&out, '[');
+        if (new_text && new_text[0]) {
+            sb_append(&out, "{\"type\":\"text\",\"text\":");
+            sb_append_json_string(&out, new_text);
+            sb_append_char(&out, '}');
+            sb_append_char(&out, ',');
+        }
+        sb_append(&out, img.data);
+        sb_append_char(&out, ']');
+        free(new_text);
+    } else if (content.type == JSON_ARRAY) {
+        int n = json_array_len(content);
+        int wrote = 0;
+        sb_append_char(&out, '[');
+        for (int i = 0; i < n; i++) {
+            JsonVal block = json_array_get(content, i);
+            char *btype = block.type == JSON_OBJECT ? json_get_string(block, "type") : NULL;
+            if (btype && strcmp(btype, "text") == 0) {
+                JsonVal tv = json_get(block, "text");
+                char *text = tv.type == JSON_STRING ? json_string_val(tv) : NULL;
+                free(btype);
+                if (!text) {
+                    if (wrote++) sb_append_char(&out, ',');
+                    sb_appendn(&out, block.src + block.start, block.end - block.start);
+                    continue;
+                }
+                char *new_text = vision_convert_text(text, &img, &img_count, ok);
+                int changed = new_text ? strcmp(new_text, text) != 0 : 0;
+                free(text);
+                if (!*ok) {
+                    free(new_text);
+                    sb_free(&img);
+                    sb_free(&out);
+                    return NULL;
+                }
+                if (new_text && !new_text[0]) {
+                    free(new_text);
+                    continue;
+                }
+                if (wrote++) sb_append_char(&out, ',');
+                if (changed) {
+                    sb_append(&out, "{\"type\":\"text\",\"text\":");
+                    sb_append_json_string(&out, new_text);
+                    sb_append_char(&out, '}');
+                } else {
+                    sb_appendn(&out, block.src + block.start, block.end - block.start);
+                }
+                free(new_text);
+            } else {
+                free(btype);
+                if (wrote++) sb_append_char(&out, ',');
+                sb_appendn(&out, block.src + block.start, block.end - block.start);
+            }
+        }
+        if (img_count == 0) { sb_free(&img); sb_free(&out); return NULL; }
+        if (wrote) sb_append_char(&out, ',');
+        sb_append(&out, img.data);
+        sb_append_char(&out, ']');
+    } else {
+        sb_free(&img);
+        sb_free(&out);
+        return NULL;
+    }
+    sb_free(&img);
+    StrBuf lb;
+    sb_init(&lb);
+    sb_append(&lb, "{\"role\":\"user\",\"content\":");
+    sb_append(&lb, out.data);
+    sb_append_char(&lb, '}');
+    sb_free(&out);
+    return lb.data;
+}
+
 char *build_claude_request(const char *model, const char *system_prompt,
                            const char *tools_json,
                            char **conv_lines, int conv_line_count,
-                           int max_tokens, const char *thinking, const char *effort) {
+                           int max_tokens, const char *thinking, const char *effort,
+                           const char *vision) {
     StrBuf buf;
     sb_init(&buf);
+    int vision_on = vision && strcmp(vision, "on") == 0;
 
     /* field order matches the Go/Rust map alphabetical order:
      * max_tokens → messages → model → output_config → stream → system → thinking → tools */
     sb_append(&buf, "{\"max_tokens\":");
     sb_appendf(&buf, "%d", max_tokens);
 
-    /* messages */
+    /* messages: skip empty physical lines (physical-line line_count,
+     * bash store_conv_get_messages parity - bash-agent PR #90).
+     * vision=on expands attachment mappings first; any failure
+     * returns NULL so the request is not sent (bash-agent PR #92) */
     sb_append(&buf, ",\"messages\":[");
+    int first_message = 1;
     for (int i = 0; i < conv_line_count; i++) {
-        if (i > 0) sb_append(&buf, ",");
+        if (!conv_lines[i] || conv_lines[i][0] == '\0') continue;
+        if (vision_on) {
+            int ok = 1;
+            char *expanded = expand_vision_line(conv_lines[i], &ok);
+            if (!ok) {
+                sb_free(&buf);
+                return NULL;
+            }
+            if (expanded) {
+                if (!first_message) sb_append(&buf, ",");
+                sb_append(&buf, expanded);
+                first_message = 0;
+                free(expanded);
+                continue;
+            }
+        }
+        if (!first_message) sb_append(&buf, ",");
         sb_append(&buf, conv_lines[i]);
+        first_message = 0;
     }
     sb_append(&buf, "]");
 
@@ -2496,6 +2719,51 @@ static int openai_convert_tool_results(StrBuf *out, JsonVal content_val) {
     return written;
 }
 
+/* does a user content array carry an image block? */
+static int openai_content_has_image(JsonVal content) {
+    int n = json_array_len(content);
+    for (int i = 0; i < n; i++) {
+        JsonVal block = json_array_get(content, i);
+        char *btype = json_get_string(block, "type");
+        int has = btype && strcmp(btype, "image") == 0;
+        FREE_PTR(btype);
+        if (has) return 1;
+    }
+    return 0;
+}
+
+/* claude content array (with image) -> openai content array:
+ * image -> image_url data URL, other blocks verbatim */
+static void openai_convert_user_content(StrBuf *out, JsonVal content_val) {
+    sb_append_char(out, '[');
+    int n = json_array_len(content_val);
+    int wrote = 0;
+    for (int i = 0; i < n; i++) {
+        JsonVal block = json_array_get(content_val, i);
+        char *btype = json_get_string(block, "type");
+        if (btype && strcmp(btype, "image") == 0) {
+            JsonVal source = json_get(block, "source");
+            char *media = source.type == JSON_OBJECT ? json_get_string(source, "media_type") : NULL;
+            char *data = source.type == JSON_OBJECT ? json_get_string(source, "data") : NULL;
+            if (media && data && data[0]) {
+                if (wrote++) sb_append_char(out, ',');
+                sb_append(out, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+                sb_append(out, media);
+                sb_append(out, ";base64,");
+                sb_append(out, data);
+                sb_append(out, "\"}}");
+            }
+            FREE_PTR(media);
+            FREE_PTR(data);
+        } else {
+            if (wrote++) sb_append_char(out, ',');
+            sb_append_json_val(out, block);
+        }
+        FREE_PTR(btype);
+    }
+    sb_append_char(out, ']');
+}
+
 static void openai_convert_messages(StrBuf *out, JsonVal messages_val) {
     sb_append_char(out, '[');
     int wrote = 0;
@@ -2513,7 +2781,14 @@ static void openai_convert_messages(StrBuf *out, JsonVal messages_val) {
             if (wrote > 0 && json_array_len(content) > 0) {
                 /* openai_convert_tool_results handles commas after the first item */
             }
-            if (wrote > 0) {
+            if (openai_content_has_image(content)) {
+                /* vision: image blocks become image_url data URLs */
+                if (wrote > 0) sb_append_char(out, ',');
+                sb_append(out, "{\"role\":\"user\",\"content\":");
+                openai_convert_user_content(out, content);
+                sb_append_char(out, '}');
+                wrote++;
+            } else if (wrote > 0) {
                 StrBuf tmp;
                 sb_init(&tmp);
                 int tool_written = openai_convert_tool_results(&tmp, content);
@@ -2695,6 +2970,21 @@ static void responses_convert_messages(StrBuf *out, JsonVal messages_val) {
                     FREE_PTR(id); FREE_PTR(value);
                 } else if (type && strcmp(type, "text") == 0) {
                     char *value = json_get_string(block, "text"); if (wrote++) sb_append_char(out, ','); sb_append(out, "{\"role\":\"user\",\"content\":"); sb_append_json_string(out, value ? value : ""); sb_append_char(out, '}'); FREE_PTR(value);
+                } else if (type && strcmp(type, "image") == 0) {
+                    /* vision: image block -> input_image data URL */
+                    JsonVal source = json_get(block, "source");
+                    char *media = source.type == JSON_OBJECT ? json_get_string(source, "media_type") : NULL;
+                    char *data = source.type == JSON_OBJECT ? json_get_string(source, "data") : NULL;
+                    if (media && data && data[0]) {
+                        if (wrote++) sb_append_char(out, ',');
+                        sb_append(out, "{\"type\":\"input_image\",\"image_url\":\"data:");
+                        sb_append(out, media);
+                        sb_append(out, ";base64,");
+                        sb_append(out, data);
+                        sb_append(out, "\"}");
+                    }
+                    FREE_PTR(media);
+                    FREE_PTR(data);
                 }
                 FREE_PTR(type);
             }

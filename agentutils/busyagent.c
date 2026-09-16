@@ -287,6 +287,7 @@ typedef struct {
 	int max_turns;
 	const char *model, *provider, *api_url, *api_key;
 	const char *effort;      /* NULL = thinking off */
+	const char *vision;      /* "on" = expand image attachments */
 	BaDisplayFormat fmt;
 	SessionPaths paths;
 } BaRunCtx;
@@ -895,6 +896,13 @@ static int ba_run_session(BaRunCtx *ctx)
 			 * turn before building the request (queue re-injection) */
 			ba_drain_background(ctx, &paths, ctx->fmt, 0);
 
+			memset(&tctx, 0, sizeof(tctx));
+			tctx.paths = &paths;
+			tctx.verbose = verbose;
+			ba_disp_init(&tctx.disp, ctx->fmt);
+			sse_accum_init(&tctx.accum);
+			accum = &tctx.accum;
+
 			ba_trim_history(paths.conversation);
 
 			if (store_conv_line_count(paths.conversation, &lines, &line_count) != 0)
@@ -904,7 +912,24 @@ static int ba_run_session(BaRunCtx *ctx)
 							   lines, line_count,
 							   BA_MAX_TOKENS,
 							   ctx->effort ? "enabled" : NULL,
-							   ctx->effort);
+							   ctx->effort,
+							   ctx->vision);
+			if (!claude_body) {
+				/* vision attachment failed to load: report and
+				 * abort this turn without sending (bash-agent
+				 * PR #92 parity) */
+				int li;
+				for (li = 0; li < line_count; li++) free(lines[li]);
+				free(lines);
+				ba_push_display(&tctx, &(BaDisplayMsg){
+					.type = BA_DM_ERROR,
+					.content = (char *)"Failed to build messages"});
+				ba_push_display(&tctx, &(BaDisplayMsg){
+					.type = BA_DM_STOP, .content = (char *)"error"});
+				sse_accum_free(accum);
+				rc = 1;
+				goto out;
+			}
 			body = claude_body;
 			if (strcmp(provider, "openai") == 0) {
 				body = convert_to_openai(claude_body);
@@ -929,13 +954,6 @@ static int ba_run_session(BaRunCtx *ctx)
 				snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
 				headers[hdr_count++] = auth_header;
 			}
-
-			memset(&tctx, 0, sizeof(tctx));
-			tctx.paths = &paths;
-			tctx.verbose = verbose;
-			ba_disp_init(&tctx.disp, ctx->fmt);
-			sse_accum_init(&tctx.accum);
-			accum = &tctx.accum;
 
 			g_interrupted = 0;
 			sse_rc = http_post_sse(api_url, headers, hdr_count,
@@ -1157,11 +1175,15 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	const char *provider_env = getenv("BA_PROVIDER");
 	const char *output_env = getenv("BA_OUTPUT");
 	const char *effort_env = getenv("BA_EFFORT");
+	const char *vision_env = getenv("BA_VISION");
 	const char *model = (model_env && model_env[0]) ? model_env : NULL;
 	const char *provider = (provider_env && provider_env[0]) ? provider_env : "openai";
 	const char *session_arg = NULL;
 	const char *output_fmt = (output_env && output_env[0]) ? output_env : "text";
 	const char *effort = (effort_env && effort_env[0]) ? effort_env : NULL;
+	/* BA_VISION default; an explicit --vision[=on|off] overrides.
+	 * anything but "on" normalizes to off (bash-agent parity) */
+	const char *vision = (vision_env && vision_env[0]) ? vision_env : "off";
 	int max_turns = BA_DEFAULT_TURNS, verbose = 0;
 	int opt_new = 0;
 	char *prompt = NULL, *home, *cwd, *session_id = NULL;
@@ -1170,19 +1192,31 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	unsigned opts;
 	const char *o_u = NULL, *o_k = NULL, *o_m = NULL, *o_p = NULL;
 	const char *o_t = NULL, *o_s = NULL, *o_o = NULL, *o_e = NULL;
-	/* bit positions follow the option string "vu:k:m:p:t:s:o:e:nci" */
+	const char *o_vision = NULL;
+	/* --vision [on|off] via getopt32long; the \xff pseudo short option
+	 * carries the optional argument (busybox long-option convention:
+	 * a value needs the --vision=on form; a bare --vision means on) */
+	static const char busyagent_longopts[] ALIGN1 =
+		"vision\0" Optional_argument "\xff";
+	/* bit positions follow the option string "vu:k:m:p:t:s:o:e:nci\xff::" */
 	enum {
 		OPT_verbose = 1 << 0,
 		OPT_new     = 1 << 9,
 		OPT_continue= 1 << 10,
 		OPT_init    = 1 << 11,
+		OPT_vision  = 1 << 12,
 	};
 
-	opts = getopt32(argv, "^"
-		"vu:k:m:p:t:s:o:e:nci" "\0",
-		&o_u, &o_k, &o_m, &o_p, &o_t, &o_s, &o_o, &o_e);
+	opts = getopt32long(argv, "^"
+		"vu:k:m:p:t:s:o:e:nci\xff::" "\0",
+		busyagent_longopts,
+		&o_u, &o_k, &o_m, &o_p, &o_t, &o_s, &o_o, &o_e, &o_vision);
 	if (opts & OPT_verbose) verbose = 1;
 	if (opts & OPT_new) opt_new = 1;
+	if (opts & OPT_vision)
+		/* bare --vision (no =value) means on; any explicit value
+		 * but "on" normalizes to off (bash-agent parity) */
+		vision = (!o_vision || strcmp(o_vision, "on") == 0) ? "on" : "off";
 	/* OPT_continue is the default behavior; the flag is a no-op kept
 	 * for muscle-memory compatibility with cagent */
 
@@ -1337,6 +1371,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 			repl.api_url = api_url;
 			repl.api_key = api_key;
 			repl.effort = effort;
+			repl.vision = vision;
 			repl.fmt = (strcmp(output_fmt, "json") == 0)
 			           ? BA_FMT_STREAM_JSON : BA_FMT_HUMAN;
 
@@ -1434,6 +1469,7 @@ int busyagent_main(int argc UNUSED_PARAM, char **argv)
 	root.api_url = api_url;
 	root.api_key = api_key;
 	root.effort = effort;
+	root.vision = vision;
 	root.fmt = (strcmp(output_fmt, "json") == 0)
 	           ? BA_FMT_STREAM_JSON : BA_FMT_HUMAN;
 

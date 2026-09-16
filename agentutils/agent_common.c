@@ -1499,6 +1499,35 @@ int util_write_file(const char *path, const char *content) {
     return (nw == len) ? 0 : -1;
 }
 
+/* binary-safe read: unlike util_read_file the buffer may contain \0
+ * (PNG data); the length goes to *out_len, no NUL is appended */
+char *util_read_file_len(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return NULL; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    char *buf = malloc(sz > 0 ? (size_t)sz : 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf); fclose(f); return NULL;
+    }
+    fclose(f);
+    *out_len = (size_t)sz;
+    return buf;
+}
+
+/* standard base64 (single line, '=' padding, NUL-terminated);
+ * wraps busybox libbb bb_uuencode instead of a hand-rolled table */
+char *util_base64_encode(const char *data, size_t len) {
+    size_t out_len = ((len + 2) / 3) * 4;
+    char *out = malloc(out_len + 1);
+    if (!out) return NULL;
+    bb_uuencode(out, data, (int)len, bb_uuenc_tbl_base64);
+    return out;
+}
+
 /* ==== ba_json.c ==== */
 #include <stdio.h>
 #include <stdlib.h>

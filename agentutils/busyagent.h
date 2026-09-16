@@ -370,11 +370,13 @@ void sse_accum_free(SseAccumulator *acc);
 /* SSE callback - accumulate events into SseAccumulator */
 void sse_accum_callback(void *ctx, const SseEvent *evt);
 
-/* build the request body */
+/* build the request body; vision "on" expands <attached-images> blocks
+ * (returns NULL when an attachment cannot be loaded) */
 char *build_claude_request(const char *model, const char *system_prompt,
                            const char *tools_json,
                            char **conv_lines, int conv_line_count,
-                           int max_tokens, const char *thinking, const char *effort);
+                           int max_tokens, const char *thinking, const char *effort,
+                           const char *vision);
 
 /* convert a Claude request body to OpenAI format */
 char *convert_to_openai(const char *claude_body);
