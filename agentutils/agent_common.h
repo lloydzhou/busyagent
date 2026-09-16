@@ -88,6 +88,12 @@ char *util_read_file(const char *path);
 /* write a whole file */
 int util_write_file(const char *path, const char *content);
 
+/* binary-safe read (buffer may contain \0; length to *out_len) */
+char *util_read_file_len(const char *path, size_t *out_len);
+
+/* standard base64 of arbitrary bytes, single line */
+char *util_base64_encode(const char *data, size_t len);
+
 
 /* ==== ba_json.h ==== */
 #ifndef JSON_H
