@@ -10,212 +10,12 @@
 /*
  * utility functions - strings, paths, timestamps
  */
-
-/* growable string buffer */
-typedef struct {
-    char *data;
-    size_t len;      /* current length (excluding '\0') */
-    size_t cap;      /* buffer capacity */
-} StrBuf;
-
-void sb_init(StrBuf *sb);
-void sb_free(StrBuf *sb);
-void sb_ensure(StrBuf *sb, size_t extra);
-void sb_append(StrBuf *sb, const char *s);
-void sb_appendn(StrBuf *sb, const char *s, size_t n);
-void sb_appendf(StrBuf *sb, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
-void sb_append_char(StrBuf *sb, char c);
-/* truncate to a given length */
-void sb_truncate(StrBuf *sb, size_t len);
-
-/* JSON-escape src and append to sb */
-void sb_append_json_string(StrBuf *sb, const char *src);
-/* shell-quote src as one argument and append to sb */
-void sb_append_shell_arg(StrBuf *sb, const char *src);
-
-/* session id: YYYYMMDD-HHMMSS-XXXX */
-char *util_new_session_id(void);
-
-/* join paths a/b (handles trailing/leading slashes) */
-char *util_path_join(const char *a, const char *b);
-
-/* ensure a directory exists (recursive, mkdir -p) */
-int util_mkdirs(const char *path, int mode);
-
-/* home directory path */
-const char *util_home_dir(void);
-
-/* strdup, NULL-safe */
-char *util_strdup(const char *s);
-
-/* free + NULL */
-#define FREE_PTR(p) do { free(p); (p) = NULL; } while(0)
-
-/* getenv with a default */
-const char *util_env(const char *name, const char *defval);
-
-/* current timestamp string (ISO 8601) */
-char *util_timestamp_now(void);
-
-/* parse a number with k/m/g suffixes (util_parse_size parity) */
-long util_parse_size(const char *s);
-
-/* current epoch seconds */
-long util_epoch_seconds(void);
-
-/* count UTF-8 characters (approximate token counting) */
-int util_utf8_char_count(const char *s);
-
-/* largest offset <= max_bytes that never splits a UTF-8 char */
-size_t util_utf8_truncate_len(const char *s, size_t max_bytes);
-
-/* truncate in place to max_total bytes (UTF-8 safe), append "..." */
-void util_truncate_str(char *s, size_t max_total);
-
-/* truncate in place to max_chars UTF-8 chars, append "..." */
-void util_truncate_chars(char *s, int max_chars);
-
-/* UTF-8 sanitize: invalid bytes become the \ufffd literal, malloc'd */
-char *util_sanitize_utf8(const char *src);
-
-/* trim trailing whitespace */
-char *util_rtrim(char *s);
-
-/* read a whole file into a string */
-char *util_read_file(const char *path);
-
-/* write a whole file */
-int util_write_file(const char *path, const char *content);
+/* StrBuf, utils and the JSON parser/serializer moved to
+ * agent_common.h */
+#include "agent_common.h"
 
 #endif /* UTIL_H */
 
-/* ==== ba_json.h ==== */
-#ifndef JSON_H
-#define JSON_H
-
-#include <stddef.h>
-#include <stdbool.h>
-
-/*
- * lightweight JSON parser - what Claude/OpenAI responses and
- *
- * design:
- *   - single pass, zero copy (values point into the original text)
- *   - json_get_string etc. return malloc'd copies
- *   - objects, arrays, strings, numbers, booleans, null
- *   - no serialization (assemble via StrBuf instead)
- */
-
-/* JSON value types */
-typedef enum {
-    JSON_NULL,
-    JSON_BOOL,
-    JSON_NUMBER,
-    JSON_STRING,
-    JSON_ARRAY,
-    JSON_OBJECT,
-} JsonType;
-
-/* JSON value - a view into the original JSON text */
-typedef struct {
-    JsonType type;
-    const char *src;        /* the original JSON string */
-    size_t start;           /* value start offset in src */
-    size_t end;             /* value end offset in src (exclusive) */
-    /* STRING: src+start..src+end is the raw value (with quotes) */
-    /* OBJECT/ARRAY: src+start..src+end is the whole structure */
-} JsonVal;
-
-/* parse result */
-typedef struct {
-    JsonVal val;            /* parsed value */
-    const char *error;      /* error message, NULL on success */
-} JsonParse;
-
-/* ============================================================
- * parsing
- * ============================================================ */
-
-/* parse a JSON value from src+pos; updates pos */
-JsonParse json_parse(const char *src, size_t *pos);
-
-/* parse a complete JSON string (from the root) */
-JsonParse json_parse_root(const char *src);
-
-/* ============================================================
- * queries - extract fields from an OBJECT
- * ============================================================ */
-
-/* value for key, or type=JSON_NULL when absent */
-JsonVal json_get(JsonVal obj, const char *key);
-
-/* string value (malloc'd copy, NULL when absent) */
-char *json_get_string(JsonVal obj, const char *key);
-
-/* integer value */
-int json_get_int(JsonVal obj, const char *key);
-
-/* long long value (large token counts) */
-long long json_get_ll(JsonVal obj, const char *key);
-
-/* double value */
-double json_get_double(JsonVal obj, const char *key);
-
-/* boolean value (def when absent) */
-bool json_get_bool(JsonVal obj, const char *key, bool def);
-
-/* ============================================================
- * array operations
- * ============================================================ */
-
-/* array length */
-int json_array_len(JsonVal arr);
-
-/* i-th element (JSON_NULL when out of range) */
-JsonVal json_array_get(JsonVal arr, int index);
-
-/* ============================================================
- * value extraction
- * ============================================================ */
-
-/* decoded string from a JSON_STRING (malloc'd copy) */
-char *json_string_val(JsonVal v);
-
-/* double from a JSON_NUMBER */
-double json_number_val(JsonVal v);
-
-/* bool from a JSON_BOOL */
-bool json_bool_val(JsonVal v);
-
-/* generic: decode when v is a string, else NULL */
-char *json_as_string(JsonVal v);
-
-/* ============================================================
- * iterate OBJECT key/value pairs
- * ============================================================ */
-
-typedef struct {
-    const char *key;        /* key (malloc'd; _next frees the previous) */
-    JsonVal val;            /* value */
-    /* internal state */
-    const char *src;
-    size_t pos;
-    bool first;
-} JsonObjectIter;
-
-void json_obj_iter_init(JsonObjectIter *it, JsonVal obj);
-bool json_obj_iter_next(JsonObjectIter *it);
-void json_obj_iter_cleanup(JsonObjectIter *it);  /* call to break out early */
-
-/* ============================================================
- * JSON Lines appending
- * ============================================================ */
-
-/* append one line to a JSONL file (adds \n) */
-int jsonl_append(const char *path, const char *json_line);
-
-#endif /* JSON_H */
 
 /* ==== ba_store.h ==== */
 #ifndef STORE_H
@@ -471,7 +271,7 @@ int http_post_sse(const char *url, const char **headers, int header_count,
                   sse_callback_fn callback, void *ctx,
                   volatile int *cancelled);
 
-/* streaming callback context (line split + provider dispatch) */
+/* streaming callback context (provider dispatch over shared SSE splitter) */
 typedef struct {
     int index;
     char *id;
@@ -482,8 +282,6 @@ typedef struct {
 typedef struct {
     sse_callback_fn callback;
     void *ctx;
-    StrBuf line_buf;        /* accumulating SSE line */
-    char *event;            /* Responses SSE event name */
     char *provider;         /* "claude", "openai" or "responses" */
     volatile int *cancelled;
     OpenAIToolAccum *openai_tools;
@@ -505,11 +303,6 @@ void sse_stream_init(StreamCtx *sctx, const char *provider,
                      sse_callback_fn callback, void *ctx,
                      volatile int *cancelled);
 void sse_stream_free(StreamCtx *sctx);
-/* stream tail: leftover JSON + responses termination check */
-void sse_stream_finish(StreamCtx *sctx, const char *provider,
-                       sse_callback_fn callback, void *ctx);
-/* feed one decoded body chunk; 0 means cancelled */
-int sse_stream_feed(StreamCtx *sctx, const char *ptr, size_t len);
 
 /* parse an SSE event line (from "data: ..." lines) */
 int sse_parse_event(const char *provider, const char *data, size_t data_len,

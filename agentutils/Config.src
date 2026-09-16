@@ -5,6 +5,11 @@
 
 menu "Agent Utilities"
 
+# hidden: shared infrastructure object (agent_common.o) used by the
+# agentutils applets; selected by whoever needs it
+config AGENTUTILS_COMMON
+	bool
+
 INSERT
 
 endmenu

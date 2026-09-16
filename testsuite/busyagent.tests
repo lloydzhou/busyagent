@@ -98,11 +98,19 @@ testing "busyagent rejects schemeless URL" \
 	"HTTP request failed\n" \
 	"" ""
 
+# control characters anywhere in the url (path included) never reach
+# the wire as header/line breaks
+CRLF_URL="http://127.0.0.1:9/x$(printf '\r\n')X-Inject: 1"
+testing "busyagent rejects a CRLF smuggled in the url path" \
+	"busyagent hi -u \"\$CRLF_URL\" -k k -m m 2>&1 | grep -o \"HTTP request failed\"" \
+	"HTTP request failed\n" \
+	"" ""
+
 # https works out of the box; the unauthenticated-TLS caveat is announced
 # on stderr before any connection is attempted.
-testing "busyagent https warns about unverified certificates" \
-	'busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -o "does not verify server certificates"' \
-	"does not verify server certificates\n" \
+testing "busyagent https connects silently (no TLS warning)" \
+	'busyagent hi -u https://127.0.0.1:1/x -k k -m m 2>&1 | grep -c "does not verify server certificates" || true' \
+	"0\n" \
 	"" ""
 
 # port 1 on loopback: refused immediately by xconnect after the warning,
@@ -284,10 +292,47 @@ responses_text()
 		'data: {"response":{"usage":{"input_tokens":10,"output_tokens":3}}}'
 }
 
+# non-SSE JSON error body: answered before `header` runs, because it
+# must not reuse the global SSE content-type
+if has 'E2E_BAD_KEY'; then
+	printf 'Status: 401\r\nContent-Type: application/json\r\n\r\n'
+	printf '{"type":"error","error":{"type":"authentication_error","message":"e2e-bad-key"}}'
+	exit
+fi
+
+# a single-line JSON body far beyond the old 64 KB SSE line cap: must
+# be delivered whole (the tail marker proves nothing was truncated)
+if case "$path" in */bigjson/*) true ;; *) false ;; esac; then
+	printf 'Content-Type: application/json\r\n\r\n'
+	printf '{"type":"error","error":{"type":"api_error","message":"big-json '
+	dd if=/dev/zero bs=1024 count=80 2>/dev/null | tr '\0' 'x'
+	printf ' tail-big-json-e2e-ok"}}'
+	exit
+fi
+
 header
 case $path in
 */chat/completions) openai_text 'openai-e2e-ok'; exit;;
 */responses) responses_text 'responses-e2e-ok'; exit;;
+*/lf/*)
+	claude_text 'lf-path-e2e-ok'
+	exit;;
+*/crlf/*)
+	# header already sent above: CRLF-separated event frames only
+	printf '%s\r\n\r\n' \
+		'event: message_start' \
+		'data: {"type":"message_start","message":{"id":"msg_crlf","role":"assistant","content":[],"model":"test","usage":{"input_tokens":10,"output_tokens":0}}}' \
+		'event: content_block_start' \
+		'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'
+	printf 'event: content_block_delta\r\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"crlf-e2e-ok"}}\r\n\r\n'
+	printf '%s\r\n\r\n' \
+		'event: content_block_stop' \
+		'data: {"type":"content_block_stop","index":0}' \
+		'event: message_delta' \
+		'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}' \
+		'event: message_stop' \
+		'data: {"type":"message_stop"}'
+	exit;;
 esac
 
 if has 'WRITE_E2E_MARKER'; then
@@ -342,6 +387,25 @@ testing "busyagent e2e openai text stream" \
 testing "busyagent e2e responses text stream" \
 	'run_agent -n -p responses hello | grep -o "responses-e2e-ok"' \
 	"responses-e2e-ok\n" "" ""
+
+testing "busyagent e2e lf control via path suffix" \
+	'run_agent -n -s lf-e2e -p claude -u "$BASE/lf" hello 2>&1 | grep -o "lf-path-e2e-ok"' \
+	"lf-path-e2e-ok\n" "" ""
+
+testing "busyagent e2e crlf-separated sse stream" \
+	'run_agent -n -s crlf-e2e -p claude -u "$BASE/crlf" hello 2>&1 | grep -o "crlf-e2e-ok"' \
+	"crlf-e2e-ok\n" "" ""
+
+testing "busyagent e2e non-sse json error body" \
+	'run_agent -n -s err-e2e -p claude E2E_BAD_KEY 2>&1 | grep -o "e2e-bad-key"; s=$(find "$HOME_DIR/projects" -type d -name err-e2e); grep -q "e2e-bad-key" "$s/events.jsonl" && echo logged' \
+	"e2e-bad-key
+logged\n" "" ""
+
+# >64 KB single-line JSON body on a non-SSE content-type: previously
+# fed through the SSE splitter, hit the line cap and failed the request
+testing "busyagent e2e large non-sse json body survives" \
+	'run_agent -n -s big-e2e -p claude -u "$BASE/bigjson" hello 2>&1 | grep -o "tail-big-json-e2e-ok"' \
+	"tail-big-json-e2e-ok\n" "" ""
 
 testing "busyagent e2e write tool loop" \
 	'rm -f "$TARGET"; run_agent -s write-e2e -p claude WRITE_E2E_MARKER >/dev/null; cat "$TARGET"' \
