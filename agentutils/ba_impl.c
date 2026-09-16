@@ -325,6 +325,7 @@ void store_session_paths_free(SessionPaths *p) {
     FREE_PTR(p->summary);
     FREE_PTR(p->plan);
     FREE_PTR(p->plan_draft);
+    FREE_PTR(p->archive);
 }
 
 SessionPaths store_session_paths_dup(const SessionPaths *p) {
@@ -339,6 +340,7 @@ SessionPaths store_session_paths_dup(const SessionPaths *p) {
     d.summary      = p->summary      ? util_strdup(p->summary) : NULL;
     d.plan         = p->plan         ? util_strdup(p->plan) : NULL;
     d.plan_draft   = p->plan_draft   ? util_strdup(p->plan_draft) : NULL;
+    d.archive      = p->archive      ? util_strdup(p->archive) : NULL;
     return d;
 }
 
@@ -432,6 +434,10 @@ SessionPaths store_session_paths_for(const char *home, const char *cwd, const ch
     sb_appendf(&buf, "%s/plan.draft", p.session_dir);
     p.plan_draft = util_strdup(buf.data);
 
+    sb_truncate(&buf, 0);
+    sb_appendf(&buf, "%s/conversation-archive.jsonl", p.session_dir);
+    p.archive = util_strdup(buf.data);
+
     sb_free(&buf);
     free(key);
     return p;
@@ -460,6 +466,7 @@ int store_session_init(const SessionPaths *p, int is_new) {
     touch_file(p->summary);
     touch_file(p->plan);
     touch_file(p->plan_draft);
+    touch_file(p->archive);
 
     if (is_new) {
         /* write the initial stats.json */
@@ -510,6 +517,9 @@ int store_session_fork(const SessionPaths *parent, const SessionPaths *child) {
     char *parent_plan = util_read_file(parent->plan);
     if (parent_plan && strlen(parent_plan) > 0) util_write_file(child->plan, parent_plan);
     free(parent_plan);
+    char *parent_archive = util_read_file(parent->archive);
+    if (parent_archive && strlen(parent_archive) > 0) util_write_file(child->archive, parent_archive);
+    free(parent_archive);
     return 0;
 }
 
@@ -767,13 +777,13 @@ int store_conv_line_count(const char *path, char ***out, int *out_count) {
     ssize_t read_len;
     if (!lines) goto fail;
 
-    /* getline grows on real newlines; a long JSONL record is one line */
+    /* physical-line semantics, aligned with wc -l (bash-agent PR #90):
+     * every LF-terminated line is one record; CR is kept so CRLF
+     * sessions are not normalized before trimming, and empty lines
+     * survive (JSON-parse failures are skipped by callers) */
     while ((read_len = getline(&line, &line_cap, f)) != -1) {
-        /* strip trailing newline */
-        size_t len = (size_t)read_len;
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-            line[--len] = '\0';
-        if (len == 0) continue;
+        if (read_len == 0 || line[read_len - 1] != '\n') continue;
+        line[read_len - 1] = '\0';
 
         if (count >= cap) {
             int new_cap = cap * 2;
@@ -801,30 +811,68 @@ fail:
     return -1;
 }
 
+/* byte offset just past the lines-th LF (== len when fewer lines) */
+static size_t conv_line_end_offset(const char *data, size_t len, int lines) {
+    if (lines <= 0) return 0;
+    int seen = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] == '\n' && ++seen == lines) return i + 1;
+    }
+    return len;
+}
+
 int store_conv_trim_tail(const char *path, int keep_lines) {
-    char **lines = NULL;
-    int count = 0;
-    if (store_conv_line_count(path, &lines, &count) != 0) return -1;
-    if (keep_lines >= count) {
-        for (int i = 0; i < count; i++) free(lines[i]);
-        free(lines);
+    char *data = util_read_file(path);
+    if (!data) return -1;
+
+    size_t len = strlen(data);
+    int total_lines = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] == '\n') total_lines++;
+    }
+    if (keep_lines >= total_lines) {
+        free(data);
         return 0;
     }
 
-    /* rewrite keeping only the last keep_lines lines */
-    FILE *f = fopen(path, "w");
+    size_t split_at = conv_line_end_offset(data, len, total_lines - keep_lines);
+
+    /* append the dropped physical lines to the session archive in their
+     * original bytes (CR included) before rewriting; an archive failure
+     * must not stop the trim the bash version performs anyway */
+    {
+        char *session_dir = util_strdup(path);
+        char *slash = strrchr(session_dir, '/');
+        if (slash) {
+            FILE *archive_file;
+            *slash = '\0';
+            StrBuf abuf;
+            sb_init(&abuf);
+            sb_appendf(&abuf, "%s/conversation-archive.jsonl", session_dir);
+            archive_file = fopen(abuf.data, "ab");
+            if (archive_file) {
+                (void)fwrite(data, 1, split_at, archive_file);
+                fclose(archive_file);
+            }
+            sb_free(&abuf);
+        }
+        free(session_dir);
+    }
+
+    /* rewrite keeping only the tail, byte-for-byte */
+    FILE *f = fopen(path, "wb");
     if (!f) {
-        for (int i = 0; i < count; i++) free(lines[i]);
-        free(lines);
+        free(data);
         return -1;
     }
-    int start = count - keep_lines;
-    for (int i = start; i < count; i++) {
-        fprintf(f, "%s\n", lines[i]);
+    size_t kept = len - split_at;
+    if (kept > 0 && fwrite(data + split_at, 1, kept, f) != kept) {
+        fclose(f);
+        free(data);
+        return -1;
     }
     fclose(f);
-    for (int i = 0; i < count; i++) free(lines[i]);
-    free(lines);
+    free(data);
     return 0;
 }
 
