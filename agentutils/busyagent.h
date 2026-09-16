@@ -45,6 +45,7 @@ typedef struct {
     char *summary;          /* session_dir/summary.md */
     char *plan;             /* session_dir/plan.md */
     char *plan_draft;       /* session_dir/plan.draft */
+    char *archive;          /* session_dir/conversation-archive.jsonl */
 } SessionPaths;
 
 void store_session_paths_free(SessionPaths *p);
